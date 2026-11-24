@@ -727,8 +727,7 @@ impl Installer {
                     .status()
                     .is_ok_and(|status| status.success());
                 let result = succeeded.then_some(()).ok_or_else(|| {
-                    "Could not change Gaming Mode. Use the terminal commands below for details."
-                        .into()
+                    "Could not change Gaming Mode. Check the installation and try again.".into()
                 });
                 let _ = sender.send(Event::GamingModeChanged(result));
                 ctx.request_repaint();
@@ -1586,26 +1585,10 @@ impl Installer {
     }
 
     fn show_gaming_mode(&mut self, ui: &mut Ui, installed: &Installed) {
-        if let Some(mut enabled) = gaming_mode(installed) {
-            card(ui, |ui| {
-                if ui
-                    .add_enabled(
-                        self.worker.is_none(),
-                        egui::Checkbox::new(&mut enabled, "Gaming Mode"),
-                    )
-                    .changed()
-                {
-                    self.change_gaming_mode(ui.ctx(), enabled);
-                }
-                caption(
-                    ui,
-                    if enabled {
-                        "New GPU jobs are paused for this Bridge."
-                    } else {
-                        "This Bridge can accept new GPU jobs."
-                    },
-                );
-            });
+        if let Some(on) = gaming_mode(installed) {
+            if gaming_mode_button(ui, on, self.worker.is_none()).clicked() {
+                self.change_gaming_mode(ui.ctx(), !on);
+            }
         } else {
             status(
                 ui,
@@ -1762,7 +1745,7 @@ impl Installer {
                 });
             });
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(theme::color(ctx, CREAM)).inner_margin(egui::Margin::symmetric(16, 12)))
+            .frame(Frame::new().fill(theme::color(ctx, CREAM)).inner_margin(egui::Margin::symmetric(16, 6)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 7.0;
@@ -1813,7 +1796,7 @@ impl Installer {
                         }
                     }
                     if let Some(installed) = self.installed.clone() {
-                        ui.collapsing("Gaming Mode", |ui| self.show_gaming_mode(ui, &installed));
+                        self.show_gaming_mode(ui, &installed);
                     }
                     #[cfg(windows)]
                     if let Some(error) = &self.tray_error {
@@ -2309,6 +2292,88 @@ fn monitor_button(ui: &mut Ui, title: &str, enabled: bool, fill: Color32) -> egu
             .min_size(egui::vec2(0.0, 34.0))
             .corner_radius(10),
     )
+}
+
+fn gaming_mode_button(ui: &mut Ui, on: bool, enabled: bool) -> egui::Response {
+    let ctx = ui.ctx();
+    let (label, fill, ink, border, hint) = if on {
+        (
+            "Gaming Mode · On",
+            LIME,
+            INK,
+            LIME,
+            "Allow agents to start GPU jobs again",
+        )
+    } else {
+        (
+            "Gaming Mode · Off",
+            Color32::TRANSPARENT,
+            theme::color(ctx, MUTED),
+            theme::color(ctx, LINE).gamma_multiply(0.65),
+            "Pause new GPU jobs from agents",
+        )
+    };
+    let mut text = egui::text::LayoutJob::default();
+    text.append(
+        label,
+        26.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(14.0),
+            color: ink,
+            ..Default::default()
+        },
+    );
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(11.0, 5.0);
+            ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0_f32, border);
+            ui.add_enabled(
+                enabled,
+                egui::Button::new(text)
+                    .fill(fill)
+                    .min_size(egui::vec2(154.0, 30.0))
+                    .corner_radius(10),
+            )
+        })
+        .inner;
+    if ui.is_rect_visible(response.rect) {
+        let origin = response.rect.left_center() + egui::vec2(11.0, -6.0);
+        let point = |x, y| origin + egui::vec2(x, y);
+        let ink = if enabled {
+            ink
+        } else {
+            ink.gamma_multiply(0.6)
+        };
+        let stroke = Stroke::new(1.35_f32, ink);
+        let painter = ui.painter();
+        let outline = [
+            (5.0, 1.2),
+            (13.0, 1.2),
+            (15.6, 2.2),
+            (17.1, 4.6),
+            (18.0, 8.8),
+            (17.6, 10.8),
+            (16.2, 11.7),
+            (14.9, 11.2),
+            (12.1, 8.6),
+            (5.9, 8.6),
+            (3.1, 11.2),
+            (1.8, 11.7),
+            (0.4, 10.8),
+            (0.0, 8.8),
+            (0.9, 4.6),
+            (2.4, 2.2),
+        ];
+        painter.add(egui::Shape::closed_line(
+            outline.into_iter().map(|(x, y)| point(x, y)).collect(),
+            stroke,
+        ));
+        painter.line_segment([point(3.7, 5.1), point(7.3, 5.1)], stroke);
+        painter.line_segment([point(5.5, 3.3), point(5.5, 6.9)], stroke);
+        painter.circle_filled(point(11.9, 4.5), 0.85, ink);
+        painter.circle_filled(point(14.5, 6.3), 0.85, ink);
+    }
+    response.on_hover_text(hint)
 }
 
 fn copy_row(ui: &mut Ui, title: &str, button: &str, value: &str) -> bool {

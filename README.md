@@ -169,7 +169,7 @@ The [pipeline guide](docs/pipelines.md#what-each-pipeline-does) covers editing, 
 
 ## Render Bridge Gaming Mode
 
-Toggle the **Gaming Mode** checkbox on **Connect**, or expand **Gaming Mode** in the Render Bridge panel for a saved installation. If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu. If you have an older shortcut that toggles Gaming Mode immediately, rename or remove it before creating the new shortcut.
+Select **Gaming Mode · Off** in the Jobs panel or on **Connect** to pause new GPU work. The controller button turns bright green and reads **Gaming Mode · On** while the pause is active. Select it again to resume. If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu. If you have an older shortcut that toggles Gaming Mode immediately, rename or remove it before creating the new shortcut.
 
 For terminal control, go to **Connect → Shutdown and terminal commands → Turn Gaming Mode off** and run the copied command. Use **Copy status command** to check it in a terminal or replace the final `off` with `on` to enable it. In the v0.1.0 download, copy the start command and replace the final `start` with `gaming-mode off`.
 
