@@ -15,11 +15,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EndMenu, FindWindowW, GWLP_USERDATA,
     GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId, HICON, HMENU, IsIconic,
-    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SW_RESTORE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, ShowWindowAsync, TPM_BOTTOMALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    UnregisterClassW, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
-    WM_PAINT, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW,
+    ShowWindowAsync, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, UnregisterClassW, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_NULL, WM_PAINT, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -449,7 +449,10 @@ fn build_menu(server_controls: bool) -> Option<HMENU> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         for (command, label) in items.into_iter().flatten() {
-            if AppendMenuW(menu, MF_STRING, command, label).is_err() {
+            if (command == IN_MENU_EXIT
+                && AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()).is_err())
+                || AppendMenuW(menu, MF_STRING, command, label).is_err()
+            {
                 let _ = DestroyMenu(menu);
                 return None;
             }
@@ -519,11 +522,20 @@ mod tests {
 
     #[test]
     fn native_menu_offers_server_actions_only_when_controls_are_available() {
-        use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, GetMenuItemID};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetMenuItemCount, GetMenuItemID, GetMenuState, MF_BYPOSITION,
+        };
 
         let commands = |server_controls| unsafe {
             let menu = build_menu(server_controls).unwrap();
-            let ids: Vec<_> = (0..GetMenuItemCount(Some(menu)))
+            let count = GetMenuItemCount(Some(menu));
+            let separator = count - 2;
+            assert_ne!(
+                GetMenuState(menu, separator as u32, MF_BYPOSITION) & MF_SEPARATOR.0,
+                0
+            );
+            let ids: Vec<_> = (0..count)
+                .filter(|index| *index != separator)
                 .map(|index| GetMenuItemID(menu, index) as usize)
                 .collect();
             DestroyMenu(menu).unwrap();

@@ -13,7 +13,7 @@ use crate::{asset_folders::check_directory, models::ModelFile};
 
 const HUB: &str = "huggingface.co";
 const MAX_REDIRECTS: usize = 6;
-const ABORTED: &str = "Model operation stopped.";
+pub(crate) const ABORTED: &str = "Model operation stopped.";
 const BAD_CATALOG: &str = "The model catalog contains an invalid file entry.";
 const BAD_FOLDER: &str =
     "The model storage folder could not be verified. Choose a regular local folder.";

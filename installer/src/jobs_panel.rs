@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::jobs::{self, QueueStatus};
 use crate::theme;
-use crate::{CAUTION, GREEN, INK, MUTED, SURFACE, VIOLET, caption, card, monitor_button, status};
+use crate::{CAUTION, GREEN, INK, LINE, SURFACE, VIOLET, caption, monitor_button, status};
 
 #[cfg(windows)]
 use crate::RAIL_ACTIVE;
@@ -142,68 +142,82 @@ impl QueueView {
     }
 
     pub fn show(&mut self, ui: &mut Ui) {
-        let (mut snapshot, mut manual) = self
+        self.show_card(ui);
+        ui.horizontal_wrapped(|ui| self.show_refresh(ui));
+    }
+
+    pub fn show_card(&mut self, ui: &mut Ui) {
+        let mut snapshot = self
             .state
             .lock()
-            .map(|state| (state.snapshot.clone(), state.manual))
-            .unwrap_or_default();
+            .ok()
+            .and_then(|state| state.snapshot.clone());
         if self.refresh.is_none() && snapshot.is_none() {
             self.start_worker(ui.ctx(), false);
-            (snapshot, manual) = self
+            snapshot = self
                 .state
                 .lock()
-                .map(|state| (state.snapshot.clone(), state.manual))
-                .unwrap_or_default();
+                .ok()
+                .and_then(|state| state.snapshot.clone());
         }
         match snapshot.as_deref() {
             Some(Ok(queue)) => {
-                card(ui, |ui| {
-                    let (label, color) = match (queue.running > 0, queue.queued > 0) {
-                        (true, _) => ("Work in progress", VIOLET),
-                        (false, true) => ("Waiting to run", VIOLET),
-                        _ => ("Queue is idle", GREEN),
-                    };
-                    ui.label(
-                        RichText::new(label)
-                            .size(17.0)
-                            .strong()
-                            .color(theme::color(ui.ctx(), color)),
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        for (label, count) in [("Running", queue.running), ("Queued", queue.queued)]
-                        {
-                            ui.label(
-                                RichText::new(count.to_string())
-                                    .size(19.0)
-                                    .strong()
-                                    .color(theme::color(ui.ctx(), INK)),
-                            );
-                            ui.label(RichText::new(label).color(theme::color(ui.ctx(), MUTED)));
-                            ui.add_space(9.0);
+                egui::Frame::new()
+                    .fill(theme::color(ui.ctx(), SURFACE))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
+                    .corner_radius(12)
+                    .inner_margin(12)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        let (label, color) = match (queue.running > 0, queue.queued > 0) {
+                            (true, _) => ("Render in progress", GREEN),
+                            (false, true) => ("Waiting to run", VIOLET),
+                            _ => ("Queue is idle", GREEN),
+                        };
+                        ui.label(
+                            RichText::new(label)
+                                .size(17.0)
+                                .strong()
+                                .color(theme::color(ui.ctx(), color)),
+                        );
+                        if queue.running > 0 {
+                            self.show_progress(ui, queue);
+                            ui.separator();
                         }
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, count) in
+                                [("running", queue.running), ("queued", queue.queued)]
+                            {
+                                ui.label(
+                                    RichText::new(format!("{count} {label}"))
+                                        .strong()
+                                        .color(theme::color(ui.ctx(), INK)),
+                                );
+                            }
+                        });
                     });
-                    if queue.running > 0 {
-                        self.show_progress(ui, queue);
-                    }
-                });
             }
             Some(Err(message)) => status(ui, "Queue status unavailable", message, CAUTION),
             None => caption(ui, "Checking the ComfyUI queue…"),
         }
-        ui.horizontal_wrapped(|ui| {
-            if monitor_button(ui, "Refresh", snapshot.is_some() && !manual, SURFACE).clicked() {
-                self.request_refresh(ui.ctx());
-                manual = self.state.lock().is_ok_and(|state| state.manual);
-            }
-            caption(
-                ui,
-                if manual {
-                    "Refreshing queue…"
-                } else {
-                    "Queue refreshes automatically"
-                },
-            );
-        });
+    }
+
+    pub fn show_refresh(&mut self, ui: &mut Ui) {
+        let (available, mut manual) = self
+            .state
+            .lock()
+            .map(|state| (state.snapshot.is_some(), state.manual))
+            .unwrap_or_default();
+        if monitor_button(ui, "Refresh", available && !manual, SURFACE)
+            .on_hover_text("The queue also refreshes automatically")
+            .clicked()
+        {
+            self.request_refresh(ui.ctx());
+            manual = self.state.lock().is_ok_and(|state| state.manual);
+        }
+        if manual {
+            caption(ui, "Refreshing queue…");
+        }
     }
 
     fn show_progress(&self, ui: &mut Ui, _queue: &QueueStatus) {
@@ -229,7 +243,7 @@ impl QueueView {
                     ui.label(
                         RichText::new(format!("{percent:.0}%"))
                             .strong()
-                            .color(theme::color(ui.ctx(), VIOLET)),
+                            .color(theme::color(ui.ctx(), GREEN)),
                     );
                 });
             });
@@ -238,7 +252,7 @@ impl QueueView {
                 ui.add(
                     egui::ProgressBar::new(fraction as f32)
                         .desired_height(10.0)
-                        .fill(theme::color(ui.ctx(), VIOLET)),
+                        .fill(theme::color(ui.ctx(), GREEN)),
                 );
             });
             return;

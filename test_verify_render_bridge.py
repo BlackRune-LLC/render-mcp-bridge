@@ -134,13 +134,14 @@ class VerifyTest(unittest.TestCase):
         server.proof_port = None
         self.url = f"http://127.0.0.1:{server.server_port}/mcp"
 
-    def verify(self, *options, url=None, link=None):
+    def verify(self, *options, url=None, link=None, preview=False):
         env = {
             **os.environ,
             "CLAUDE_CONFIG_DIR": str(self.claude),
             "CODEX_HOME": str(self.codex),
             "HTTP_PROXY": "http://127.0.0.1:1",
             "NO_PROXY": "",
+            "RENDER_BRIDGE_FIRST_RENDER_PREVIEW": "1" if preview else "0",
         }
         response = subprocess.run(
             [sys.executable, "-B", str(SCRIPT), url or self.url, str(self.token), *options],
@@ -166,6 +167,19 @@ class VerifyTest(unittest.TestCase):
                          {"first_render": "ok"})
         self.assertEqual(self.server.calls, ["download"])
         self.assertIsNone(self.server.download_authorization)
+
+    def test_preview_uses_only_the_already_verified_signed_png(self):
+        valid = self.signed_png_link()
+        receipt = self.verify("--first-render", RENDER_PREFIX, link=valid, preview=True)
+        self.assertEqual(receipt["first_render"], "ok")
+        self.assertEqual(receipt["preview_rgba"], "000000ff" * (96 * 96))
+        self.assertEqual(self.server.calls, ["download"])
+        self.assertIsNone(self.server.download_authorization)
+
+        unrelated = self.signed_png_link(filename="unrelated_00001_.png")
+        failed = self.verify("--first-render", RENDER_PREFIX, link=unrelated, preview=True)
+        self.assertEqual(failed, {"first_render": "wrong_link"})
+        self.assertEqual(self.server.calls, ["download"])
 
     def test_rejects_receipts_for_other_sessions_or_installations_without_requesting_them(self):
         links = [

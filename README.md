@@ -78,9 +78,9 @@ The optional **Install signed build** action requires a valid Windows signature 
 
 Choose an optional generated asset folder, backup folder, or both during installation. In the Windows panel, open **Settings → Storage** to change those choices. Select **Copy generated assets** when you want a copy of the configured ComfyUI output. The copy keeps subfolders, preserves the original files, and leaves existing destination files in place.
 
-Use **Settings → Advanced configuration → Open configuration file** to review the saved ComfyUI data root, URL, and any separate input or output paths. Stop Render Bridge before editing the file, then restart it and verify the connection. Set runtime tuning variables in the environment that starts Render Bridge. Render Bridge requests a model unload after 10 minutes of idle time by default. Set `IDLE_UNLOAD_MIN=0` to disable idle unloading. [Configuration reference](docs/configuration.md)
+Use **Settings → Advanced → Open configuration file** to review the saved ComfyUI data root, URL, and any separate input or output paths. Stop Render Bridge before editing the file, then restart it and verify the connection. Set runtime tuning variables in the environment that starts Render Bridge. Render Bridge requests a model unload after 10 minutes of idle time by default. Set `IDLE_UNLOAD_MIN=0` to disable idle unloading. [Configuration reference](docs/configuration.md)
 
-Use **Settings → Open crash logs** to find local Render Bridge crash reports on Windows. [Local crash logs](docs/configuration.md#local-crash-logs)
+Use **Settings → Diagnostics → Open crash logs** to find local Render Bridge crash reports on Windows. [Local crash logs](docs/configuration.md#local-crash-logs)
 
 To repair or uninstall an existing Windows setup, run the setup wizard again. [Windows installation, repair, and removal](docs/configuration.md#windows-installation-repair-and-removal)
 

@@ -11,13 +11,19 @@ use crate::setup::{self, Installed};
 use crate::{CAUTION, GREEN, caption, card, field_label, secondary, theme};
 
 const MAX_LINK_BYTES: usize = 4096;
+const PREVIEW_SIZE: usize = 96;
+const MAX_RECEIPT_BYTES: usize = PREVIEW_SIZE * PREVIEW_SIZE * 8 + 4096;
+const PREVIEW_MODE: &str = "RENDER_BRIDGE_FIRST_RENDER_PREVIEW";
+
+type CheckedReceipt = Result<Option<egui::ColorImage>, &'static str>;
 
 #[derive(Default)]
 pub(crate) struct FirstRender {
     installation: Option<(PathBuf, String)>,
     prefix: Option<String>,
     link: String,
-    worker: Option<Receiver<Result<(), &'static str>>>,
+    worker: Option<Receiver<CheckedReceipt>>,
+    preview: Option<egui::TextureHandle>,
     result: Option<Result<(), &'static str>>,
 }
 
@@ -30,11 +36,31 @@ impl FirstRender {
                 ..Self::default()
             };
         }
-        self.poll();
+        self.poll(ui.ctx());
 
         card(ui, |ui| {
             field_label(ui, "First render");
-            let verified = matches!(self.result, Some(Ok(())));
+            if matches!(self.result, Some(Ok(()))) {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(preview) = &self.preview {
+                        let size = egui::vec2(PREVIEW_SIZE as f32, PREVIEW_SIZE as f32);
+                        ui.add(
+                            egui::Image::new((preview.id(), size))
+                                .corner_radius(8)
+                                .alt_text("Verified first render"),
+                        );
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("PNG verified")
+                                .strong()
+                                .color(theme::color(ui.ctx(), GREEN)),
+                        );
+                        caption(ui, "The signed link returned a valid 512 × 512 PNG.");
+                    });
+                });
+                return;
+            }
             check_label(
                 ui,
                 "Render Bridge",
@@ -45,29 +71,8 @@ impl FirstRender {
                 },
                 server_verified,
             );
-            check_label(
-                ui,
-                "Agent connection",
-                if verified {
-                    "Confirmed by test output"
-                } else {
-                    "Awaiting test output"
-                },
-                verified,
-            );
-            check_label(
-                ui,
-                "Test PNG",
-                if verified {
-                    "Downloaded and verified"
-                } else {
-                    "Awaiting signed link"
-                },
-                verified,
-            );
-            if verified {
-                return;
-            }
+            check_label(ui, "Agent connection", "Awaiting test output", false);
+            check_label(ui, "Test PNG", "Awaiting signed link", false);
 
             caption(
                 ui,
@@ -120,7 +125,7 @@ impl FirstRender {
         });
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
         let Some(worker) = &self.worker else { return };
         let result = match worker.try_recv() {
             Ok(result) => result,
@@ -130,7 +135,11 @@ impl FirstRender {
             }
         };
         self.worker = None;
-        self.result = Some(result);
+        self.result = Some(result.map(|preview| {
+            self.preview = preview.map(|image| {
+                ctx.load_texture("first-render-preview", image, egui::TextureOptions::LINEAR)
+            });
+        }));
     }
 
     fn start_check(&mut self, ctx: &egui::Context, installed: &Installed) {
@@ -200,13 +209,14 @@ fn test_prompt(mcp_url: &str, prefix: &str) -> String {
     )
 }
 
-fn check_link(installed: &Installed, prefix: &str, link: &str) -> Result<(), &'static str> {
+fn check_link(installed: &Installed, prefix: &str, link: &str) -> CheckedReceipt {
     let failed = "The PNG check could not finish. Reopen setup or paste the signed link again.";
     let mut child = setup::quiet_command(setup::venv_python(&installed.app_dir))
         .arg(installed.app_dir.join("verify_render_bridge.py"))
         .arg(&installed.mcp_url)
         .arg(&installed.token_path)
         .args(["--first-render", prefix])
+        .env(PREVIEW_MODE, "1")
         .current_dir(&installed.app_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -219,12 +229,12 @@ fn check_link(installed: &Installed, prefix: &str, link: &str) -> Result<(), &'s
         .take()
         .is_some_and(|mut stdin| stdin.write_all(link.as_bytes()).is_ok());
     let result = child.wait_with_output().map_err(|_| failed)?;
-    if !wrote || !result.status.success() {
+    if !wrote || !result.status.success() || result.stdout.len() > MAX_RECEIPT_BYTES {
         return Err(failed);
     }
     let answer: serde_json::Value = serde_json::from_slice(&result.stdout).map_err(|_| failed)?;
     match answer["first_render"].as_str() {
-        Some("ok") => Ok(()),
+        Some("ok") => Ok(receipt_preview(answer["preview_rgba"].as_str())),
         Some("wrong_link") => Err("Use the matching, unexpired PNG link from this setup test."),
         Some("download_failed") => Err(
             "Could not download the PNG. Check the server and paste a fresh link if it expired.",
@@ -237,9 +247,35 @@ fn check_link(installed: &Installed, prefix: &str, link: &str) -> Result<(), &'s
     }
 }
 
+fn receipt_preview(preview: Option<&str>) -> Option<egui::ColorImage> {
+    let preview = preview?.as_bytes();
+    if preview.len() != PREVIEW_SIZE * PREVIEW_SIZE * 8 {
+        return None;
+    }
+    let pixels = preview
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [PREVIEW_SIZE, PREVIEW_SIZE],
+        &pixels,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_preview_accepts_only_exact_bounded_pixel_data() {
+        let expected = "123456ff".repeat(PREVIEW_SIZE * PREVIEW_SIZE);
+        let preview = receipt_preview(Some(&expected)).unwrap();
+        assert_eq!(preview.size, [PREVIEW_SIZE, PREVIEW_SIZE]);
+        assert_eq!(preview.pixels[0], egui::Color32::from_rgb(18, 52, 86));
+        assert!(receipt_preview(None).is_none());
+        assert!(receipt_preview(Some(&expected[2..])).is_none());
+        assert!(receipt_preview(Some(&expected.replacen("12", "yz", 1))).is_none());
+    }
 
     #[test]
     fn prompt_checks_readiness_and_requests_one_private_test() {

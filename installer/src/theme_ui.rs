@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use eframe::egui::{Theme, Ui};
+use eframe::egui::{TextEdit, Theme, Ui};
 
 use crate::theme::{self, ColorRole, ThemePlugin};
 use crate::{CAUTION, caption, primary, secondary, status};
@@ -65,8 +65,9 @@ impl ThemeEditor {
             return;
         };
         ui.horizontal_wrapped(|ui| {
-            ui.label("Theme name");
-            ui.text_edit_singleline(&mut plugin.name);
+            let label = ui.label("Theme name");
+            ui.add(TextEdit::singleline(&mut plugin.name).desired_width(180.0))
+                .labelled_by(label.id);
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Colors for");
@@ -80,8 +81,12 @@ impl ThemeEditor {
                     let [red, green, blue, _] =
                         plugin.color(self.mode, role).to_srgba_unmultiplied();
                     let mut rgb = [red, green, blue];
-                    ui.label(role.label());
-                    if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    let label = ui.label(role.label());
+                    if ui
+                        .color_edit_button_srgb(&mut rgb)
+                        .labelled_by(label.id)
+                        .changed()
+                    {
                         plugin.set_color(self.mode, role, rgb);
                     }
                     let [r, g, b] = rgb;

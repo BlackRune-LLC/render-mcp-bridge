@@ -269,25 +269,63 @@ impl NodePanel {
             .filter(|selected| visible.contains(selected))
             .or_else(|| visible.first().copied());
 
+        enum Row {
+            Group(Origin, usize),
+            Node(usize),
+        }
+        let mut rows = Vec::with_capacity(visible.len() + 3);
+        for origin in [Origin::BuiltIn, Origin::Custom, Origin::Unreported] {
+            let matches = visible
+                .iter()
+                .copied()
+                .filter(|index| self.nodes[*index].origin == origin);
+            let count = matches.clone().count();
+            if count > 0 {
+                rows.push(Row::Group(origin, count));
+                rows.extend(matches.map(Row::Node));
+            }
+        }
         let list = |ui: &mut Ui, selected: &mut Option<usize>| {
-            caption(ui, &format!("{} nodes", visible.len()));
-            egui::ScrollArea::vertical()
-                .id_salt("node-inventory")
-                .max_height(330.0)
-                .show_rows(ui, 30.0, visible.len(), |ui, rows| {
-                    for row in rows {
-                        let index = visible[row];
-                        let node = &self.nodes[index];
-                        let label = format!("{}  ·  {}", node.title, node.origin.label());
-                        if ui
-                            .selectable_label(*selected == Some(index), label)
-                            .on_hover_text(&node.id)
-                            .clicked()
-                        {
-                            *selected = Some(index);
+            card(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("node-inventory")
+                    .max_height(330.0)
+                    .show_rows(ui, 32.0, rows.len(), |ui, range| {
+                        for row in range {
+                            match rows[row] {
+                                Row::Group(origin, count) => {
+                                    ui.add_sized(
+                                        [ui.available_width(), 32.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(format!(
+                                                "{} ({count})",
+                                                origin.label()
+                                            ))
+                                            .strong(),
+                                        ),
+                                    );
+                                }
+                                Row::Node(index) => {
+                                    let node = &self.nodes[index];
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), 32.0],
+                                            egui::Button::selectable(
+                                                *selected == Some(index),
+                                                &node.title,
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&node.id)
+                                        .clicked()
+                                    {
+                                        *selected = Some(index);
+                                    }
+                                }
+                            }
                         }
-                    }
-                });
+                    });
+            });
         };
         let details = |ui: &mut Ui, selected: Option<usize>| {
             if let Some(node) = selected.map(|index| &self.nodes[index]) {
@@ -310,7 +348,7 @@ impl NodePanel {
     fn details(&self, ui: &mut Ui, node: &Node) {
         card(ui, |ui| {
             ui.heading(&node.title);
-            ui.monospace(&node.id);
+            crate::code_label(ui, &node.id);
             caption(ui, node.origin.label());
             for (label, value) in [
                 ("Category", &node.category),
@@ -325,6 +363,12 @@ impl NodePanel {
                 caption(ui, &node.description);
             }
             if node.origin == Origin::Custom {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Review custom sources before installing")
+                        .color(crate::theme::color(ui.ctx(), CAUTION))
+                        .strong(),
+                );
                 if let Some(url) = review_source(&node.source) {
                     ui.hyperlink_to("Review source", url.as_str());
                 } else {

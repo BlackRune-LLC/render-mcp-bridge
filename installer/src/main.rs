@@ -40,6 +40,8 @@ mod update_handoff;
 mod update_ui;
 #[cfg(windows)]
 mod updates;
+#[cfg(windows)]
+mod utility_ui;
 mod workflow_editor;
 mod workflow_ui;
 
@@ -96,12 +98,12 @@ enum Step {
     Connect,
 }
 
-const STEPS: [(Step, &str, &str); 5] = [
-    (Step::Prerequisites, "01", "Prerequisites"),
-    (Step::Comfy, "02", "ComfyUI"),
-    (Step::Models, "03", "Models"),
-    (Step::Install, "04", "Install"),
-    (Step::Connect, "05", "Connect"),
+const STEPS: [(Step, &str); 5] = [
+    (Step::Prerequisites, "Prerequisites"),
+    (Step::Comfy, "ComfyUI"),
+    (Step::Models, "Models"),
+    (Step::Install, "Install"),
+    (Step::Connect, "Connect"),
 ];
 
 enum Event {
@@ -110,7 +112,11 @@ enum Event {
     PythonInstallFinished(Result<PythonReadiness, String>),
     Checked(CheckOutcome),
     Discovered(Vec<discovery::Instance>),
-    Verified(Option<RunningBridge>, Result<serde_json::Value, String>),
+    Verified(
+        VerificationTarget,
+        Option<RunningBridge>,
+        Result<serde_json::Value, String>,
+    ),
     GamingModeChanged(Result<(), String>),
     TokenRotated(Result<(), String>),
     Progress(String),
@@ -176,15 +182,50 @@ struct TrayPanel {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SettingsTab {
+    #[default]
+    Appearance,
+    Storage,
+    Advanced,
+    Diagnostics,
+}
+
+#[cfg(windows)]
+impl SettingsTab {
+    const ALL: [Self; 4] = [
+        Self::Appearance,
+        Self::Storage,
+        Self::Advanced,
+        Self::Diagnostics,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Storage => "Storage",
+            Self::Advanced => "Advanced",
+            Self::Diagnostics => "Diagnostics",
+        }
+    }
+}
+
+#[cfg(windows)]
 struct StartupSetting {
     executable: PathBuf,
     arguments: Vec<std::ffi::OsString>,
+    comfy_url: Option<String>,
     open: bool,
+    selected: SettingsTab,
     enabled: Option<bool>,
     error: Option<String>,
     appearance_error: Option<String>,
+    message: Option<Result<&'static str, String>>,
     theme_editor: theme_ui::ThemeEditor,
     assets: asset_ui::AssetEditor,
+    model_destination: Option<PathBuf>,
+    model_destination_changed: bool,
+    diagnostics: SettingsDiagnostics,
 }
 
 #[cfg(windows)]
@@ -195,6 +236,11 @@ impl StartupSetting {
             return;
         }
         self.open = true;
+        self.selected = SettingsTab::default();
+        self.message = None;
+        self.diagnostics = SettingsDiagnostics::default();
+        self.model_destination =
+            installed.and_then(|installed| model_library::load_destination(&installed.data_dir));
         if let Some(installed) = installed {
             self.assets.load(&installed.data_dir);
         }
@@ -227,36 +273,88 @@ impl StartupSetting {
                 .with_title("Render Bridge Settings")
                 .with_icon(icons::window_icon())
                 .with_inner_size(size)
-                .with_min_inner_size(size.min(egui::vec2(360.0, 280.0)))
+                .with_min_inner_size(size.min(egui::vec2(340.0, 270.0)))
                 .with_clamp_size_to_monitor_size(true),
             |ctx, class| {
                 if class == egui::ViewportClass::Embedded {
                     let response = panel_modal(ctx, "render-bridge-settings").show(ctx, |ui| {
-                        ui.set_width((ctx.content_rect().width() - 32.0).clamp(120.0, 520.0));
-                        ui.heading("Render Bridge Settings");
+                        let viewport = ctx.content_rect();
+                        ui.set_width((viewport.width() - 54.0).clamp(120.0, 500.0));
+                        ui.heading("Settings");
+                        self.navigation(ui, false);
                         egui::ScrollArea::vertical()
-                            .max_height((ctx.content_rect().height() - 108.0).max(0.0))
+                            .id_salt(self.selected.title())
+                            .max_height((viewport.height() - 178.0).max(40.0))
+                            .auto_shrink([false, true])
                             .show(ui, |ui| self.contents(ui, appearance, data_dir, installed));
                         ui.separator();
-                        self.actions(ui)
+                        Self::actions(ui)
                     });
                     return response.inner || response.should_close();
                 }
 
-                let frame = || {
-                    Frame::new()
-                        .fill(theme::color(ctx, SURFACE))
-                        .inner_margin(egui::Margin::same(16))
-                };
+                let fill = theme::color(ctx, RAIL);
+                egui::TopBottomPanel::top("settings-title")
+                    .frame(
+                        Frame::new()
+                            .fill(fill)
+                            .inner_margin(egui::Margin::symmetric(14, 4)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            bridge_mark(ui);
+                            ui.label(
+                                RichText::new("Render Bridge")
+                                    .size(19.0)
+                                    .strong()
+                                    .color(theme::on_fill(fill)),
+                            );
+                            ui.label(
+                                RichText::new("Settings")
+                                    .size(15.0)
+                                    .color(theme::on_fill(fill)),
+                            );
+                        });
+                    });
+                let surface = theme::color(ctx, SURFACE);
+                let roomy = ctx.content_rect().width() >= SETTINGS_RAIL_MIN_WIDTH;
+                if roomy {
+                    egui::SidePanel::left("settings-navigation")
+                        .exact_width(144.0)
+                        .resizable(false)
+                        .frame(
+                            Frame::new()
+                                .fill(surface)
+                                .inner_margin(egui::Margin::same(10)),
+                        )
+                        .show(ctx, |ui| self.navigation(ui, true));
+                } else {
+                    egui::TopBottomPanel::top("settings-navigation")
+                        .frame(
+                            Frame::new()
+                                .fill(surface)
+                                .inner_margin(egui::Margin::symmetric(8, 5)),
+                        )
+                        .show(ctx, |ui| self.navigation(ui, false));
+                }
                 let done = egui::TopBottomPanel::bottom("settings-actions")
-                    .frame(frame())
-                    .show(ctx, |ui| self.actions(ui))
+                    .frame(
+                        Frame::new()
+                            .fill(surface)
+                            .inner_margin(egui::Margin::symmetric(14, 8)),
+                    )
+                    .show(ctx, Self::actions)
                     .inner;
                 egui::CentralPanel::default()
-                    .frame(frame())
+                    .frame(
+                        Frame::new()
+                            .fill(theme::color(ctx, CREAM))
+                            .inner_margin(egui::Margin::same(14)),
+                    )
                     .show(ctx, |ui| {
-                        ui.heading("Render Bridge Settings");
                         egui::ScrollArea::vertical()
+                            .id_salt(self.selected.title())
+                            .auto_shrink([false, false])
                             .show(ui, |ui| self.contents(ui, appearance, data_dir, installed));
                     });
                 done || ctx.input(|input| {
@@ -270,6 +368,25 @@ impl StartupSetting {
         }
     }
 
+    fn navigation(&mut self, ui: &mut Ui, rail: bool) {
+        let labels = |ui: &mut Ui| {
+            for tab in SettingsTab::ALL {
+                let width = if rail { ui.available_width() } else { 0.0 };
+                if settings_choice(ui, tab.title(), self.selected == tab, width).clicked()
+                    && self.selected != tab
+                {
+                    self.selected = tab;
+                    self.message = None;
+                }
+            }
+        };
+        if rail {
+            ui.vertical(labels);
+        } else {
+            ui.horizontal_wrapped(labels);
+        }
+    }
+
     fn contents(
         &mut self,
         ui: &mut Ui,
@@ -277,65 +394,122 @@ impl StartupSetting {
         data_dir: Option<&Path>,
         installed: Option<&Installed>,
     ) {
-        ui.horizontal_wrapped(|ui| {
-            caption(ui, concat!("Version ", env!("CARGO_PKG_VERSION")));
-            ui.hyperlink_to("Release notes", RELEASE_NOTES);
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Theme");
-            for (label, preference) in [
-                ("Dark", egui::ThemePreference::Dark),
-                ("Light", egui::ThemePreference::Light),
-                ("System", egui::ThemePreference::System),
-            ] {
-                let button = egui::Button::new(label)
-                    .selected(*appearance == preference)
-                    .min_size(egui::vec2(65.0, 30.0));
-                if ui.add(button).clicked() && *appearance != preference {
-                    match theme::save(data_dir, preference) {
-                        Ok(()) => {
-                            *appearance = preference;
-                            self.appearance_error = None;
-                            ui.ctx().set_theme(preference);
-                            ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+        ui.label(RichText::new(self.selected.title()).size(24.0).strong());
+        ui.add_space(8.0);
+        match self.selected {
+            SettingsTab::Appearance => self.appearance(ui, appearance, data_dir),
+            SettingsTab::Storage => self.storage(ui, installed),
+            SettingsTab::Advanced => self.advanced(ui, installed),
+            SettingsTab::Diagnostics => self.diagnostics(ui, installed),
+        }
+        if let Some(message) = &self.message {
+            match message {
+                Ok(message) => status(ui, "Saved", message, GREEN),
+                Err(error) => status(ui, "Action unavailable", error, CAUTION),
+            }
+        }
+    }
+
+    fn appearance(
+        &mut self,
+        ui: &mut Ui,
+        appearance: &mut egui::ThemePreference,
+        data_dir: Option<&Path>,
+    ) {
+        card(ui, |ui| {
+            field_label(ui, "Theme");
+            ui.horizontal_wrapped(|ui| {
+                for (label, preference) in [
+                    ("Dark", egui::ThemePreference::Dark),
+                    ("Light", egui::ThemePreference::Light),
+                    ("System", egui::ThemePreference::System),
+                ] {
+                    if settings_choice(ui, label, *appearance == preference, 70.0).clicked()
+                        && *appearance != preference
+                    {
+                        match theme::save(data_dir, preference) {
+                            Ok(()) => {
+                                *appearance = preference;
+                                self.appearance_error = None;
+                                ui.ctx().set_theme(preference);
+                                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                            }
+                            Err(error) => self.appearance_error = Some(error),
                         }
-                        Err(error) => self.appearance_error = Some(error),
                     }
                 }
+            });
+            if let Some(error) = &self.appearance_error {
+                caption(ui, error);
             }
+            ui.add_space(8.0);
+            theme_preview(ui);
         });
-        if let Some(error) = &self.appearance_error {
-            status(ui, "Theme setting unavailable", error, CAUTION);
-        }
-        self.theme_editor.show(ui, data_dir);
-        ui.separator();
-        if let Some(mut enabled) = self.enabled
-            && ui
-                .checkbox(&mut enabled, "Start hidden when I sign in")
+        card(ui, |ui| {
+            self.theme_editor.show(ui, data_dir);
+        });
+        card(ui, |ui| {
+            field_label(ui, "Sign-in");
+            let mut enabled = self.enabled.unwrap_or_default();
+            if ui
+                .add_enabled(
+                    self.enabled.is_some(),
+                    egui::Checkbox::new(&mut enabled, "Start hidden when I sign in"),
+                )
                 .changed()
-        {
-            match startup::set_enabled(&self.executable, &self.arguments, enabled) {
-                Ok(()) => {
-                    self.enabled = Some(enabled);
-                    self.error = None;
+            {
+                match startup::set_enabled(&self.executable, &self.arguments, enabled) {
+                    Ok(()) => {
+                        self.enabled = Some(enabled);
+                        self.error = None;
+                    }
+                    Err(message) => self.error = Some(message),
                 }
-                Err(message) => self.error = Some(message),
             }
-        }
-        caption(
-            ui,
-            "Open Render Bridge in the Windows tray when you sign in.",
-        );
-        if let Some(error) = &self.error {
-            status(ui, "Settings unavailable", error, CAUTION);
-        }
-        if let Some(installed) = installed {
-            ui.separator();
-            ui.heading("Storage");
             caption(
                 ui,
-                &format!("Installation folder: {}", installed.data_dir.display()),
+                "Open Render Bridge in the Windows tray when you sign in.",
             );
+            if let Some(error) = &self.error {
+                caption(ui, error);
+            }
+        });
+    }
+
+    fn storage(&mut self, ui: &mut Ui, installed: Option<&Installed>) {
+        let Some(installed) = installed else {
+            caption(
+                ui,
+                "Open a saved Render Bridge installation to change its folders.",
+            );
+            return;
+        };
+
+        card(ui, |ui| {
+            let previous = self.model_destination.clone();
+            if asset_ui::compact_folder_option(
+                ui,
+                "Model storage folder",
+                &mut self.model_destination,
+                "Automatic. Use folders registered by the active ComfyUI build.",
+            ) {
+                self.message = Some(
+                    match model_library::save_destination(
+                        &installed.data_dir,
+                        self.model_destination.as_deref(),
+                    ) {
+                        Ok(()) => {
+                            self.model_destination_changed = true;
+                            Ok("Model storage updated.")
+                        }
+                        Err(error) => {
+                            self.model_destination = previous;
+                            Err(error)
+                        }
+                    },
+                );
+            }
+            ui.separator();
             match setup::saved_install_settings(installed) {
                 Ok(settings) => self.assets.settings(
                     ui,
@@ -346,35 +520,85 @@ impl StartupSetting {
                 Err(error) => caption(ui, &error),
             }
             ui.separator();
-            ui.heading("Advanced configuration");
+            ui.horizontal_wrapped(|ui| {
+                field_label(ui, "Hugging Face token");
+                caption(
+                    ui,
+                    if std::env::var_os("HF_TOKEN").is_some_and(|value| !value.is_empty()) {
+                        "Available from the environment."
+                    } else {
+                        "Optional for gated downloads."
+                    },
+                );
+            });
+        });
+    }
+
+    fn advanced(&mut self, ui: &mut Ui, installed: Option<&Installed>) {
+        let Some(installed) = installed else {
+            if let Some(url) = &self.comfy_url {
+                card(ui, |ui| {
+                    field_label(ui, "ComfyUI address");
+                    code_label(ui, url);
+                });
+            }
+            caption(
+                ui,
+                "Open a saved Render Bridge installation to edit or export its configuration.",
+            );
+            return;
+        };
+
+        card(ui, |ui| {
+            field_label(ui, "Installation folder");
+            code_label(ui, &installed.data_dir.to_string_lossy());
+            ui.separator();
+            match setup::saved_install_settings(installed) {
+                Ok(settings) => {
+                    field_label(ui, "ComfyUI address");
+                    code_label(ui, &settings.comfy_url);
+                    for (label, kind) in [("Input folder", "input"), ("Output folder", "output")] {
+                        field_label(ui, label);
+                        code_label(ui, &setup::folder(&settings, kind).to_string_lossy());
+                    }
+                }
+                Err(error) => caption(ui, &error),
+            }
+        });
+
+        card(ui, |ui| {
+            field_label(ui, "Configuration file");
             caption(
                 ui,
                 "Stop Render Bridge before editing its active configuration. Start it again to verify your changes.",
             );
-            if secondary(ui, "Open configuration file", true).clicked() {
-                let file = setup::config_file(installed);
-                if setup::quiet_command("notepad.exe")
-                    .arg(file)
-                    .spawn()
-                    .is_err()
-                {
-                    self.error = Some("Could not open the configuration file.".into());
+            ui.horizontal_wrapped(|ui| {
+                if secondary(ui, "Open configuration file", true).clicked() {
+                    self.message = open_configuration_file(installed).err().map(Err);
                 }
-            }
-            if secondary(ui, "Export setup config", true).clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Render Bridge settings", &["json"])
-                    .set_file_name("settings.json")
-                    .save_file()
-            {
-                self.error = setup::export_setup_config(installed, &path).err();
-            }
+                if secondary(ui, "Export setup config", true).clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Render Bridge settings", &["json"])
+                        .set_file_name("settings.json")
+                        .save_file()
+                {
+                    self.message = Some(
+                        setup::export_setup_config(installed, &path)
+                            .map(|()| "Setup config exported."),
+                    );
+                }
+            });
             ui.hyperlink_to("Server and model settings", SETTINGS_GUIDE);
-        }
+        });
     }
 
-    fn actions(&mut self, ui: &mut Ui) -> bool {
-        ui.horizontal_wrapped(|ui| {
+    fn diagnostics(&mut self, ui: &mut Ui, installed: Option<&Installed>) {
+        card(ui, |ui| {
+            self.diagnostics
+                .show(ui, installed, self.comfy_url.as_deref())
+        });
+        card(ui, |ui| {
+            field_label(ui, "Crash logs");
             let logs = diagnostics::existing_directory();
             if secondary(ui, "Open crash logs", logs.is_some())
                 .on_disabled_hover_text("No local crash logs yet.")
@@ -382,13 +606,240 @@ impl StartupSetting {
                 && let Some(folder) = logs
                 && !diagnostics::open_directory(&folder)
             {
-                self.error = Some("Could not open the crash logs folder.".into());
+                self.message = Some(Err("Could not open the crash logs folder.".into()));
             }
-            secondary(ui, "Done", true).clicked()
+        });
+        ui.horizontal_wrapped(|ui| {
+            caption(ui, concat!("Version ", env!("CARGO_PKG_VERSION")));
+            ui.hyperlink_to("Release notes", RELEASE_NOTES);
+        });
+    }
+
+    fn take_model_destination_change(&mut self) -> bool {
+        std::mem::take(&mut self.model_destination_changed)
+    }
+
+    fn actions(ui: &mut Ui) -> bool {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            settings_choice(ui, "Done", true, 72.0).clicked()
         })
         .inner
     }
 }
+
+#[cfg(windows)]
+#[derive(Default)]
+struct SettingsDiagnostics {
+    target: Option<(Option<PathBuf>, Option<String>)>,
+    worker: Option<Receiver<SettingsHealth>>,
+    result: Option<SettingsHealth>,
+    error: Option<&'static str>,
+}
+
+#[cfg(windows)]
+struct SettingsHealth {
+    bridge_listening: Option<bool>,
+    queue: Option<Result<jobs::QueueStatus, String>>,
+}
+
+#[cfg(windows)]
+impl SettingsDiagnostics {
+    fn show(&mut self, ui: &mut Ui, installed: Option<&Installed>, standalone_url: Option<&str>) {
+        let url = installed
+            .and_then(setup::installed_comfy_url)
+            .or_else(|| standalone_url.map(str::to_owned));
+        let target = (
+            installed.map(|installed| installed.data_dir.clone()),
+            url.clone(),
+        );
+        if self.target.as_ref() != Some(&target) {
+            self.target = Some(target);
+            self.result = None;
+            self.start(ui.ctx(), installed.cloned(), url.clone());
+        }
+        if let Some(worker) = &self.worker {
+            match worker.try_recv() {
+                Ok(result) => {
+                    self.result = Some(result);
+                    self.worker = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.error = Some("The status check did not finish.");
+                    self.worker = None;
+                }
+            }
+        }
+
+        field_label(ui, "Service status");
+        let bridge_listening = self
+            .result
+            .as_ref()
+            .and_then(|result| result.bridge_listening);
+        let queue = self
+            .result
+            .as_ref()
+            .and_then(|result| result.queue.as_ref());
+        let bridge = match (installed.is_some(), bridge_listening) {
+            (_, Some(true)) => ("Listening", GREEN),
+            (_, Some(false)) => ("Unverified", CAUTION),
+            (true, None) => ("Waiting for check", MUTED),
+            (false, None) => ("No saved installation", MUTED),
+        };
+        let comfy = match (url.is_some(), queue) {
+            (_, Some(Ok(_))) => ("Responding", GREEN),
+            (_, Some(Err(_))) => ("Unverified", CAUTION),
+            (true, None) => ("Waiting for check", MUTED),
+            (false, None) => ("No backend selected", MUTED),
+        };
+        Self::row(ui, "Render Bridge", bridge.0, bridge.1);
+        ui.separator();
+        Self::row(ui, "ComfyUI", comfy.0, comfy.1);
+        if let Some(Ok(queue)) = queue {
+            ui.separator();
+            Self::row(
+                ui,
+                "Queue",
+                &format!("{} running, {} queued", queue.running, queue.queued),
+                MUTED,
+            );
+        }
+        if let Some(Err(error)) = queue {
+            caption(ui, error);
+        }
+        if let Some(error) = self.error {
+            caption(ui, error);
+        }
+        if secondary(
+            ui,
+            if self.worker.is_some() {
+                "Checking…"
+            } else {
+                "Recheck services"
+            },
+            self.worker.is_none() && (installed.is_some() || url.is_some()),
+        )
+        .clicked()
+        {
+            self.start(ui.ctx(), installed.cloned(), url);
+        }
+    }
+
+    fn row(ui: &mut Ui, label: &str, state: &str, color: Color32) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(label).strong());
+            ui.label(RichText::new(state).color(theme::color(ui.ctx(), color)));
+        });
+    }
+
+    fn start(&mut self, ctx: &egui::Context, installed: Option<Installed>, url: Option<String>) {
+        self.worker = None;
+        self.error = None;
+        if installed.is_none() && url.is_none() {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        let viewport = ctx.viewport_id();
+        let ctx = ctx.clone();
+        match thread::Builder::new()
+            .name("render-bridge-diagnostics".into())
+            .spawn(move || {
+                let bridge_listening = installed.as_ref().map(connection::bridge_is_listening);
+                let queue = url.as_deref().map(jobs::check);
+                let _ = send.send(SettingsHealth {
+                    bridge_listening,
+                    queue,
+                });
+                ctx.request_repaint_of(viewport);
+            }) {
+            Ok(_) => self.worker = Some(receive),
+            Err(_) => self.error = Some("The status check could not start."),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn settings_choice(ui: &mut Ui, label: &str, selected: bool, width: f32) -> egui::Response {
+    let fill = theme::color(ui.ctx(), if selected { LIME } else { SURFACE });
+    let text = if selected {
+        theme::on_fill(fill)
+    } else {
+        theme::color(ui.ctx(), INK)
+    };
+    ui.add(
+        egui::Button::new(RichText::new(label).color(text).strong())
+            .selected(selected)
+            .fill(fill)
+            .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
+            .corner_radius(8)
+            .min_size(egui::vec2(width, 34.0)),
+    )
+}
+
+#[cfg(windows)]
+fn theme_preview(ui: &mut Ui) {
+    let width = ui.available_width().min(280.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 88.0), egui::Sense::hover());
+    let fill = |role| theme::color(ui.ctx(), role);
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        8,
+        fill(CREAM),
+        Stroke::new(1.0_f32, fill(LINE)),
+        egui::StrokeKind::Inside,
+    );
+    let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 19.0));
+    painter.rect_filled(
+        top,
+        egui::CornerRadius {
+            nw: 8,
+            ne: 8,
+            ..Default::default()
+        },
+        fill(RAIL),
+    );
+    for index in 0..3 {
+        painter.circle_filled(
+            top.min + egui::vec2(12.0 + index as f32 * 11.0, 9.0),
+            2.5,
+            fill(LIME),
+        );
+    }
+    let body = egui::Rect::from_min_max(
+        rect.min + egui::vec2(10.0, 28.0),
+        rect.max - egui::vec2(10.0, 9.0),
+    );
+    let rail = egui::Rect::from_min_max(
+        body.min,
+        egui::pos2(body.min.x + (body.width() * 0.30), body.max.y),
+    );
+    painter.rect_filled(rail, 6, fill(SURFACE));
+    painter.rect_filled(
+        egui::Rect::from_min_size(
+            rail.min + egui::vec2(5.0, 6.0),
+            egui::vec2((rail.width() - 10.0).max(1.0), 11.0),
+        ),
+        4,
+        fill(LIME),
+    );
+    let pane = egui::Rect::from_min_max(egui::pos2(rail.max.x + 8.0, body.min.y), body.max);
+    painter.rect_filled(pane, 6, fill(SURFACE));
+    for (offset, fraction) in [(10.0, 0.70), (24.0, 0.50), (37.0, 0.60)] {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                pane.min + egui::vec2(8.0, offset),
+                egui::vec2(pane.width().max(1.0) * fraction, 5.0),
+            ),
+            2,
+            fill(LINE),
+        );
+    }
+    response.on_hover_text("Preview of the active theme");
+}
+
+#[cfg(windows)]
+const SETTINGS_RAIL_MIN_WIDTH: f32 = 520.0;
 
 #[cfg(windows)]
 fn settings_viewport_id() -> egui::ViewportId {
@@ -397,7 +848,7 @@ fn settings_viewport_id() -> egui::ViewportId {
 
 #[cfg(windows)]
 fn settings_window_size(monitor: Option<Vec2>) -> Vec2 {
-    let preferred = egui::vec2(550.0, 620.0);
+    let preferred = egui::vec2(660.0, 560.0);
     monitor.map_or(preferred, |size| {
         // Leave room for Windows decorations and the taskbar at the monitor's scale.
         preferred.min((size - egui::vec2(32.0, 64.0)).max(egui::vec2(1.0, 1.0)))
@@ -469,24 +920,95 @@ impl TrayPanel {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 enum WorkspaceTab {
     #[default]
     Jobs,
     Models,
     Pipelines,
     Nodes,
+    Connect,
 }
 
-const WORKSPACE_TABS: [(WorkspaceTab, &str); 4] = [
+const WORKSPACE_TABS: [(WorkspaceTab, &str); 5] = [
     (WorkspaceTab::Jobs, "Jobs"),
     (WorkspaceTab::Models, "Models"),
     (WorkspaceTab::Pipelines, "Pipelines"),
     (WorkspaceTab::Nodes, "Nodes"),
+    (WorkspaceTab::Connect, "Connect"),
 ];
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum ConnectTarget {
+    #[default]
+    Local,
+    Network,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum ConnectClient {
+    #[default]
+    Codex,
+    Claude,
+    Other,
+}
+
+impl ConnectClient {
+    fn verifier(self) -> Option<Client> {
+        match self {
+            Self::Codex => Some(Client::Codex),
+            Self::Claude => Some(Client::Claude),
+            Self::Other => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        self.verifier().map_or("Other clients", Client::label)
+    }
+
+    fn guide(self) -> &'static str {
+        match self {
+            Self::Codex => {
+                "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/connections.md#codex"
+            }
+            Self::Claude => {
+                "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/connections.md#claude-code"
+            }
+            Self::Other => CLIENT_GUIDE,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct VerificationTarget {
+    data_dir: PathBuf,
+    app_dir: PathBuf,
+    endpoint: String,
+    settings: Option<Settings>,
+}
+
+impl VerificationTarget {
+    fn capture(installed: &Installed) -> Self {
+        Self {
+            data_dir: installed.data_dir.clone(),
+            app_dir: installed.app_dir.clone(),
+            endpoint: installed.mcp_url.clone(),
+            settings: setup::saved_install_settings(installed).ok(),
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        setup::existing_install_at(&self.data_dir)
+            .as_ref()
+            .map(Self::capture)
+            .as_ref()
+            == Some(self)
+    }
+}
 
 struct ControlsState {
     data_dir: Option<PathBuf>,
+    installation: Option<VerificationTarget>,
     backend_url: Option<String>,
     model_root: PathBuf,
     queue: Option<QueueView>,
@@ -529,7 +1051,9 @@ struct Installer {
     install_cancel: Option<Arc<AtomicBool>>,
     installed: Option<Installed>,
     copied: Option<&'static str>,
-    panel_connect: bool,
+    connect_target: ConnectTarget,
+    connect_client: ConnectClient,
+    connect_profile: String,
     confirm_rotation: bool,
     rotation_message: Option<String>,
     instances: Vec<discovery::Instance>,
@@ -606,7 +1130,9 @@ impl Installer {
             install_cancel: None,
             installed: None,
             copied: None,
-            panel_connect: false,
+            connect_target: ConnectTarget::default(),
+            connect_client: ConnectClient::default(),
+            connect_profile: String::new(),
             confirm_rotation: false,
             rotation_message: None,
             instances: Vec::new(),
@@ -681,6 +1207,7 @@ impl Installer {
                 installer.step = Step::Connect;
                 installer.controls = Some(ControlsState {
                     data_dir,
+                    installation: None,
                     backend_url,
                     model_root: PathBuf::new(),
                     queue,
@@ -859,7 +1386,8 @@ impl Installer {
             ui.set_width((ctx.content_rect().width() - 32.0).clamp(120.0, 420.0));
             let title = match action {
                 QueueAction::Inspect => "Jobs",
-                _ => "Check jobs",
+                QueueAction::StopBridge => "Stop Render Bridge?",
+                QueueAction::CloseWindow => "Stop Render Bridge and exit?",
             };
             ui.heading(RichText::new(title).size(25.0).strong());
             let footer_space = if action == QueueAction::Inspect { 116.0 } else { 164.0 };
@@ -1072,6 +1600,7 @@ impl Installer {
         };
         self.verification = None;
         self.progress = "Starting the Bridge and checking authenticated MCP…".into();
+        let target = VerificationTarget::capture(&installed);
         let running = self.running.take();
         let codex_profile = self.codex_profile.trim().to_owned();
         let clients: Vec<_> = [
@@ -1102,7 +1631,7 @@ impl Installer {
                     );
                     (running, result)
                 };
-                let _ = sender.send(Event::Verified(running, result));
+                let _ = sender.send(Event::Verified(target, running, result));
                 ctx.request_repaint();
             })
             .is_ok()
@@ -1211,24 +1740,57 @@ impl Installer {
 
     #[cfg(windows)]
     fn start_panel_server(&mut self, ctx: &egui::Context, force_start: bool) {
+        self.start_or_verify_panel(ctx, force_start, false);
+    }
+
+    fn start_or_verify_panel(
+        &mut self,
+        ctx: &egui::Context,
+        force_start: bool,
+        verify_client: bool,
+    ) {
         let Some(installed) = self.installed.clone() else {
             return;
         };
-        let already_running = || serde_json::json!({ "bridge": "already_running" });
-        if self.running.as_mut().is_some_and(RunningBridge::is_running) {
+        let owned = self.running.as_mut().is_some_and(RunningBridge::is_running);
+        if owned && !verify_client {
             if self.verification.is_none() {
-                self.verification = Some(Ok(already_running()));
+                self.verification = Some(Ok(serde_json::json!({ "bridge": "already_running" })));
             }
             return;
         }
-        let confirm_only = !force_start
-            && self
-                .controls
-                .as_ref()
-                .is_some_and(|controls| controls.bridge_online);
+        #[cfg(windows)]
+        let confirm_only = owned
+            || (!force_start
+                && self
+                    .controls
+                    .as_ref()
+                    .is_some_and(|controls| controls.bridge_online));
+        #[cfg(not(windows))]
+        let confirm_only = {
+            let _ = force_start;
+            owned
+        };
+
+        let client = verify_client
+            .then(|| self.connect_client.verifier())
+            .flatten();
+        let clients: Vec<_> = client.into_iter().collect();
+        let codex_profile = if client == Some(Client::Codex) {
+            self.connect_profile.trim().to_owned()
+        } else {
+            String::new()
+        };
         self.verification = None;
-        self.progress = "Checking the Render Bridge server…".into();
-        self.running = None;
+        self.progress = if verify_client {
+            "Checking the authenticated MCP connection…".into()
+        } else {
+            "Checking the Render Bridge server…".into()
+        };
+        if !owned {
+            self.running = None;
+        }
+        let target = VerificationTarget::capture(&installed);
         let ctx = ctx.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = thread::Builder::new()
@@ -1236,20 +1798,22 @@ impl Installer {
             .spawn(move || {
                 let mut running = None;
                 let result = if connection::bridge_is_listening(&installed) {
-                    connection::verify_listener(&installed, &[], "").and_then(|mut result| {
-                        if result["bridge"] == "ok" {
-                            let settings = setup::saved_install_settings(&installed)?;
-                            result["folders"] = setup::recheck_folders(&settings)?.into();
-                            result["bridge"] = "already_running".into();
-                        }
-                        Ok(result)
-                    })
+                    connection::verify_listener(&installed, &clients, &codex_profile).and_then(
+                        |mut result| {
+                            if result["bridge"] == "ok" {
+                                let settings = setup::saved_install_settings(&installed)?;
+                                result["folders"] = setup::recheck_folders(&settings)?.into();
+                                result["bridge"] = "already_running".into();
+                            }
+                            Ok(result)
+                        },
+                    )
                 } else if confirm_only {
                     Err("The server no longer responds. Check the status and try again.".into())
                 } else {
-                    connection::start_and_verify(&installed, &mut running, &[], "")
+                    connection::start_and_verify(&installed, &mut running, &clients, &codex_profile)
                 };
-                let _ = sender.send(Event::Verified(running, result));
+                let _ = sender.send(Event::Verified(target, running, result));
                 ctx.request_repaint();
             });
         if worker.is_ok() {
@@ -1340,9 +1904,16 @@ impl Installer {
                         self.use_instance(0);
                     }
                 }
-                Ok(Event::Verified(running, result)) => {
+                Ok(Event::Verified(target, running, result)) => {
                     self.worker = None;
-                    self.running = running;
+                    if let Some(running) = running {
+                        self.running = Some(running);
+                    }
+                    if !target.is_current() {
+                        self.verification = Some(Err("Render Bridge settings changed during verification. Check the connection again.".into()));
+                        self.first_render = first_render::FirstRender::default();
+                        continue;
+                    }
                     #[cfg(windows)]
                     if let Some(controls) = &mut self.controls {
                         controls.bridge_online = result.as_ref().is_ok_and(|result| {
@@ -1362,6 +1933,10 @@ impl Installer {
                 }
                 Ok(Event::TokenRotated(result)) => {
                     self.worker = None;
+                    if result.is_ok() {
+                        self.verification = None;
+                        self.first_render = first_render::FirstRender::default();
+                    }
                     self.rotation_message = Some(result.map_or_else(
                         |error| error,
                         |()| "Token rotated. Start Render Bridge and reconnect your agents using the updated file.".into(),
@@ -1427,55 +2002,48 @@ impl Installer {
     }
 
     fn rail(&self, ctx: &egui::Context) {
+        let width = if ctx.content_rect().width() < 850.0 {
+            154.0
+        } else {
+            178.0
+        };
         egui::SidePanel::left("setup-steps")
-            .exact_width(230.0)
+            .exact_width(width)
             .resizable(false)
+            .show_separator_line(false)
             .frame(
                 Frame::new()
                     .fill(theme::color(ctx, RAIL))
-                    .inner_margin(egui::Margin::symmetric(24, 31)),
+                    .inner_margin(egui::Margin::symmetric(12, 18)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    bridge_mark(ui);
-                    ui.label(
-                        RichText::new("Render\nBridge")
-                            .size(27.0)
-                            .strong()
-                            .color(theme::on_fill(theme::color(ctx, RAIL))),
-                    );
-                });
-                ui.add_space(37.0);
-                for (step, number, label) in STEPS {
+                bridge_mark(ui);
+                ui.label(
+                    RichText::new("Render Bridge")
+                        .size(17.0)
+                        .strong()
+                        .color(theme::on_fill(theme::color(ctx, RAIL))),
+                );
+                ui.add_space(12.0);
+                for (step, label) in STEPS {
                     let selected = step == self.step;
-                    let background = if selected {
-                        theme::color(ctx, RAIL_ACTIVE)
+                    let fill = if selected {
+                        theme::color(ctx, LIME)
                     } else {
                         Color32::TRANSPARENT
                     };
                     let foreground = if selected {
-                        theme::on_fill(background)
+                        theme::on_fill(fill)
                     } else {
                         theme::color(ctx, RAIL_TEXT)
                     };
                     Frame::new()
-                        .fill(background)
-                        .corner_radius(13)
-                        .inner_margin(egui::Margin::symmetric(12, 12))
+                        .fill(fill)
+                        .corner_radius(9)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {
-                            ui.set_min_width(151.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(number)
-                                        .monospace()
-                                        .size(13.0)
-                                        .color(foreground),
-                                );
-                                ui.add_space(5.0);
-                                ui.label(
-                                    RichText::new(label).size(15.0).strong().color(foreground),
-                                );
-                            });
+                            ui.set_min_width(ui.available_width());
+                            ui.label(RichText::new(label).size(14.0).strong().color(foreground));
                         });
                 }
             });
@@ -1485,12 +2053,12 @@ impl Installer {
         header(
             ui,
             "Get ready to render",
-            "Set up a clean machine with Python and ComfyUI. Choose an agent when you are ready to connect.",
+            "Check the three things you need to run your first job.",
         );
         ui.hyperlink_to("Privacy and network use", PRIVACY_GUIDE);
         let idle = self.worker.is_none();
         let ready = self.python_ready();
-        card(ui, |ui| {
+        setup_card(ui, |ui| {
             field_label(ui, "Python 3.11 or newer");
             if self.python_check_failed {
                 caption(ui, "Python could not be checked. Try the check again.");
@@ -1518,7 +2086,9 @@ impl Installer {
                                 .strong()
                                 .color(theme::color(ui.ctx(), GREEN)),
                         );
-                        code_label(ui, &executable.to_string_lossy());
+                        ui.collapsing("Python executable", |ui| {
+                            code_label(ui, &executable.to_string_lossy())
+                        });
                     }
                     PythonReadiness::TooOld { version } => {
                         ui.label(
@@ -1582,76 +2152,81 @@ impl Installer {
             if let Some(message) = &self.python_install_error {
                 caption(ui, message);
             }
-            ui.horizontal_wrapped(|ui| {
-                if secondary(ui, "Select Python executable", idle).clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .set_title("Select your Python executable")
-                        .pick_file()
-                {
-                    self.selected_python = Some(path);
-                    self.check_python(ui.ctx());
-                }
-                if self.selected_python.is_some()
-                    && secondary(ui, "Use automatic detection", idle).clicked()
-                {
-                    self.selected_python = None;
-                    self.check_python(ui.ctx());
-                } else if ready && secondary(ui, "Check Python again", idle).clicked() {
-                    self.check_python(ui.ctx());
-                }
+            ui.collapsing("Python options", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if secondary(ui, "Select Python executable", idle).clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Select your Python executable")
+                            .pick_file()
+                    {
+                        self.selected_python = Some(path);
+                        self.check_python(ui.ctx());
+                    }
+                    if self.selected_python.is_some()
+                        && secondary(ui, "Use automatic detection", idle).clicked()
+                    {
+                        self.selected_python = None;
+                        self.check_python(ui.ctx());
+                    } else if ready && secondary(ui, "Check Python again", idle).clicked() {
+                        self.check_python(ui.ctx());
+                    }
+                })
             });
             if let Some(message) = self.copied {
                 caption(ui, message);
             }
         });
-        card(ui, |ui| {
+        setup_card(ui, |ui| {
             field_label(ui, "ComfyUI on this computer");
             caption(
                 ui,
-                "Install Comfy Desktop, finish its setup, and start a local build. The next step checks its API and folders. You can also use a portable or manual installation.",
+                "Start Comfy Desktop or a portable or manual build. Setup checks its connection and folders on the next screen.",
             );
             ui.horizontal_wrapped(|ui| {
                 ui.hyperlink_to("Get Comfy Desktop", COMFY_DOWNLOAD);
                 ui.hyperlink_to("Manual ComfyUI setup", COMFY_GUIDE);
             });
         });
-        card(ui, |ui| {
+        setup_card(ui, |ui| {
             field_label(ui, "Agent client");
             caption(
                 ui,
-                "Install and sign in to a client before you connect it. You can set up the Bridge first.",
+                "Choose an agent that supports MCP. You can connect it after installing.",
             );
             ui.horizontal_wrapped(|ui| {
                 ui.hyperlink_to("Set up Claude Code", CLAUDE_SETUP);
                 ui.hyperlink_to("Set up Codex", CODEX_SETUP);
             });
         });
-        ui.horizontal_wrapped(|ui| {
-            self.setup_config_picker(ui, idle);
-            if let Some(installed) = self
-                .setup_directory()
-                .ok()
-                .and_then(|data| setup::existing_install_at(&data))
-                && secondary(ui, "Open existing setup", idle).clicked()
-            {
-                self.open_existing(installed);
-            }
-            if secondary(ui, "Browse for an installation", idle).clicked()
-                && let Some(folder) = rfd::FileDialog::new()
-                    .set_title("Choose an existing Render Bridge installation folder")
-                    .pick_folder()
-            {
-                if let Some(installed) = setup::existing_install_at(&folder) {
+        self.setup_config_picker(ui, idle);
+        ui.collapsing("Existing installations", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(installed) = self
+                    .setup_directory()
+                    .ok()
+                    .and_then(|data| setup::existing_install_at(&data))
+                    && secondary(ui, "Open existing setup", idle).clicked()
+                {
                     self.open_existing(installed);
-                } else {
-                    self.install_error =
-                        Some("That folder does not contain a verified Render Bridge setup.".into());
                 }
-            }
-            #[cfg(windows)]
-            if secondary(ui, "Uninstall Render Bridge", idle).clicked() {
-                self.uninstall.choose();
-            }
+                if secondary(ui, "Browse for an installation", idle).clicked()
+                    && let Some(folder) = rfd::FileDialog::new()
+                        .set_title("Choose an existing Render Bridge installation folder")
+                        .pick_folder()
+                {
+                    if let Some(installed) = setup::existing_install_at(&folder) {
+                        self.open_existing(installed);
+                    } else {
+                        self.install_error = Some(
+                            "That folder does not contain a verified Render Bridge setup.".into(),
+                        );
+                    }
+                }
+                #[cfg(windows)]
+                if secondary(ui, "Repair or uninstall", idle).clicked() {
+                    self.uninstall.choose();
+                }
+            })
         });
         if self.setup_config_error.is_none()
             && (self.using_saved_setup || self.setup_profile.is_some())
@@ -1670,7 +2245,8 @@ impl Installer {
                 ui.set_width((ui.ctx().content_rect().width() - 32.0).clamp(120.0, 360.0));
                 ui.heading("Install Python on this PC?");
                 caption(ui, "WinGet will request the latest available Python 3.13 patch for all users on this PC. Windows will ask for administrator approval.");
-                caption(ui, "You can cancel and use the official Python download instead.");
+                let (label, url) = python_install_link();
+                ui.hyperlink_to(label, url);
                 ui.horizontal_wrapped(|ui| {
                     let cancel = secondary(ui, "Cancel", true).clicked();
                     let approve = primary(ui, "Request administrator approval", true).clicked();
@@ -1690,34 +2266,54 @@ impl Installer {
     fn comfy_screen(&mut self, ui: &mut Ui) {
         header(
             ui,
-            "Connect to ComfyUI",
-            "Find a running ComfyUI instance or enter the address and folders for its build.",
+            "Choose a ComfyUI build",
+            "Select the local build you want Render Bridge to use.",
         );
         let idle = self.worker.is_none();
         let mut changed = false;
+        self.setup_config_picker(ui, idle);
         ui.horizontal_wrapped(|ui| {
-            self.setup_config_picker(ui, idle);
             if secondary(ui, "Detect running ComfyUI", idle).clicked() {
                 self.start_discovery(ui.ctx());
             }
-            if secondary(ui, "ComfyUI Jobs", idle).clicked() {
+            if secondary(ui, "Check jobs", idle).clicked() {
                 self.show_jobs(QueueAction::Inspect);
             }
         });
         if !self.instances.is_empty() {
             let mut chosen = None;
-            card(ui, |ui| {
-                field_label(ui, "Detected ComfyUI instances");
-                for (index, instance) in self.instances.iter().enumerate() {
-                    ui.horizontal_wrapped(|ui| {
-                        if secondary(ui, &format!("Use {}", instance.url), idle).clicked() {
+            for (index, instance) in self.instances.iter().enumerate() {
+                let selected = instance.url == self.settings.comfy_url
+                    && setup::folder(&self.settings, "input") == instance.input
+                    && setup::folder(&self.settings, "output") == instance.output;
+                let stroke = if selected { VIOLET } else { LINE };
+                Frame::new()
+                    .fill(theme::color(ui.ctx(), SURFACE))
+                    .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), stroke)))
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::symmetric(12, 9))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        if ui
+                            .add_enabled(
+                                idle,
+                                egui::RadioButton::new(
+                                    selected,
+                                    RichText::new(&instance.url).strong(),
+                                ),
+                            )
+                            .clicked()
+                        {
                             chosen = Some(index);
                         }
+                        if let Some(root) = &instance.root {
+                            code_label(ui, &root.to_string_lossy());
+                        } else {
+                            caption(ui, &format!("Input · {}", instance.input.display()));
+                            caption(ui, &format!("Output · {}", instance.output.display()));
+                        }
                     });
-                    caption(ui, &format!("Input: {}", instance.input.display()));
-                    caption(ui, &format!("Output: {}", instance.output.display()));
-                }
-            });
+            }
             if let Some(index) = chosen {
                 self.use_instance(index);
             }
@@ -1727,37 +2323,41 @@ impl Installer {
                 "No running instance reported its folders. Start ComfyUI or enter the build's address and folders.",
             );
         }
-        card(ui, |ui| {
-            ui.add_enabled_ui(idle, |ui| {
-                let root_label = field_label(ui, "ComfyUI folder");
-                ui.horizontal(|ui| {
-                    let width = (ui.available_width() - 108.0).max(150.0);
-                    let mut root_changed =
-                        text_edit(ui, &mut self.settings.comfy_root, width, root_label);
-                    if secondary(ui, "Browse…", true).clicked() {
-                        let mut dialog =
-                            rfd::FileDialog::new().set_title("Choose the ComfyUI folder");
-                        let current = Path::new(&self.settings.comfy_root);
-                        if current.is_dir() {
-                            dialog = dialog.set_directory(current);
-                        }
-                        if let Some(path) = dialog.pick_folder() {
-                            self.settings.comfy_root = path.to_string_lossy().into_owned();
-                            root_changed = true;
-                        }
-                    }
-                    if root_changed {
-                        self.settings.comfy_input.clear();
-                        self.settings.comfy_output.clear();
-                        changed = true;
-                    }
-                });
-                caption(ui, "Select the folder that contains input and output.");
-                ui.add_space(9.0);
-                let url_label = field_label(ui, "Local API address");
-                let url_width = ui.available_width();
-                changed |= text_edit(ui, &mut self.settings.comfy_url, url_width, url_label);
-                ui.collapsing("Separate input and output folders", |ui| {
+        egui::CollapsingHeader::new("ComfyUI address and folders")
+            .default_open(self.instances.is_empty())
+            .show(ui, |ui| {
+                card(ui, |ui| {
+                    ui.add_enabled_ui(idle, |ui| {
+                        let root_label = field_label(ui, "ComfyUI folder");
+                        ui.horizontal(|ui| {
+                            let width = (ui.available_width() - 108.0).max(150.0);
+                            let mut root_changed =
+                                text_edit(ui, &mut self.settings.comfy_root, width, root_label);
+                            if secondary(ui, "Browse…", true).clicked() {
+                                let mut dialog =
+                                    rfd::FileDialog::new().set_title("Choose the ComfyUI folder");
+                                let current = Path::new(&self.settings.comfy_root);
+                                if current.is_dir() {
+                                    dialog = dialog.set_directory(current);
+                                }
+                                if let Some(path) = dialog.pick_folder() {
+                                    self.settings.comfy_root = path.to_string_lossy().into_owned();
+                                    root_changed = true;
+                                }
+                            }
+                            if root_changed {
+                                self.settings.comfy_input.clear();
+                                self.settings.comfy_output.clear();
+                                changed = true;
+                            }
+                        });
+                        caption(ui, "Select the folder that contains input and output.");
+                        ui.add_space(9.0);
+                        let url_label = field_label(ui, "Local API address");
+                        let url_width = ui.available_width();
+                        changed |=
+                            text_edit(ui, &mut self.settings.comfy_url, url_width, url_label);
+                        ui.collapsing("Separate input and output folders", |ui| {
                     let input = field_label(ui, "Input folder override");
                     changed |= text_edit(
                         ui,
@@ -1777,8 +2377,9 @@ impl Installer {
                         "Leave overrides empty to use input and output under the main folder.",
                     );
                 });
+                    });
+                })
             });
-        });
         if changed {
             self.settings_changed();
         }
@@ -1838,11 +2439,235 @@ impl Installer {
         }
     }
 
+    fn installed_connect(&mut self, ui: &mut Ui) {
+        ui.heading(RichText::new("Connect an agent").size(25.0).strong());
+        let Some(installed) = self.installed.clone() else {
+            status(
+                ui,
+                "Installation unavailable",
+                "Open Render Bridge Setup to locate or repair the installation.",
+                CAUTION,
+            );
+            return;
+        };
+        let idle = self.worker.is_none() && !self.update_in_progress();
+        ui.horizontal_wrapped(|ui| {
+            for (target, label) in [
+                (ConnectTarget::Local, "This computer"),
+                (ConnectTarget::Network, "Another device"),
+            ] {
+                if connect_option(ui, label, self.connect_target == target, idle, CREAM) {
+                    self.connect_target = target;
+                    self.copied = None;
+                    self.confirm_rotation = false;
+                }
+            }
+        });
+
+        if self.connect_target == ConnectTarget::Network {
+            self.network_connect(ui, &installed);
+            return;
+        }
+
+        let owned = self.running.as_mut().is_some_and(RunningBridge::is_running);
+        #[cfg(windows)]
+        let online = owned
+            || self
+                .controls
+                .as_ref()
+                .is_some_and(|controls| controls.bridge_online);
+        #[cfg(not(windows))]
+        let online = owned;
+        let can_rotate = idle && !online;
+        if ui.available_width() >= 760.0 {
+            ui.columns(2, |columns| {
+                self.installed_client_fields(&mut columns[0], &installed, idle);
+                self.installed_receipt_fields(&mut columns[1], &installed, can_rotate);
+            });
+        } else {
+            self.installed_client_fields(ui, &installed, idle);
+            self.installed_receipt_fields(ui, &installed, can_rotate);
+        }
+    }
+
+    fn installed_client_fields(&mut self, ui: &mut Ui, installed: &Installed, idle: bool) {
+        card(ui, |ui| {
+            field_label(ui, "MCP client");
+            ui.horizontal_wrapped(|ui| {
+                for client in [
+                    ConnectClient::Codex,
+                    ConnectClient::Claude,
+                    ConnectClient::Other,
+                ] {
+                    if connect_option(
+                        ui,
+                        client.label(),
+                        self.connect_client == client,
+                        idle,
+                        SURFACE,
+                    ) {
+                        self.connect_client = client;
+                        self.copied = None;
+                    }
+                }
+            });
+            if self.connect_client == ConnectClient::Codex {
+                ui.collapsing("Verify a Codex profile (optional)", |ui| {
+                    let label = field_label(ui, "Profile name");
+                    ui.add_enabled_ui(idle, |ui| {
+                        let width = ui.available_width();
+                        if text_edit(ui, &mut self.connect_profile, width, label)
+                            && let Some(result) = self.verification.as_mut()
+                            && let Some(entries) = result
+                                .as_mut()
+                                .ok()
+                                .and_then(serde_json::Value::as_object_mut)
+                        {
+                            entries.remove(Client::Codex.key());
+                        }
+                    });
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                if primary(ui, "Copy agent setup prompt", true).clicked() {
+                    let preface = match self.connect_client {
+                        ConnectClient::Other => String::new(),
+                        client => format!("Use {} as my MCP client.\n\n", client.label()),
+                    };
+                    ui.ctx().copy_text(preface + &agent_setup_prompt(installed));
+                    self.copied =
+                        Some("Setup prompt copied. Paste it into your agent on this computer.");
+                }
+                ui.hyperlink_to("Manual setup", self.connect_client.guide());
+            });
+            ui.separator();
+            if connect_copy_row(ui, "MCP endpoint", "Copy address", &installed.mcp_url) {
+                self.copied = Some("MCP endpoint copied.");
+            }
+            if connect_copy_row(
+                ui,
+                "Private token file",
+                "Copy path",
+                &installed.token_path.to_string_lossy(),
+            ) {
+                self.copied = Some("Private token file path copied.");
+            }
+            if let Some(message) = self.copied {
+                caption(ui, message);
+            }
+            ui.separator();
+            if monitor_button(ui, "Start & Verify", idle, SURFACE).clicked() {
+                self.start_or_verify_panel(ui.ctx(), true, true);
+            }
+            if !idle && self.worker.is_some() {
+                activity(ui, &self.progress);
+            } else if let Some(result) = &self.verification {
+                match result {
+                    Ok(result) => {
+                        let (message, passed) =
+                            bridge_status(result["bridge"].as_str().unwrap_or_default());
+                        connection_result(ui, "Render Bridge", message, passed);
+                        if passed && result["folders"].as_bool() != Some(true) {
+                            connection_result(
+                                ui,
+                                "ComfyUI folders",
+                                "Folder pairing could not be verified.",
+                                false,
+                            );
+                        }
+                        if let Some(client) = self.connect_client.verifier()
+                            && let Some(value) = result[client.key()].as_str()
+                        {
+                            let (message, passed) = client_status(value);
+                            connection_result(ui, client.label(), message, passed);
+                        }
+                    }
+                    Err(error) => connection_result(ui, "Verification", error, false),
+                }
+            }
+        });
+    }
+
+    fn installed_receipt_fields(&mut self, ui: &mut Ui, installed: &Installed, can_rotate: bool) {
+        let server_verified = self.server_ready_for_render();
+        self.first_render.show(ui, installed, server_verified);
+        ui.collapsing("Token security", |ui| {
+            if self.confirm_rotation {
+                caption(ui, "Stop every server that uses this token file. Rotation revokes current credentials and signed links. Reconnect your agents after restarting Render Bridge.");
+                ui.horizontal_wrapped(|ui| {
+                    if monitor_button(ui, "Cancel", true, SURFACE).clicked() {
+                        self.confirm_rotation = false;
+                    }
+                    if monitor_button(ui, "Rotate private token", can_rotate, ERROR).clicked() {
+                        self.confirm_rotation = false;
+                        self.rotate_token(ui.ctx(), installed.clone());
+                    }
+                });
+            } else if monitor_button(ui, "Rotate token…", can_rotate, SURFACE)
+                .on_disabled_hover_text("Stop Render Bridge before rotating the token.")
+                .clicked()
+            {
+                self.confirm_rotation = true;
+            }
+            if let Some(message) = &self.rotation_message {
+                caption(ui, message);
+            }
+        });
+    }
+
+    fn network_connect(&mut self, ui: &mut Ui, installed: &Installed) {
+        card(ui, |ui| {
+            field_label(ui, "Connect over a private network");
+            caption(
+                ui,
+                "Keep the render host's listener local. Use an SSH tunnel for one device or an HTTPS proxy on your private network.",
+            );
+            if let Some(port) = url::Url::parse(&installed.mcp_url)
+                .ok()
+                .and_then(|url| url.port_or_known_default())
+            {
+                let command = format!(
+                    "ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:{port}:127.0.0.1:{port} user@render-host"
+                );
+                caption(
+                    ui,
+                    "On the client device, replace user@render-host with the render host's SSH login. Keep the tunnel open while you render.",
+                );
+                if connect_copy_row(ui, "SSH tunnel command", "Copy command", &command) {
+                    self.copied = Some("Tunnel command copied.");
+                }
+                if connect_copy_row(
+                    ui,
+                    "MCP endpoint through the tunnel",
+                    "Copy address",
+                    &installed.mcp_url,
+                ) {
+                    self.copied = Some("Tunnel endpoint copied.");
+                }
+            }
+            caption(
+                ui,
+                "Store the bearer token in the client device's private credential settings, then verify with server_status.",
+            );
+            ui.hyperlink_to("Set up access from another device", REMOTE_GUIDE);
+            if let Some(message) = self.copied {
+                caption(ui, message);
+            }
+        });
+    }
+
+    fn update_in_progress(&self) -> bool {
+        #[cfg(windows)]
+        return self.update.blocks_controls();
+        #[cfg(not(windows))]
+        false
+    }
+
     fn models_screen(&mut self, ui: &mut Ui) {
         header(
             ui,
-            "Check starter models",
-            "Render Bridge uses model files from your ComfyUI installation.",
+            "Choose a starter pack",
+            "Download model files now or add them later in Models.",
         );
         match &self.check {
             _ if self.worker.is_some() => activity(ui, "Checking the model loaders…"),
@@ -1919,7 +2744,7 @@ impl Installer {
         header(
             ui,
             "Install Render Bridge",
-            "Install the bridge for your user account with a dedicated Python environment.",
+            "Choose where Render Bridge and your generated assets will live.",
         );
         let effective = self
             .setup_directory()
@@ -1929,14 +2754,6 @@ impl Installer {
         }
         let effective = effective.unwrap_or_else(|_| self.settings.clone());
         card(ui, |ui| {
-            field_label(ui, "Local API address");
-            code_label(ui, &effective.comfy_url);
-            ui.separator();
-            field_label(ui, "ComfyUI input folder");
-            code_label(ui, &setup::folder(&effective, "input").to_string_lossy());
-            field_label(ui, "ComfyUI output folder");
-            code_label(ui, &setup::folder(&effective, "output").to_string_lossy());
-            ui.separator();
             ui.add_enabled_ui(self.worker.is_none(), |ui| {
                 let default = setup::data_dir().ok();
                 if asset_ui::folder_option(
@@ -1952,20 +2769,28 @@ impl Installer {
                     self.install_assets.load(&data);
                     self.use_setup_destination(&data);
                 }
-                caption(
-                    ui,
-                    "Use a folder only you can access for the runtime and private settings.",
-                );
+                caption(ui, "Choose a private folder for the app and its settings.");
+                ui.separator();
                 self.install_assets.fields(ui);
                 if let Some(error) = &self.install_assets.message {
                     caption(ui, error);
                 }
             });
         });
-        ui.add_space(9.0);
+        ui.collapsing("Selected ComfyUI build", |ui| {
+            code_label(ui, &effective.comfy_url);
+            caption(
+                ui,
+                &format!("Input · {}", setup::folder(&effective, "input").display()),
+            );
+            caption(
+                ui,
+                &format!("Output · {}", setup::folder(&effective, "output").display()),
+            );
+        });
         caption(
             ui,
-            "Install uses Python 3.11 or newer to download the bridge dependencies. The next step shows how to connect your MCP client.",
+            "Setup will download Python packages for Render Bridge's private environment.",
         );
         if self.worker.is_some() {
             ui.add_space(9.0);
@@ -1999,13 +2824,25 @@ impl Installer {
     }
 
     fn connect_screen(&mut self, ui: &mut Ui) {
+        if let Some(error) = &self.install_error {
+            status(ui, "Configuration file", error, CAUTION);
+        }
         if let Some(error) = &self.model_destination_error {
             status(ui, "Model folder choice was not saved", error, CAUTION);
         }
+        let server_verified = self.server_ready_for_render();
         header(
             ui,
-            "Connect your MCP client",
-            "Start Render Bridge, then paste the setup prompt into an agent on this computer.",
+            if server_verified {
+                "Ready to render"
+            } else {
+                "Connect your agent"
+            },
+            if server_verified {
+                "Render Bridge and its ComfyUI folders are verified. Try a first render from your agent."
+            } else {
+                "Start Render Bridge and check the agent you want to connect."
+            },
         );
         let Some(installed) = self.installed.clone() else {
             return;
@@ -2013,8 +2850,8 @@ impl Installer {
         let mut copied = None;
         let idle = self.worker.is_none();
         let mut selection_changed = false;
-        copied = copy_agent_prompt(ui, &installed).or(copied);
         card(ui, |ui| {
+            field_label(ui, "Agent settings to verify");
             ui.add_enabled_ui(idle, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     selection_changed |= ui
@@ -2023,40 +2860,47 @@ impl Installer {
                     selection_changed |= ui.checkbox(&mut self.verify_codex, "Codex").changed();
                 });
             });
-            for (client, selected) in [
-                (Client::Claude, self.verify_claude),
-                (Client::Codex, self.verify_codex),
-            ] {
-                if selected && let Some(path) = connection::profile_path(client) {
-                    caption(
-                        ui,
-                        &format!("{} settings: {}", client.label(), path.display()),
-                    );
-                }
-            }
-            if self.verify_codex {
-                ui.add_enabled_ui(idle, |ui| {
-                    let label = field_label(ui, "Codex profile name (optional)");
-                    selection_changed |=
-                        text_edit(ui, &mut self.codex_profile, ui.available_width(), label);
+            if self.verify_claude || self.verify_codex {
+                ui.collapsing("Client paths and profiles", |ui| {
+                    for (client, selected) in [
+                        (Client::Claude, self.verify_claude),
+                        (Client::Codex, self.verify_codex),
+                    ] {
+                        if selected && let Some(path) = connection::profile_path(client) {
+                            caption(
+                                ui,
+                                &format!("{} settings: {}", client.label(), path.display()),
+                            );
+                        }
+                    }
+                    if self.verify_codex {
+                        ui.add_enabled_ui(idle, |ui| {
+                            let label = field_label(ui, "Codex profile name (optional)");
+                            selection_changed |=
+                                text_edit(ui, &mut self.codex_profile, ui.available_width(), label);
+                        });
+                    }
                 });
             }
             caption(
                 ui,
                 "Setup checks these saved user settings and leaves them intact.",
             );
-            if copy_row(ui, "MCP endpoint", "Copy address", &installed.mcp_url) {
-                copied = Some("MCP endpoint copied");
-            }
-            ui.separator();
-            if copy_row(
-                ui,
-                "Private token file path",
-                "Copy path",
-                &installed.token_path.to_string_lossy(),
-            ) {
-                copied = Some("Token file path copied");
-            }
+            copied = copy_agent_prompt(ui, &installed, idle).or(copied);
+            ui.collapsing("Endpoint and private token file", |ui| {
+                if copy_row(ui, "MCP endpoint", "Copy address", &installed.mcp_url) {
+                    copied = Some("MCP endpoint copied");
+                }
+                ui.separator();
+                if copy_row(
+                    ui,
+                    "Private token file path",
+                    "Copy path",
+                    &installed.token_path.to_string_lossy(),
+                ) {
+                    copied = Some("Token file path copied");
+                }
+            });
         });
         if selection_changed {
             self.verification = None;
@@ -2065,6 +2909,7 @@ impl Installer {
             ui.hyperlink_to("Connect an MCP client", CLIENT_GUIDE);
             ui.hyperlink_to("Connect from another device", REMOTE_GUIDE);
         });
+        self.first_render.show(ui, &installed, server_verified);
         if self.worker.is_some() {
             activity(ui, &self.progress);
         } else if let Some(verification) = &self.verification {
@@ -2101,8 +2946,6 @@ impl Installer {
                 }
             }
         }
-        let server_verified = self.server_ready_for_render();
-        self.first_render.show(ui, &installed, server_verified);
         if let Some((message, passed)) = &self.shortcut_message {
             status(
                 ui,
@@ -2121,7 +2964,7 @@ impl Installer {
                 status(ui, "Render Bridge panel", message, CAUTION);
             }
         }
-        if secondary(ui, "ComfyUI Jobs", idle).clicked() {
+        if secondary(ui, "Check jobs", idle).clicked() {
             self.show_jobs(QueueAction::Inspect);
         }
         #[cfg(windows)]
@@ -2205,13 +3048,15 @@ impl Installer {
             .as_deref()
             .and_then(setup::existing_install_at);
         let url = installed.as_ref().and_then(setup::installed_comfy_url);
-        let changed = installed.as_ref().map(|current| &current.app_dir)
-            != self.installed.as_ref().map(|opened| &opened.app_dir);
+        let current = installed.as_ref().map(VerificationTarget::capture);
+        let changed = current != controls.installation;
         controls.backend_url = url.clone();
-        if changed || self.workspace_tab == WorkspaceTab::Models {
-            controls.model_root = installed
+        if changed {
+            self.verification = None;
+            self.first_render = first_render::FirstRender::default();
+            controls.model_root = current
                 .as_ref()
-                .and_then(|installed| setup::saved_install_settings(installed).ok())
+                .and_then(|current| current.settings.as_ref())
                 .map(|settings| Path::new(&settings.comfy_root).join("models"))
                 .unwrap_or_default();
         }
@@ -2220,7 +3065,6 @@ impl Installer {
             if changed {
                 controls.bridge_probe = None;
                 controls.bridge_online = false;
-                self.verification = None;
             }
             if let Some(probe) = &controls.bridge_probe {
                 match probe.try_recv() {
@@ -2264,6 +3108,7 @@ impl Installer {
             None => controls.queue = None,
             _ => {}
         }
+        controls.installation = current;
         self.installed = installed;
         controls.next_load = Instant::now() + Duration::from_secs(2);
         ctx.request_repaint_after(Duration::from_secs(2));
@@ -2293,6 +3138,10 @@ impl Installer {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(previous));
         }
+        if tab == WorkspaceTab::Connect {
+            self.copied = None;
+            self.confirm_rotation = false;
+        }
         self.workspace_tab = tab;
     }
 
@@ -2311,20 +3160,22 @@ impl Installer {
             )
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    bridge_mark(ui);
-                    ui.label(
-                        RichText::new("Render Bridge")
-                            .size(20.0)
-                            .strong()
-                            .color(theme::on_fill(theme::color(ctx, RAIL))),
-                    );
+                    if ui.available_width() >= 560.0 {
+                        bridge_mark(ui);
+                        ui.label(
+                            RichText::new("Render Bridge")
+                                .size(20.0)
+                                .strong()
+                                .color(theme::on_fill(theme::color(ctx, RAIL))),
+                        );
+                    }
+                    let has_installation = self
+                        .controls
+                        .as_ref()
+                        .is_some_and(|controls| controls.data_dir.is_some());
                     for (tab, label) in WORKSPACE_TABS {
-                        let fill = if self.workspace_tab == tab {
-                            LIME
-                        } else {
-                            SURFACE
-                        };
-                        if monitor_button(ui, label, true, fill).clicked() {
+                        let enabled = tab != WorkspaceTab::Connect || has_installation;
+                        if connect_option(ui, label, self.workspace_tab == tab, enabled, RAIL) {
                             self.select_workspace(ctx, tab);
                         }
                     }
@@ -2344,13 +3195,6 @@ impl Installer {
                         && monitor_button(ui, "Settings", true, SURFACE).clicked()
                     {
                         setting.open(ctx, self.installed.as_ref());
-                    }
-                    if self.installed.is_some()
-                        && monitor_button(ui, "Connect", true, SURFACE).clicked()
-                    {
-                        self.panel_connect = true;
-                        self.copied = None;
-                        self.confirm_rotation = false;
                     }
                     #[cfg(windows)]
                     if self.installed.is_some()
@@ -2397,8 +3241,12 @@ impl Installer {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::color(ctx, CREAM)).inner_margin(egui::Margin::symmetric(16, 6)))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt(self.workspace_tab).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 7.0;
+                    if self.workspace_tab == WorkspaceTab::Connect {
+                        self.installed_connect(ui);
+                        return;
+                    }
                     if self.workspace_tab != WorkspaceTab::Jobs {
                         if let Some(controls) = &self.controls {
                             let url = controls.backend_url.as_deref();
@@ -2416,45 +3264,48 @@ impl Installer {
                                     self.pipelines.show(ui, url, data_dir, self.installed.as_ref());
                                 }
                                 WorkspaceTab::Nodes => self.nodes.show(ui, url, self.installed.as_ref()),
-                                WorkspaceTab::Jobs => {}
+                                WorkspaceTab::Jobs | WorkspaceTab::Connect => {}
                             }
                         }
                         return;
                     }
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Jobs").size(23.0).strong());
-                        #[cfg(windows)]
-                        if self.installed.is_some() {
-                            let idle = self.worker.is_none();
-                            let owned = self.running.as_mut().is_some_and(RunningBridge::is_running);
-                            let online = owned || self.controls.as_ref().is_some_and(|controls| controls.bridge_online);
-                            ui.add_space(4.0);
+                    #[cfg(windows)]
+                    if self.installed.is_some() {
+                        let idle = self.worker.is_none() && !self.update.blocks_controls();
+                        let owned = self.running.as_mut().is_some_and(RunningBridge::is_running);
+                        let online = owned || self.controls.as_ref().is_some_and(|controls| controls.bridge_online);
+                        ui.horizontal_wrapped(|ui| {
+                            server_state(ui, online, owned);
                             let start_fill = if online { LINE } else { SURFACE };
                             if monitor_button(ui, "Start server", idle, start_fill)
                                 .on_hover_text(if online { "Confirm the server is running" } else { "Start Render Bridge" })
-                                .clicked() {
+                                .clicked()
+                            {
                                 self.request_server_action(ctx, ServerAction::Start);
                             }
-                            let stop_fill = if online { ERROR } else { LINE };
+                            let stop_fill = if owned { ERROR } else { LINE };
                             if monitor_button(ui, "Stop server", idle && owned, stop_fill)
                                 .on_disabled_hover_text(if online { "This panel can stop the server it starts." } else { "Start the server to enable Stop." })
-                                .clicked() {
+                                .clicked()
+                            {
                                 self.request_server_action(ctx, ServerAction::Stop);
                             }
-                            let server = match (online, owned) {
-                                (true, false) => "Server started elsewhere",
-                                (true, true) => "Render Bridge running",
-                                _ => "Render Bridge server",
-                            };
-                            ui.label(RichText::new(server).size(13.0).color(theme::color(ui.ctx(), MUTED)));
-                        }
-                    });
+                        });
+                    }
                     if let Some(queue) = self.controls.as_mut().and_then(|controls| controls.queue.as_mut()) {
-                        queue.show(ui);
+                        queue.show_card(ui);
                     } else {
                         status(ui, "Queue status unavailable",
                             "The saved ComfyUI connection could not be read. Open Render Bridge Setup to review the installation.", CAUTION);
                     }
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(queue) = self.controls.as_mut().and_then(|controls| controls.queue.as_mut()) {
+                            queue.show_refresh(ui);
+                        }
+                        if let Some(installed) = self.installed.clone() {
+                            self.show_gaming_mode(ui, &installed);
+                        }
+                    });
                     if self.worker.is_some() {
                         activity(ui, &self.progress);
                     }
@@ -2468,82 +3319,12 @@ impl Installer {
                             Err(message) => status(ui, "Render Bridge server", message, CAUTION),
                         }
                     }
-                    if let Some(installed) = self.installed.clone() {
-                        self.show_gaming_mode(ui, &installed);
-                    }
                     #[cfg(windows)]
                     if let Some(error) = &self.tray_error {
                         status(ui, "Tray icon unavailable", error, CAUTION);
                     }
                 });
             });
-        if self.panel_connect {
-            if let Some(installed) = self.installed.clone() {
-                #[cfg(windows)]
-                let online = self.running.as_mut().is_some_and(RunningBridge::is_running)
-                    || self
-                        .controls
-                        .as_ref()
-                        .is_some_and(|controls| controls.bridge_online);
-                #[cfg(not(windows))]
-                let online = self.running.as_mut().is_some_and(RunningBridge::is_running);
-                let can_rotate = self.worker.is_none() && !online;
-                let server_verified = self.server_ready_for_render();
-                let mut rotate = false;
-                let response = panel_modal(ctx, "connect-installed-bridge").show(ctx, |ui| {
-                    ui.set_width(360.0);
-                    ui.heading("Connect an agent");
-                    egui::ScrollArea::vertical()
-                        .max_height((ctx.content_rect().height() - 116.0).max(136.0))
-                        .show(ui, |ui| {
-                    caption(ui, "Use Start server in Jobs if Render Bridge is offline, then paste this prompt into your agent.");
-                    self.copied = copy_agent_prompt(ui, &installed).or(self.copied);
-                    if copy_row(ui, "MCP endpoint", "Copy address", &installed.mcp_url) {
-                        self.copied = Some("MCP endpoint copied.");
-                    }
-                    ui.hyperlink_to("Connect from another device", REMOTE_GUIDE);
-                    if let Some(message) = self.copied {
-                        caption(ui, message);
-                    }
-                    ui.separator();
-                    if self.confirm_rotation {
-                        caption(ui, "Stop every server that shares this token file. Rotation revokes existing client credentials and signed links. Reconnect your agents after restarting the server.");
-                        ui.horizontal_wrapped(|ui| {
-                            if secondary(ui, "Cancel", true).clicked() {
-                                self.confirm_rotation = false;
-                            }
-                            if primary(ui, "Confirm rotation", can_rotate).clicked() {
-                                self.confirm_rotation = false;
-                                rotate = true;
-                            }
-                        });
-                    } else if secondary(ui, "Rotate token", can_rotate)
-                        .on_disabled_hover_text("Stop Render Bridge before rotating its token.")
-                        .clicked()
-                    {
-                        self.confirm_rotation = true;
-                    }
-                    if let Some(message) = &self.rotation_message {
-                        caption(ui, message);
-                    } else if self.worker.is_some() {
-                        caption(ui, &self.progress);
-                    }
-                    ui.collapsing("First render test", |ui| {
-                        self.first_render.show(ui, &installed, server_verified);
-                    });
-                        });
-                    secondary(ui, "Done", true).clicked()
-                });
-                if rotate {
-                    self.rotate_token(ctx, installed);
-                }
-                if response.inner || response.should_close() {
-                    self.panel_connect = false;
-                }
-            } else {
-                self.panel_connect = false;
-            }
-        }
         #[cfg(windows)]
         if let Some(setting) = &mut self.startup_setting {
             if self.tray_panel.as_ref().is_some_and(|tray| tray.hidden) {
@@ -2554,6 +3335,9 @@ impl Installer {
                     .as_ref()
                     .and_then(|controls| controls.data_dir.as_deref());
                 setting.show(ctx, &mut self.appearance, data_dir, self.installed.as_ref());
+                if setting.take_model_destination_change() {
+                    self.model_manager.reload_saved_destination();
+                }
             }
         }
         #[cfg(windows)]
@@ -2585,13 +3369,13 @@ impl Installer {
 
     fn actions(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("setup-actions")
-            .exact_height(82.0)
+            .exact_height(65.0)
             .show_separator_line(false)
             .frame(
                 Frame::new()
                     .fill(theme::color(ctx, CREAM))
                     .stroke(Stroke::new(1.0_f32, theme::color(ctx, LINE)))
-                    .inner_margin(egui::Margin::symmetric(38, 17)),
+                    .inner_margin(egui::Margin::symmetric(20, 10)),
             )
             .show(ctx, |ui| {
                 let idle = self.worker.is_none() && !self.model_manager.downloading();
@@ -2610,15 +3394,13 @@ impl Installer {
                         } else if secondary(ui, "Close", true).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                        if self.running.is_none() && secondary(ui, "Change ComfyUI", true).clicked()
+                        if self.running.is_none()
+                            && let Some(installed) = &self.installed
+                            && secondary(ui, "Change ComfyUI", true).on_hover_text("Open settings.json. Stop Render Bridge before editing the saved configuration.").clicked()
                         {
-                            self.settings_changed();
-                            if self.python_ready() {
-                                self.change_step(Step::Comfy);
-                            } else {
-                                self.change_step(Step::Prerequisites);
-                                self.check_python(ctx);
-                            }
+                            self.install_error = open_configuration_file(installed).err();
+                            self.verification = None;
+                            self.first_render = first_render::FirstRender::default();
                         }
                     }
                     if matches!(self.step, Step::Comfy | Step::Models | Step::Install)
@@ -2816,7 +3598,7 @@ impl eframe::App for Installer {
             .frame(
                 Frame::new()
                     .fill(theme::color(ctx, CREAM))
-                    .inner_margin(egui::Margin::symmetric(38, 34)),
+                    .inner_margin(egui::Margin::symmetric(24, 19)),
             )
             .show(ctx, |ui| {
                 let step = self.step;
@@ -2841,6 +3623,23 @@ impl eframe::App for Installer {
         #[cfg(windows)]
         self.uninstall.show(ctx);
     }
+}
+
+fn open_configuration_file(installed: &Installed) -> Result<(), String> {
+    let path = setup::config_file(installed);
+    let (program, args): (&str, &[&str]) = if cfg!(windows) {
+        ("notepad.exe", &[])
+    } else if cfg!(target_os = "macos") {
+        ("open", &["-t"])
+    } else {
+        ("xdg-open", &[])
+    };
+    setup::quiet_command(program)
+        .args(args)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "Could not open settings.json in a text editor.".into())
 }
 
 fn python_install_link() -> (&'static str, &'static str) {
@@ -2965,7 +3764,7 @@ fn client_status(code: &str) -> (&'static str, bool) {
 }
 
 fn header(ui: &mut Ui, title: &str, description: &str) {
-    ui.add(egui::Label::new(RichText::new(title).size(36.0).strong()).wrap());
+    ui.add(egui::Label::new(RichText::new(title).size(31.0).strong()).wrap());
     ui.add(
         egui::Label::new(
             RichText::new(description)
@@ -2990,6 +3789,19 @@ fn bridge_mark(ui: &mut Ui) {
             color,
         );
     }
+}
+
+fn setup_card(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
+    Frame::new()
+        .fill(theme::color(ui.ctx(), SURFACE))
+        .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
+        .corner_radius(12)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
+            content(ui);
+        });
 }
 
 fn card(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
@@ -3142,6 +3954,67 @@ fn monitor_button(ui: &mut Ui, title: &str, enabled: bool, fill: Color32) -> egu
     )
 }
 
+fn connect_option(
+    ui: &mut Ui,
+    label: &str,
+    selected: bool,
+    enabled: bool,
+    background: Color32,
+) -> bool {
+    let fill = theme::color(ui.ctx(), if selected { LIME } else { background });
+    ui.add_enabled(
+        enabled,
+        egui::Button::selectable(
+            selected,
+            RichText::new(label).strong().color(theme::on_fill(fill)),
+        )
+        .min_size(egui::vec2(0.0, 34.0))
+        .fill(fill)
+        .corner_radius(10),
+    )
+    .clicked()
+}
+
+fn connect_copy_row(ui: &mut Ui, label: &str, action: &str, value: &str) -> bool {
+    let clicked = ui
+        .horizontal_wrapped(|ui| {
+            field_label(ui, label);
+            monitor_button(ui, action, true, SURFACE).clicked()
+        })
+        .inner;
+    code_label(ui, value);
+    if clicked {
+        ui.ctx().copy_text(value.to_owned());
+    }
+    clicked
+}
+
+fn connection_result(ui: &mut Ui, label: &str, message: &str, passed: bool) {
+    let ink = theme::color(ui.ctx(), if passed { GREEN } else { CAUTION });
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(label).strong().color(ink));
+        caption(ui, message);
+    });
+}
+
+#[cfg(windows)]
+fn server_state(ui: &mut Ui, online: bool, owned: bool) {
+    let (label, color) = match (online, owned) {
+        (true, true) => ("Server online", GREEN),
+        (true, false) => ("Server started elsewhere", GREEN),
+        _ => ("Server offline", MUTED),
+    };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), 4.0, theme::color(ui.ctx(), color));
+    ui.label(
+        RichText::new(label)
+            .size(13.0)
+            .strong()
+            .color(theme::color(ui.ctx(), color)),
+    );
+}
+
 fn gaming_mode_button(ui: &mut Ui, on: bool, enabled: bool) -> egui::Response {
     let ctx = ui.ctx();
     let (label, fill, ink, border, hint) = if on {
@@ -3244,8 +4117,8 @@ fn model_paths(folder: &Path) -> String {
     )
 }
 
-fn copy_agent_prompt(ui: &mut Ui, installed: &Installed) -> Option<&'static str> {
-    if secondary(ui, "Copy agent setup prompt", true).clicked() {
+fn copy_agent_prompt(ui: &mut Ui, installed: &Installed, enabled: bool) -> Option<&'static str> {
+    if primary(ui, "Copy setup prompt", enabled).clicked() {
         ui.ctx().copy_text(agent_setup_prompt(installed));
         Some("Prompt copied. Paste it into your agent on this computer.")
     } else {
@@ -3375,15 +4248,15 @@ fn tray_key(mode: &LaunchMode) -> Option<String> {
 #[cfg(windows)]
 fn startup_setting(mode: &LaunchMode) -> Option<StartupSetting> {
     use std::ffi::OsString;
-    let (flag, value) = match mode {
+    let (flag, value, comfy_url) = match mode {
         LaunchMode::Controls {
             target: MonitorTarget::ComfyUrl(url),
             ..
-        } => ("--comfy-url", OsString::from(url)),
+        } => ("--comfy-url", OsString::from(url), Some(url.clone())),
         LaunchMode::Controls {
             target: MonitorTarget::Installation(directory),
             ..
-        } => ("--data-dir", directory.as_os_str().to_owned()),
+        } => ("--data-dir", directory.as_os_str().to_owned(), None),
         _ => return None,
     };
     Some(StartupSetting {
@@ -3394,12 +4267,18 @@ fn startup_setting(mode: &LaunchMode) -> Option<StartupSetting> {
             value,
             OsString::from("--start-in-tray"),
         ],
+        comfy_url,
         open: false,
+        selected: SettingsTab::default(),
         enabled: None,
         error: None,
         appearance_error: None,
+        message: None,
         theme_editor: theme_ui::ThemeEditor::default(),
         assets: asset_ui::AssetEditor::default(),
+        model_destination: None,
+        model_destination_changed: false,
+        diagnostics: SettingsDiagnostics::default(),
     })
 }
 
@@ -3419,10 +4298,10 @@ mod launch_tests {
     #[cfg(windows)]
     #[test]
     fn settings_window_prefers_roomy_view_and_fits_smaller_logical_displays() {
-        assert_eq!(settings_window_size(None), egui::vec2(550.0, 620.0));
+        assert_eq!(settings_window_size(None), egui::vec2(660.0, 560.0));
         assert_eq!(
             settings_window_size(Some(egui::vec2(1920.0, 1080.0))),
-            egui::vec2(550.0, 620.0)
+            egui::vec2(660.0, 560.0)
         );
         assert_eq!(
             settings_window_size(Some(egui::vec2(500.0, 432.0))),
@@ -3501,6 +4380,32 @@ mod launch_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn connection_verification_expires_when_the_saved_backend_or_folders_change() {
+        let data = tempfile::tempdir().unwrap();
+        let app = data.path().join("app");
+        let python = setup::venv_python(&app);
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(python, []).unwrap();
+        for (file, _) in setup::RUNTIME_FILES {
+            std::fs::write(app.join(file), []).unwrap();
+        }
+        for dir in ["input", "output", "other-output"] {
+            std::fs::create_dir(data.path().join(dir)).unwrap();
+        }
+        let mut settings = serde_json::json!({
+            "COMFY_ROOT": data.path(), "COMFY_URL": "http://127.0.0.1:8188"
+        });
+        let config = data.path().join("settings.json");
+        std::fs::write(&config, settings.to_string()).unwrap();
+        let installed = setup::existing_install_at(data.path()).unwrap();
+        let target = VerificationTarget::capture(&installed);
+        assert!(target.is_current());
+        settings["COMFY_OUTPUT_DIR"] = serde_json::json!(data.path().join("other-output"));
+        std::fs::write(&config, settings.to_string()).unwrap();
+        assert!(!target.is_current());
     }
 
     #[test]
@@ -3635,8 +4540,8 @@ fn open_app() -> eframe::Result {
     let (title, size, minimum, start_hidden) = match &mode {
         LaunchMode::Setup(_) => (
             "Render Bridge Installer",
-            Vec2::new(990.0, 670.0),
-            Vec2::new(760.0, 540.0),
+            Vec2::new(920.0, 650.0),
+            Vec2::new(720.0, 520.0),
             false,
         ),
         LaunchMode::Controls { start_hidden, .. } => (

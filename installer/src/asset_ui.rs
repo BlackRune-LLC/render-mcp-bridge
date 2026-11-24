@@ -8,10 +8,42 @@ use crate::asset_folders::{self, AssetFolders};
 use crate::{caption, field_label, secondary};
 
 pub fn folder_option(ui: &mut Ui, label: &str, path: &mut Option<PathBuf>, fallback: &str) -> bool {
-    field_label(ui, label);
+    folder_picker(ui, label, path, fallback, false)
+}
+
+#[cfg(windows)]
+pub(crate) fn compact_folder_option(
+    ui: &mut Ui,
+    label: &str,
+    path: &mut Option<PathBuf>,
+    fallback: &str,
+) -> bool {
+    folder_picker(ui, label, path, fallback, true)
+}
+
+fn folder_picker(
+    ui: &mut Ui,
+    label: &str,
+    path: &mut Option<PathBuf>,
+    fallback: &str,
+    compact: bool,
+) -> bool {
+    if !compact {
+        field_label(ui, label);
+    }
+    let button = |ui: &mut Ui, action| {
+        if compact {
+            crate::monitor_button(ui, action, true, crate::SURFACE)
+        } else {
+            secondary(ui, action, true)
+        }
+    };
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
-        let picker = secondary(ui, "Browse…", true);
+        if compact {
+            field_label(ui, label);
+        }
+        let picker = button(ui, "Browse…");
         if picker.clicked() {
             let mut dialog = rfd::FileDialog::new().set_title(label);
             if let Some(existing) = &path {
@@ -22,7 +54,7 @@ pub fn folder_option(ui: &mut Ui, label: &str, path: &mut Option<PathBuf>, fallb
                 changed = true;
             }
         }
-        if path.is_some() && secondary(ui, "Clear", true).clicked() {
+        if path.is_some() && button(ui, "Clear").clicked() {
             *path = None;
             changed = true;
         }
@@ -84,9 +116,15 @@ impl AssetEditor {
             }
         }
         ui.add_enabled_ui(self.copy.is_none(), |ui| {
-            self.fields(ui);
+            compact_folder_option(
+                ui,
+                "Generated assets folder",
+                &mut self.folders.library,
+                "Optional",
+            );
+            compact_folder_option(ui, "Backup folder", &mut self.folders.backup, "Optional");
             ui.horizontal_wrapped(|ui| {
-                if secondary(ui, "Save folders", true).clicked() {
+                if crate::monitor_button(ui, "Save folders", true, crate::SURFACE).clicked() {
                     self.message = Some(
                         asset_folders::validate(output, input, data, &self.folders)
                             .and_then(|()| asset_folders::save(data, &self.folders))
@@ -94,7 +132,9 @@ impl AssetEditor {
                     );
                 }
                 let copyable = self.folders.library.is_some() || self.folders.backup.is_some();
-                if secondary(ui, "Copy generated assets", copyable).clicked() {
+                if crate::monitor_button(ui, "Copy generated assets", copyable, crate::SURFACE)
+                    .clicked()
+                {
                     match asset_folders::validate(output, input, data, &self.folders)
                         .and_then(|()| asset_folders::save(data, &self.folders))
                     {

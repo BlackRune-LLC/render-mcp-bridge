@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-use eframe::egui::{self, Button, Frame, Margin, RichText, ScrollArea, Stroke, Ui};
+use eframe::egui::{self, Button, Color32, Frame, Margin, RichText, ScrollArea, Stroke, Ui};
 
 use crate::pipeline::{self, Availability, Dependencies, Dependency, Revision, Variant};
 use crate::{
@@ -12,7 +12,8 @@ use crate::{
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum Node {
-    Inputs,
+    Character,
+    DrivingClip,
     #[default]
     MotionModel,
     Animate,
@@ -23,7 +24,8 @@ enum Node {
 impl Node {
     fn title(self) -> &'static str {
         match self {
-            Self::Inputs => "Inputs",
+            Self::Character => "Character",
+            Self::DrivingClip => "Driving clip",
             Self::MotionModel => "Motion model",
             Self::Animate => "Animate",
             Self::Decode => "VAE decode",
@@ -33,7 +35,8 @@ impl Node {
 
     fn summary(self, draft: Variant) -> &'static str {
         match self {
-            Self::Inputs => "Image + clip",
+            Self::Character => "Image",
+            Self::DrivingClip => "Video",
             Self::MotionModel => draft.label(),
             Self::Animate => "Motion transfer",
             Self::Decode => "Video frames",
@@ -43,9 +46,8 @@ impl Node {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Inputs => {
-                "LoadImage and LoadVideo read the character image and driving clip provided by your agent."
-            }
+            Self::Character => "LoadImage reads the character reference from your agent.",
+            Self::DrivingClip => "LoadVideo reads the driving clip from your agent.",
             Self::MotionModel => "UNETLoader uses the selected Wan Animate 2 weight.",
             Self::Animate => {
                 "WanAnimate2ToVideo, BasicScheduler, and SamplerCustom transfer motion using the model variant’s sampler settings."
@@ -102,18 +104,19 @@ impl PipelinePanel {
         }
         ui.heading("Wan Animate 2");
         caption(ui, "Motion transfer");
-        self.graph(ui);
-        ui.add_space(6.0);
-
-        Frame::new()
-            .fill(theme::color(ui.ctx(), SURFACE))
-            .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
-            .corner_radius(12)
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| self.inspector(ui));
-
-        self.show_validation(ui);
-        self.show_revision_actions(ui);
+        if ui.available_width() >= 860.0 {
+            ui.columns(2, |columns| {
+                self.graph(&mut columns[0]);
+                self.show_validation(&mut columns[0]);
+                self.swap_panel(&mut columns[1]);
+                self.show_revision_actions(&mut columns[1]);
+            });
+        } else {
+            self.graph(ui);
+            self.swap_panel(ui);
+            self.show_validation(ui);
+            self.show_revision_actions(ui);
+        }
     }
 
     fn refresh(&mut self, data_dir: Option<&Path>, backend: Option<&str>) {
@@ -163,52 +166,105 @@ impl PipelinePanel {
         Frame::new()
             .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
             .corner_radius(12)
-            .inner_margin(Margin::same(12))
+            .inner_margin(Margin::same(8))
             .show(ui, |ui| {
                 ScrollArea::horizontal()
                     .id_salt("wan-graph")
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for (i, node) in [
-                                Node::Inputs,
-                                Node::MotionModel,
-                                Node::Animate,
-                                Node::Decode,
-                                Node::Output,
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            {
-                                if i > 0 {
-                                    ui.label(
-                                        RichText::new(">").color(theme::color(ui.ctx(), MUTED)),
-                                    );
-                                }
-                                let selected = self.node == node;
-                                let fill = theme::color(
-                                    ui.ctx(),
-                                    if selected { RAIL_ACTIVE } else { SURFACE },
+                        let width = ui.available_width().max(410.0);
+                        let (bounds, _) =
+                            ui.allocate_exact_size(egui::vec2(width, 198.0), egui::Sense::hover());
+                        let dot = theme::color(ui.ctx(), LINE).gamma_multiply(0.40);
+                        for x in (10..(width as usize)).step_by(14) {
+                            for y in (10..198).step_by(14) {
+                                ui.painter().circle_filled(
+                                    bounds.min + egui::vec2(x as f32, y as f32),
+                                    0.8,
+                                    dot,
                                 );
-                                let border =
-                                    theme::color(ui.ctx(), if selected { VIOLET } else { LINE });
-                                let label =
-                                    format!("{}\n{}", node.title(), node.summary(self.draft));
-                                if ui
-                                    .add_sized(
-                                        [108.0, 57.0],
-                                        Button::new(RichText::new(label).size(14.0))
-                                            .fill(fill)
-                                            .stroke(Stroke::new(1.0_f32, border))
-                                            .corner_radius(9),
-                                    )
-                                    .on_hover_text(node.description())
-                                    .clicked()
-                                {
-                                    self.node = node;
-                                }
                             }
-                        });
+                        }
+                        let slot = (width - 16.0) / 4.0;
+                        let rect = |col: u8, row: u8| {
+                            egui::Rect::from_min_size(
+                                bounds.min
+                                    + egui::vec2(
+                                        8.0 + f32::from(col) * slot,
+                                        10.0 + f32::from(row) * 62.0,
+                                    ),
+                                egui::vec2(slot - 14.0, 51.0),
+                            )
+                        };
+                        let inputs = [
+                            (Node::Character, rect(0, 0)),
+                            (Node::DrivingClip, rect(0, 1)),
+                            (Node::MotionModel, rect(0, 2)),
+                        ];
+                        let stages = [
+                            (Node::Animate, rect(1, 1)),
+                            (Node::Decode, rect(2, 1)),
+                            (Node::Output, rect(3, 1)),
+                        ];
+                        let edge_color = theme::color(ui.ctx(), GREEN);
+                        let edge = |from: egui::Rect, to: egui::Rect, offset: f32| {
+                            let start = from.right_center();
+                            let end = to.left_center() + egui::vec2(0.0, offset);
+                            let middle = (start.x + end.x) * 0.5;
+                            ui.painter()
+                                .add(egui::epaint::CubicBezierShape::from_points_stroke(
+                                    [
+                                        start,
+                                        egui::pos2(middle, start.y),
+                                        egui::pos2(middle, end.y),
+                                        end,
+                                    ],
+                                    false,
+                                    Color32::TRANSPARENT,
+                                    Stroke::new(1.8_f32, edge_color),
+                                ));
+                        };
+                        for (index, (_, source)) in inputs.iter().enumerate() {
+                            edge(*source, stages[0].1, (index as f32 - 1.0) * 10.0);
+                        }
+                        for pair in stages.windows(2) {
+                            edge(pair[0].1, pair[1].1, 0.0);
+                        }
+                        for (node, bounds) in inputs.into_iter().chain(stages) {
+                            let selected = self.node == node;
+                            let fill = theme::color(
+                                ui.ctx(),
+                                if selected { RAIL_ACTIVE } else { SURFACE },
+                            );
+                            let border =
+                                theme::color(ui.ctx(), if selected { VIOLET } else { LINE });
+                            let label = format!("{}\n{}", node.title(), node.summary(self.draft));
+                            if ui
+                                .put(
+                                    bounds,
+                                    Button::new(RichText::new(label).size(13.0))
+                                        .fill(fill)
+                                        .stroke(Stroke::new(1.0_f32, border))
+                                        .corner_radius(9),
+                                )
+                                .on_hover_text(node.description())
+                                .clicked()
+                            {
+                                self.node = node;
+                            }
+                        }
                     });
+            });
+    }
+
+    fn swap_panel(&mut self, ui: &mut Ui) {
+        Frame::new()
+            .fill(theme::color(ui.ctx(), SURFACE))
+            .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
+            .corner_radius(12)
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                self.inspector(ui);
             });
     }
 

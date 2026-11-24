@@ -30,6 +30,8 @@ struct Transfer {
     total: Arc<AtomicU64>,
     name: &'static str,
     verifying: bool,
+    resume: Vec<Target>,
+    destination: Option<PathBuf>,
 }
 
 enum Work {
@@ -56,6 +58,9 @@ pub struct ModelManager {
     notice: Option<(String, bool)>,
     installed_only: bool,
     workspace_tab: ModelTab,
+    pack: usize,
+    selected_model: Option<(String, String)>,
+    paused: Option<(&'static str, Vec<Target>)>,
     search: String,
     category: Option<String>,
     verification: Option<(&'static str, Verification)>,
@@ -80,6 +85,24 @@ impl ModelManager {
 
     pub fn take_pipeline_request(&mut self) -> bool {
         std::mem::take(&mut self.pipeline_requested)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn reload_saved_destination(&mut self) {
+        let Some(data_dir) = self
+            .connection
+            .as_ref()
+            .and_then(|connection| connection.data_dir.as_deref())
+        else {
+            return;
+        };
+        let destination = model_library::load_destination(data_dir);
+        if self.selected != destination {
+            self.selected = destination;
+            self.verification = None;
+            self.confirm_repair = false;
+            self.paused = None;
+        }
     }
 
     fn refresh(&mut self, ctx: &egui::Context) {
@@ -135,6 +158,14 @@ impl ModelManager {
         };
         let name = transfer.name;
         let verifying = transfer.verifying;
+        if outcome
+            .as_ref()
+            .is_err_and(|error| error == model_download::ABORTED)
+            && !verifying
+            && transfer.destination == self.selected
+        {
+            self.paused = Some((name, transfer.resume.clone()));
+        }
         self.transfer = None;
         match outcome {
             Ok(Work::Verified(report)) => self.verification = Some((name, report)),
@@ -153,6 +184,14 @@ impl ModelManager {
                 }
                 self.notice = Some((message, true));
             }
+            Err(error) if error == model_download::ABORTED => {
+                let message = if verifying {
+                    "Verification stopped."
+                } else {
+                    "Download paused. Partial files were kept."
+                };
+                self.notice = Some((message.into(), true));
+            }
             Err(error) => self.notice = Some((error, false)),
         }
         if !verifying {
@@ -168,6 +207,11 @@ impl ModelManager {
         ctx: &egui::Context,
     ) {
         let repairing = targets.iter().any(Target::is_repair);
+        let resume = if verifying {
+            Vec::new()
+        } else {
+            targets.clone()
+        };
         let total = Arc::new(AtomicU64::new(targets.iter().map(Target::bytes).sum()));
         let cancel = Arc::new(AtomicBool::new(false));
         let bytes = Arc::new(AtomicU64::new(0));
@@ -200,7 +244,12 @@ impl ModelManager {
                 total,
                 name,
                 verifying,
+                resume,
+                destination: self.selected.clone(),
             });
+            if !verifying {
+                self.paused = None;
+            }
             self.notice = None;
             if !repairing {
                 self.verification = None;
@@ -259,11 +308,13 @@ impl ModelManager {
             self.verification = None;
             self.confirm_repair = false;
             self.category = None;
+            self.selected_model = None;
+            self.paused = None;
             self.pipeline_requested = false;
             self.refresh(ui.ctx());
         }
         if workspace {
-            ui.heading("Models");
+            ui.heading("Model library");
         }
         if self.connection.is_none() {
             caption(
@@ -313,7 +364,11 @@ impl ModelManager {
                         transfer.name
                     ),
                 );
-                ui.add(egui::ProgressBar::new(ratio).show_percentage());
+                ui.add(
+                    egui::ProgressBar::new(ratio)
+                        .fill(crate::theme::color(ui.ctx(), crate::LIME))
+                        .show_percentage(),
+                );
                 ui.horizontal_wrapped(|ui| {
                     caption(ui, &format!("{} of {}", file_size(done), file_size(total)));
                     let cancelling = transfer.cancel.load(Ordering::Relaxed);
@@ -365,13 +420,23 @@ impl ModelManager {
             ModelTab::Packs => self.show_catalog(ui, workspace),
             ModelTab::Downloads => {
                 if !self.downloading() {
-                    caption(ui, "No model transfer is running.");
-                    caption(
-                        ui,
-                        "Choose a pack to start a download or resume a paused transfer.",
-                    );
-                    if secondary(ui, "Browse packs", true).clicked() {
-                        self.workspace_tab = ModelTab::Packs;
+                    if let Some((name, targets)) = &self.paused {
+                        let mut resume = false;
+                        card(ui, |ui| {
+                            field_label(ui, name);
+                            caption(ui, "Paused. Resume from the partial files on disk.");
+                            resume = primary(ui, "Resume download", self.scan.is_none()).clicked();
+                        });
+                        if resume {
+                            self.start_work(name, targets.clone(), false, ui.ctx());
+                        }
+                    } else {
+                        card(ui, |ui| {
+                            caption(ui, "No model transfer is running.");
+                            if secondary(ui, "Browse packs", true).clicked() {
+                                self.workspace_tab = ModelTab::Packs;
+                            }
+                        });
                     }
                 }
             }
@@ -416,6 +481,13 @@ impl ModelManager {
         }
         let search = self.search.trim().to_lowercase();
         let category_filter = workspace.then_some(self.category.as_deref()).flatten();
+        let mut selected_model = self.selected_model.clone().filter(|(category, name)| {
+            matches_installed_query(category, name, category_filter, &search)
+                && library
+                    .files
+                    .get(category)
+                    .is_some_and(|files| files.contains(name))
+        });
         let mut count = 0;
         for (category, files) in &library.files {
             let matching: Vec<_> = files
@@ -424,14 +496,38 @@ impl ModelManager {
                 .collect();
             if !matching.is_empty() {
                 count += matching.len();
-                ui.collapsing(
-                    format!("{} ({})", category_name(category), matching.len()),
-                    |ui| {
-                        for name in matching {
+                egui::CollapsingHeader::new(format!(
+                    "{} ({})",
+                    category_name(category),
+                    matching.len()
+                ))
+                .default_open(
+                    !search.is_empty() || category_filter.is_some() || library.files.len() <= 5,
+                )
+                .show(ui, |ui| {
+                    for name in matching {
+                        if workspace {
+                            let selected = selected_model
+                                .as_ref()
+                                .is_some_and(|(group, file)| group == category && file == name);
+                            if ui
+                                .add(
+                                    egui::Button::selectable(
+                                        selected,
+                                        egui::RichText::new(name).monospace(),
+                                    )
+                                    .wrap(),
+                                )
+                                .on_hover_text(name)
+                                .clicked()
+                            {
+                                selected_model = Some((category.clone(), name.clone()));
+                            }
+                        } else {
                             ui.add(egui::Label::new(egui::RichText::new(name).monospace()).wrap());
                         }
-                    },
-                );
+                    }
+                });
             }
         }
         if count == 0 {
@@ -444,12 +540,73 @@ impl ModelManager {
                 },
             );
         }
+        if let Some((category, name)) = &selected_model {
+            card(ui, |ui| {
+                field_label(ui, &category_name(category));
+                crate::code_label(ui, name);
+                if secondary(ui, "Copy filename", true).clicked() {
+                    ui.ctx().copy_text(name.clone());
+                }
+            });
+        }
+        self.selected_model = selected_model;
+    }
+
+    fn show_pack_picker(&mut self, ui: &mut Ui) {
+        for (index, pack) in DOWNLOAD_PIPELINES.iter().enumerate() {
+            let installed = self
+                .library
+                .as_ref()
+                .map(|library| pack.files.iter().filter(|file| library.has(file)).count());
+            let detail = installed.map_or_else(
+                || {
+                    if self.scan.is_some() {
+                        "Checking availability".to_owned()
+                    } else {
+                        "Availability unconfirmed".to_owned()
+                    }
+                },
+                |count| {
+                    if count == pack.files.len() {
+                        "Installed".to_owned()
+                    } else {
+                        format!("{count} of {} files installed", pack.files.len())
+                    }
+                },
+            );
+            let label = egui::RichText::new(format!("{}\n{}", pack.name, detail)).strong();
+            if ui
+                .add_sized(
+                    [ui.available_width(), 46.0],
+                    egui::Button::selectable(self.pack == index, label).wrap(),
+                )
+                .on_hover_text(pack.description)
+                .clicked()
+            {
+                self.pack = index;
+                self.confirm_repair = false;
+            }
+        }
     }
 
     fn show_catalog(&mut self, ui: &mut Ui, workspace: bool) {
+        if ui.available_width() >= if workspace { 720.0 } else { 570.0 } {
+            ui.columns(2, |columns| {
+                self.show_pack_picker(&mut columns[0]);
+                self.show_model_storage(&mut columns[0], !workspace);
+                self.show_pack(&mut columns[1], workspace);
+            });
+        } else {
+            self.show_pack_picker(ui);
+            self.show_model_storage(ui, !workspace);
+            self.show_pack(ui, workspace);
+        }
+    }
+
+    fn show_model_storage(&mut self, ui: &mut Ui, expanded: bool) {
         let downloading = self.downloading();
         if let Some(connection) = &self.connection {
-            ui.collapsing("Model storage and Hugging Face", |ui| {
+            egui::CollapsingHeader::new("Model storage and Hugging Face").default_open(expanded).show(ui, |ui| {
                 ui.add_enabled_ui(!downloading, |ui| {
                     let changed = asset_ui::folder_option(
                         ui,
@@ -461,6 +618,7 @@ impl ModelManager {
                     if changed {
                         self.verification = None;
                         self.confirm_repair = false;
+                        self.paused = None;
                     }
                     if changed && let Some(data_dir) = &connection.data_dir
                         && let Err(error) = model_library::save_destination(data_dir, self.selected.as_deref())
@@ -481,10 +639,13 @@ impl ModelManager {
                 ui.hyperlink_to("Hugging Face token setup", "https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hftoken");
             });
         }
+    }
+
+    fn show_pack(&mut self, ui: &mut Ui, workspace: bool) {
         let mut selection = None;
         let mut verify_pack = None;
-        let idle = !downloading && self.scan.is_none();
-        for pipeline in DOWNLOAD_PIPELINES {
+        let idle = !self.downloading() && self.scan.is_none();
+        if let Some(pipeline) = DOWNLOAD_PIPELINES.get(self.pack) {
             let library = self.library.as_ref();
             let missing: Vec<_> = pipeline
                 .files
@@ -514,7 +675,7 @@ impl ModelManager {
                 _ => Err("Start ComfyUI and refresh to choose a download location.".into()),
             };
             card(ui, |ui| {
-                field_label(ui, pipeline.name);
+                ui.heading(pipeline.name);
                 caption(ui, pipeline.description);
                 caption(ui, pipeline.license);
                 if workspace {
@@ -542,26 +703,20 @@ impl ModelManager {
                         .iter()
                         .filter_map(|target| target.path.parent())
                         .collect::<BTreeSet<_>>();
-                    if directories.len() == 1 {
-                        if let Some(folder) = directories.first() {
-                            caption(
-                                ui,
-                                &format!("{} to {}", file_size(missing_bytes), folder.display()),
-                            );
-                        }
-                    } else {
-                        caption(
-                            ui,
-                            &format!(
-                                "{} across {} registered model folders:",
-                                file_size(missing_bytes),
-                                directories.len()
-                            ),
-                        );
+                    caption(
+                        ui,
+                        &format!(
+                            "{} · {} destination folder{}",
+                            file_size(missing_bytes),
+                            directories.len(),
+                            if directories.len() == 1 { "" } else { "s" }
+                        ),
+                    );
+                    ui.collapsing("Show download destinations", |ui| {
                         for folder in directories {
-                            caption(ui, &folder.display().to_string());
+                            crate::code_label(ui, &folder.to_string_lossy());
                         }
-                    }
+                    });
                     if library.is_some_and(|library| !library.paths_reported()) {
                         caption(
                             ui,
@@ -683,7 +838,36 @@ fn file_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::matches_installed_query;
+    use super::*;
+
+    #[test]
+    fn paused_download_can_resume_only_for_the_same_destination() {
+        let model = DOWNLOAD_PIPELINES[0].files[0].clone();
+        for (initial, current, resumable) in [("first", "first", true), ("first", "other", false)] {
+            let (tx, rx) = mpsc::channel();
+            tx.send(Err(model_download::ABORTED.into())).unwrap();
+            let mut manager = ModelManager {
+                selected: Some(PathBuf::from(current)),
+                transfer: Some(Transfer {
+                    result: rx,
+                    cancel: Arc::new(AtomicBool::new(true)),
+                    bytes: Arc::new(AtomicU64::new(1)),
+                    total: Arc::new(AtomicU64::new(2)),
+                    name: "Fixture pack",
+                    verifying: false,
+                    resume: vec![Target::new(
+                        model.clone(),
+                        PathBuf::from(initial).join(model.filename),
+                    )],
+                    destination: Some(PathBuf::from(initial)),
+                }),
+                ..Default::default()
+            };
+            manager.update(&egui::Context::default());
+            assert_eq!(manager.paused.is_some(), resumable);
+            assert!(!manager.downloading());
+        }
+    }
 
     #[test]
     fn filters_installed_paths_and_requires_the_selected_category() {

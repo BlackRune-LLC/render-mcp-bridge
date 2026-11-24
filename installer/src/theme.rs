@@ -379,7 +379,7 @@ fn default_color(theme: Theme, role: ColorRole) -> Color32 {
             Muted => MUTED,
             Border => LINE,
             Accent => VIOLET,
-            Primary => LIME,
+            Primary => Color32::from_rgb(109, 64, 197),
             Success => GREEN,
             Warning => CAUTION,
             Error | Destructive => ERROR,

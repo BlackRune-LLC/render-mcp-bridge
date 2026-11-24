@@ -985,7 +985,6 @@ pub(crate) fn saved_install_settings(installed: &Installed) -> Result<Settings, 
     validate_settings(&settings)
 }
 
-#[cfg(windows)]
 pub(crate) fn config_file(installed: &Installed) -> PathBuf {
     settings_directory(&installed.data_dir, &installed.app_dir).join("settings.json")
 }

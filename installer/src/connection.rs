@@ -119,7 +119,6 @@ fn available_port(installed: &Installed) -> Result<u16, String> {
     Ok(port)
 }
 
-#[cfg(windows)]
 pub fn bridge_is_listening(installed: &Installed) -> bool {
     let Ok(origin) = origin(installed).and_then(setup::validate_comfy_url) else {
         return false;
@@ -236,6 +235,7 @@ pub fn verify_listener(
     clients: &[Client],
     codex_profile: &str,
 ) -> Result<serde_json::Value, String> {
+    validate_client_options(clients, codex_profile)?;
     let settings = setup::saved_install_settings(installed)?;
     run_verifier(installed, &settings, clients, codex_profile)
 }

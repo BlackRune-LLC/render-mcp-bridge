@@ -10,6 +10,7 @@ use crate::setup::{self, Installed};
 use crate::theme;
 use crate::update_handoff::{self, UpdateRequest};
 use crate::updates::{self, Release, StagedInstaller};
+use crate::utility_ui::{self, UtilityIcon};
 use crate::{
     CAUTION, CREAM, RAIL, activity, bridge_mark, caption, panel_modal, primary, secondary, status,
 };
@@ -114,32 +115,31 @@ impl UpdateDialog {
         }
         let response = panel_modal(ctx, "render-bridge-update").show(ctx, |ui| {
             let viewport = ctx.content_rect();
-            ui.set_width((viewport.width() - 32.0).clamp(160.0, 350.0));
-            ui.heading("Render Bridge Update");
-            caption(
-                ui,
-                &format!("Installed version {}", env!("CARGO_PKG_VERSION")),
-            );
-            egui::ScrollArea::vertical()
-                .max_height((viewport.height() - 145.0).max(50.0))
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
+            ui.set_width((viewport.width() - 48.0).clamp(120.0, 394.0));
+            let detail = if self.downloading {
+                "Verifying the installer".to_owned()
+            } else {
+                match &self.result {
+                    Some(Ok(Some(release))) if release.is_installed_version() => {
+                        "Published build available".to_owned()
+                    }
+                    Some(Ok(Some(release))) => format!("Version {} is available", release.version),
+                    Some(Ok(None)) => "Render Bridge is up to date".to_owned(),
+                    Some(Err(_)) => "Could not check for updates".to_owned(),
+                    None => "Check for the latest release".to_owned(),
+                }
+            };
+            utility_ui::heading(ui, UtilityIcon::Download, "Render Bridge Update", Some(&detail));
+            utility_ui::scroll_body(ui, "update-dialog-body", |ui| {
+                    caption(ui, concat!("Installed version ", env!("CARGO_PKG_VERSION")));
                     if self.downloading {
                         activity(ui, "Downloading and verifying the installer…");
                     } else {
                         match &self.result {
                             None => activity(ui, "Checking for updates…"),
-                            Some(Ok(None)) => caption(ui, "Render Bridge is up to date."),
-                            Some(Ok(Some(release))) => {
-                                if release.is_installed_version() {
-                                    ui.label("The published build of this version is available.");
-                                } else {
-                                    ui.label(format!("Version {} is available.", release.version));
-                                }
-                                caption(
-                                    ui,
-                                    "For an unsigned build, download the installer from GitHub. Finish any jobs and exit Render Bridge from the tray. Run setup, choose the same folder on the Install page, and select Install Render Bridge.",
-                                );
+                            Some(Ok(None)) => {}
+                            Some(Ok(Some(_))) => {
+                                caption(ui, "For an unsigned build, download the installer from GitHub. Finish any jobs and exit Render Bridge from the tray. Choose the same folder when you run setup.");
                                 if let Some(reason) = blocked {
                                     caption(ui, reason);
                                 } else {
@@ -155,7 +155,8 @@ impl UpdateDialog {
                             }
                         }
                     }
-                });
+            });
+            utility_ui::footer(ui);
             let mut install = false;
             let mut retry = false;
             let mut close = false;
@@ -343,6 +344,28 @@ impl eframe::App for ApplyWindow {
                     );
                 });
             });
+        let cancelling = self.cancel.load(Ordering::Relaxed);
+        egui::TopBottomPanel::bottom("update-apply-actions")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::color(ctx, crate::SURFACE))
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.error.is_some() {
+                        if self.target.is_some() {
+                            if secondary(ui, "Open Render Bridge", true).clicked() {
+                                self.reopen(ctx);
+                            }
+                        } else if secondary(ui, "Close", true).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    } else if secondary(ui, "Cancel", !cancelling).clicked() {
+                        self.cancel.store(true, Ordering::Relaxed);
+                    }
+                });
+            });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -351,27 +374,20 @@ impl eframe::App for ApplyWindow {
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Updating Render Bridge");
+                    utility_ui::heading(ui, UtilityIcon::Download, "Updating Render Bridge", None);
                     if let Some(error) = &self.error {
                         status(ui, "Update could not finish", error, CAUTION);
-                        if self.target.is_some()
-                            && secondary(ui, "Open Render Bridge", true).clicked()
-                        {
-                            self.reopen(ctx);
-                        }
                     } else {
-                        let cancelling = self.cancel.load(Ordering::Relaxed);
-                        activity(
-                            ui,
-                            if cancelling {
-                                "Cancelling the update…"
-                            } else {
-                                &self.progress
-                            },
-                        );
-                        if secondary(ui, "Cancel", !cancelling).clicked() {
-                            self.cancel.store(true, Ordering::Relaxed);
-                        }
+                        crate::card(ui, |ui| {
+                            activity(
+                                ui,
+                                if cancelling {
+                                    "Cancelling the update…"
+                                } else {
+                                    &self.progress
+                                },
+                            );
+                        });
                     }
                 });
             });

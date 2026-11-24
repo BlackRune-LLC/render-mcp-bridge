@@ -26,6 +26,8 @@ MAX_RESPONSE = 128 * 1024
 MAX_CONFIG = 16 * 1024 * 1024
 MAX_LINK = 4096
 MAX_TEST_PNG = 8 * 1024 * 1024
+PREVIEW_SIZE = 96
+PREVIEW_MODE = "RENDER_BRIDGE_FIRST_RENDER_PREVIEW"
 
 
 class VerificationError(Exception):
@@ -210,32 +212,36 @@ def first_render_path(origin, prefix, link, token):
 def verify_first_render(endpoint, origin, prefix, link, token):
     path = first_render_path(origin, prefix, link, token)
     if path is None:
-        return "wrong_link"
+        return "wrong_link", None
     connection = http.client.HTTPConnection(endpoint[1].strip("[]"), int(endpoint[2]), timeout=8)
     try:
         connection.request("GET", path, headers={"Accept-Encoding": "identity"})
         with connection.getresponse() as response:
             if response.status != 200:
-                return "download_failed"
+                return "download_failed", None
             data = response.read(MAX_TEST_PNG + 1)
     except (OSError, http.client.HTTPException):
-        return "download_failed"
+        return "download_failed", None
     finally:
         connection.close()
     if len(data) > MAX_TEST_PNG:
-        return "invalid_png"
+        return "invalid_png", None
     from PIL import Image
 
+    preview = None
     try:
         with Image.open(io.BytesIO(data), formats=("PNG",)) as image:
             if image.size != (512, 512):
-                return "invalid_png"
+                return "invalid_png", None
             image.verify()
         with Image.open(io.BytesIO(data), formats=("PNG",)) as image:
             image.load()
+            if os.environ.get(PREVIEW_MODE) == "1":
+                thumbnail = image.convert("RGBA").resize((PREVIEW_SIZE, PREVIEW_SIZE), Image.Resampling.LANCZOS)
+                preview = thumbnail.tobytes().hex()
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
-        return "invalid_png"
-    return "ok"
+        return "invalid_png", None
+    return "ok", preview
 
 
 def load_config(path, server_table, parse):
@@ -381,6 +387,7 @@ def main(argv=None):
         return 0
 
     if args.first_render:
+        preview = None
         data = sys.stdin.buffer.read(MAX_LINK + 1)
         if len(data) > MAX_LINK:
             status = "wrong_link"
@@ -390,8 +397,11 @@ def main(argv=None):
             except UnicodeError:
                 status = "wrong_link"
             else:
-                status = verify_first_render(endpoint, args.url.removesuffix("/mcp"), args.first_render, link, token)
-        print(json.dumps({"first_render": status}))
+                status, preview = verify_first_render(endpoint, args.url.removesuffix("/mcp"), args.first_render, link, token)
+        receipt = {"first_render": status}
+        if preview is not None:
+            receipt["preview_rgba"] = preview
+        print(json.dumps(receipt))
         return 0
 
     # Use the literal loopback address without redirects or proxy settings.

@@ -1,10 +1,10 @@
 # Render Bridge configuration
 
-In the Windows control panel, open **Settings** to change appearance, sign-in behavior, or storage. In **Advanced configuration**, **Open configuration file** opens the active Render Bridge JSON settings. Stop the server before editing, keep a copy of the original, then start it again to verify the updated ComfyUI connection.
+In the Windows control panel, open **Settings** to change appearance, sign-in behavior, or storage. In **Advanced**, **Open configuration file** opens the active Render Bridge JSON settings. Stop the server before editing, keep a copy of the original, then start it again to verify the updated ComfyUI connection.
 
 ## Reuse a setup config on another computer
 
-In Render Bridge for Windows, open **Settings → Advanced configuration → Export setup config**. You can also prepare `settings.json` by hand for a computer that already runs ComfyUI. Fill in the paths and address for that computer, then place the file there. Use absolute paths or `~/` paths relative to that computer's user home.
+In Render Bridge for Windows, open **Settings → Advanced → Export setup config**. You can also prepare `settings.json` by hand for a computer that already runs ComfyUI. Fill in the paths and address for that computer, then place the file there. Use absolute paths or `~/` paths relative to that computer's user home.
 
 ```json
 {
@@ -25,7 +25,7 @@ The portable config carries the ComfyUI address and folders. Tokens, MCP listene
 
 ## Theme plugins
 
-On Windows, open **Settings → Custom theme** to edit a color and select **Apply theme**. Edit Dark and Light palettes separately. **System** uses the palette that matches Windows appearance. **Export theme** saves a shareable JSON file and **Import theme** applies an existing file to this installation. **Reset to defaults** restores the built-in colors.
+On Windows, open **Settings → Appearance → Custom theme** to edit a color and select **Apply theme**. Edit Dark and Light palettes separately. **System** uses the palette that matches Windows appearance. **Export theme** saves a shareable JSON file and **Import theme** applies an existing file to this installation. **Reset to defaults** restores the built-in colors.
 
 A theme plugin contains a name and color overrides. Each value is a six-digit hex color. Omitted colors use the built-in palette. Export an edited theme to use as a starting point.
 
@@ -46,7 +46,7 @@ To keep your runtime, shortcuts, and token when reinstalling, select the existin
 
 ## Windows installation, repair, and removal
 
-On the wizard's **Install** step, choose a **Render Bridge installation folder** or accept the default. Select an empty folder for a new install. The **Settings → Storage** panel shows the folder for an installed copy.
+On the wizard's **Install** step, choose a **Render Bridge installation folder** or accept the default. Select an empty folder for a new install. The **Settings → Advanced** panel shows the folder for an installed copy.
 
 To repair Render Bridge, exit the tray app and stop that installation's Render Bridge server. Run the standard setup wizard again, select the same ComfyUI build, and choose the same Render Bridge installation folder. Setup checks a replacement runtime before activating it.
 
@@ -54,7 +54,7 @@ To uninstall, run the setup wizard from a location outside the installation fold
 
 ## Local crash logs
 
-In the Windows control panel, use **Settings → Open crash logs** after a report exists. You can also open the folder directly after a crash.
+In the Windows control panel, use **Settings → Diagnostics → Open crash logs** after a report exists. You can also open the folder directly after a crash.
 
 - **Windows** `%LOCALAPPDATA%\comfy-mcp\crash-logs`
 - **macOS and Linux** `${XDG_DATA_HOME:-$HOME/.local/share}/comfy-mcp/crash-logs`

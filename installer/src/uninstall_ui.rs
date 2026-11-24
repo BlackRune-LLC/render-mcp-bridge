@@ -4,7 +4,11 @@ use std::thread;
 
 use eframe::egui;
 
-use crate::{activity, caption, code_label, destructive, panel_modal, secondary, uninstall};
+use crate::utility_ui::{self, UtilityIcon};
+use crate::{
+    CAUTION, activity, caption, code_label, destructive, field_label, panel_modal, secondary,
+    status, uninstall,
+};
 
 #[derive(Default)]
 pub(crate) struct UninstallDialog {
@@ -49,25 +53,26 @@ impl UninstallDialog {
             other => other,
         };
         let response = panel_modal(ctx, "uninstall-render-bridge").show(ctx, |ui| {
-            ui.set_width((ctx.content_rect().width() - 32.0).clamp(120.0, 360.0));
-            ui.heading("Uninstall Render Bridge");
-            egui::ScrollArea::vertical()
-                .id_salt("uninstall-dialog-body")
-                .auto_shrink([false, true])
-                .max_height((ctx.content_rect().height() - 126.0).max(72.0))
-                .show(ui, |ui| match &state {
-                    State::Confirm(folder) => {
-                        code_label(ui, &folder.to_string_lossy());
-                        caption(ui, "Exit Render Bridge from the tray and stop its server before continuing.");
-                        caption(ui, "This removes verified Render Bridge program files and matching shortcuts. Your saved settings, token, project records, and ComfyUI assets stay on disk.");
-                    }
-                    State::Removing(_) => activity(ui, "Removing the selected installation…"),
-                    State::Finished(Ok(())) => caption(
-                        ui,
-                        "Render Bridge was uninstalled. Your saved data is still available for reinstalling.",
-                    ),
-                    State::Finished(Err(message)) => caption(ui, message),
-                });
+            ui.set_width((ctx.content_rect().width() - 48.0).clamp(120.0, 394.0));
+            let detail = match &state {
+                State::Confirm(_) => "Review the selected installation",
+                State::Removing(_) => "Removing program files",
+                State::Finished(Ok(())) => "Program files removed",
+                State::Finished(Err(_)) => "Uninstall could not finish",
+            };
+            utility_ui::heading(ui, UtilityIcon::Maintenance, "Uninstall Render Bridge", Some(detail));
+            utility_ui::scroll_body(ui, "uninstall-dialog-body", |ui| match &state {
+                State::Confirm(folder) => {
+                    field_label(ui, "Installation folder");
+                    code_label(ui, &folder.to_string_lossy());
+                    ui.separator();
+                    caption(ui, "Exit Render Bridge from the tray and stop its server first. Uninstall removes verified program files and matching shortcuts. Your saved settings, token, project records, and ComfyUI assets stay on disk.");
+                }
+                State::Removing(_) => activity(ui, "Removing the selected installation…"),
+                State::Finished(Ok(())) => caption(ui, "Your saved data is available for reinstalling."),
+                State::Finished(Err(message)) => status(ui, "Check the installation", message, CAUTION),
+            });
+            utility_ui::footer(ui);
             match &state {
                 State::Confirm(_) => ui
                     .horizontal_wrapped(|ui| {
