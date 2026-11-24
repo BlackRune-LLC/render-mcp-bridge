@@ -34,6 +34,15 @@ Keep those filenames. The named preset looks up the listed FP8 checkpoint. For a
 
 For a one-file illustration starter, choose `anime` instead. Put [`NetaYumev35_pretrained_all_in_one.safetensors`](https://huggingface.co/duongve/NetaYume-Lumina-Image-2.0/blob/main/NetaYumev35_pretrained_all_in_one.safetensors) in `models/checkpoints/` and ask your agent to use that preset after `list_models` shows it is available.
 
+## Store models on another drive
+
+Choose **Model storage folder** on Render Bridge's **Models** screen, then select **Copy ComfyUI model paths**. The copied YAML uses the selected folder as the base and expects category subfolders such as `diffusion_models`, `text_encoders`, and `vae` inside it. Put the weights in those folders.
+
+- **ComfyUI portable or manual install.** Merge the copied entry into `extra_model_paths.yaml` in the ComfyUI directory. If you only have `extra_model_paths.yaml.example`, use it as a starting point for the new file. Keep existing entries and use a unique name for the new block. [ComfyUI extra model paths](https://docs.comfy.org/installation/manual_install#adding-extra-model-paths) · [Upstream YAML example](https://github.com/Comfy-Org/ComfyUI/blob/master/extra_model_paths.yaml.example)
+- **Comfy Desktop.** Open the build's **Folders** tab and use **Add models folder** to select the external model folder. A build with a YAML entry also offers **Show extra_model_paths.yaml** to locate its file. Merge any YAML entries alongside the build's existing settings. [Comfy Desktop build folders](https://docs.comfy.org/installation/desktop/usage/instance-management#choose-which-folders-the-build-uses)
+
+Restart the selected ComfyUI build after saving the paths. Use **Check again** in the installer or call `list_models` from your agent to confirm the model filenames are available.
+
 ## Check and install nodes
 
 Standard generation, Qwen image tools, and BiRefNet cutouts use nodes supplied with current ComfyUI. The named Wan and 3D pipelines also use newer core nodes. Start by updating ComfyUI if a core node is missing. Examples include `RemoveBackground`, `WanAnimate2ToVideo`, `WanFirstLastFrameToVideo`, `LoadMoGeModel`, and `Save3DAdvanced`.

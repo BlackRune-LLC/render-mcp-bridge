@@ -361,6 +361,7 @@ pub(crate) fn loopback_agent(timeout: Duration) -> ureq::Agent {
 pub struct Probe {
     pub models: Vec<ModelCheck>,
     pub reported: Option<crate::discovery::Instance>,
+    pub hardware: Option<crate::models::Hardware>,
 }
 
 pub fn verify_folders(
@@ -440,7 +441,11 @@ pub fn probe(settings: &Settings) -> Result<Probe, String> {
                 .and_then(|data| model_available(&data, file.node, file.field, file.filename)),
         })
         .collect();
-    Ok(Probe { models, reported })
+    Ok(Probe {
+        models,
+        reported,
+        hardware: crate::models::Hardware::from_stats(&stats),
+    })
 }
 
 pub(crate) fn quiet_command(program: impl AsRef<OsStr>) -> Command {
@@ -764,17 +769,16 @@ fn start_command(
     let program = console_quote(python)?;
     let script = console_quote(&app_dir.join(LAUNCHER))?;
     let token = console_quote(token_path)?;
-    let public_url = format!("local=http://127.0.0.1:{port}");
     if cfg!(windows) {
         Ok(format!(
             "$env:COMFY_MCP_DATA_DIR = {data}; $env:MCP_HOST = '127.0.0.1'; \
              $env:MCP_PORT = '{port}'; $env:MCP_TOKEN_FILE = {token}; \
-             $env:PUBLIC_URLS = '{public_url}'; & {program} {script} start"
+             & {program} {script} start"
         ))
     } else {
         Ok(format!(
             "COMFY_MCP_DATA_DIR={data} MCP_HOST='127.0.0.1' MCP_PORT='{port}' \
-             MCP_TOKEN_FILE={token} PUBLIC_URLS='{public_url}' {program} {script} start"
+             MCP_TOKEN_FILE={token} {program} {script} start"
         ))
     }
 }
@@ -842,6 +846,38 @@ pub(crate) fn saved_install_settings(installed: &Installed) -> Result<Settings, 
     let settings = settings_for_runtime(&installed.data_dir, &installed.app_dir)
         .ok_or("Bridge setup settings are missing. Run setup again.")?;
     validate_settings(&settings)
+}
+
+#[cfg(windows)]
+pub(crate) fn config_file(installed: &Installed) -> PathBuf {
+    if installed.app_dir == installed.data_dir.join("app") {
+        installed.data_dir.join("settings.json")
+    } else {
+        installed.app_dir.join("settings.json")
+    }
+}
+
+pub(crate) fn rotate_token(installed: &Installed) -> Result<(), String> {
+    let port = url::Url::parse(&installed.mcp_url)
+        .ok()
+        .and_then(|address| address.port_or_known_default())
+        .ok_or("The Render Bridge port is invalid.")?;
+    run_install_stage(
+        quiet_command(venv_python(&installed.app_dir))
+            .current_dir(&installed.app_dir)
+            .arg(installed.app_dir.join(LAUNCHER))
+            .args(["rotate-token", "--confirm"])
+            .env("COMFY_MCP_DATA_DIR", &installed.data_dir)
+            .env("MCP_HOST", "127.0.0.1")
+            .env("MCP_PORT", port.to_string())
+            .env("MCP_TOKEN_FILE", &installed.token_path),
+        &AtomicBool::new(false),
+        "Token rotation",
+        Duration::from_secs(30),
+    )
+    .map_err(|_| {
+        "Could not rotate the token. Stop the server and check that its token file exists.".into()
+    })
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
@@ -1036,6 +1072,7 @@ fn stage_runtime(
 pub fn install(
     settings: &Settings,
     selected_python: Option<&Path>,
+    selected_data_dir: Option<&Path>,
     cancel: &AtomicBool,
     mut progress: impl FnMut(&str),
 ) -> Result<Installed, String> {
@@ -1043,7 +1080,26 @@ pub fn install(
     let settings = validate_settings(settings)?;
     progress("Checking Python 3.11 or newer.");
     let command = python_for_creation(selected_python, cancel)?;
-    let data_dir = data_dir()?;
+    let data_dir = match selected_data_dir {
+        Some(path) => {
+            if !path.is_absolute() {
+                return Err("Choose an absolute path for the Render Bridge installation.".into());
+            }
+            let entries = fs::read_dir(path)
+                .map_err(|_| "Choose a writable directory for the Render Bridge installation.")?;
+            if entries
+                .into_iter()
+                .any(|entry| entry.map_or(true, |entry| entry.file_name() != "install.lock"))
+                && existing_install_at(path).is_none()
+            {
+                return Err(
+                    "Choose an empty folder or an existing Render Bridge installation.".into(),
+                );
+            }
+            path.to_path_buf()
+        }
+        None => data_dir()?,
+    };
     create_private_dir(&data_dir)
         .map_err(|_| "Could not create the Render Bridge data directory.")?;
     let _lock = lock_install(&data_dir)?;
@@ -1341,7 +1397,7 @@ mod tests {
         let app = data.join("app");
         let token = data.join("a friend's token file");
         let command = start_command(data, &app, &venv_python(&app), &token, 19189).unwrap();
-        assert!(command.contains("local=http://127.0.0.1:19189"));
+        assert!(!command.contains("PUBLIC_URLS"));
         if cfg!(windows) {
             assert!(command.contains("$env:MCP_HOST = '127.0.0.1'"));
             assert!(command.contains("$env:MCP_PORT = '19189'"));

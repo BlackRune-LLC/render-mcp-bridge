@@ -63,7 +63,7 @@ LINK_TTL_S = float(os.environ.get("DOWNLOAD_LINK_DAYS", "1")) * 86400
 TOKEN_FILE = Path(os.environ.get("MCP_TOKEN_FILE", DATA_DIR / "token.txt")).expanduser()
 DEFAULT_TIMEOUT_S = int(float(os.environ.get("JOB_TIMEOUT_MIN", "15")) * 60)
 QUEUE_WAIT_MAX_S = float(os.environ.get("QUEUE_WAIT_MAX_MIN", "240")) * 60
-IDLE_UNLOAD_S = float(os.environ.get("IDLE_UNLOAD_MIN", "0")) * 60
+IDLE_UNLOAD_S = float(os.environ.get("IDLE_UNLOAD_MIN", "10")) * 60
 COMFY_BUSY_WAIT_S = float(os.environ.get("COMFY_BUSY_WAIT_S", "60"))
 PAUSE_FLAG = Path(os.environ.get("PAUSE_FLAG", DATA_DIR / "gaming_mode.flag")).expanduser()
 PAUSED_MSG = "Gaming mode is on. ComfyUI MCP is not accepting new GPU work. Retry when gaming mode is off."
@@ -81,6 +81,8 @@ def is_loopback(host: str) -> bool:
 
 
 def validate_server_settings() -> None:
+    if not math.isfinite(IDLE_UNLOAD_S) or IDLE_UNLOAD_S < 0:
+        raise SystemExit("Set IDLE_UNLOAD_MIN to a finite non-negative number of minutes.")
     if not MCP_HOSTS or not 1 <= MCP_PORT <= 65535:
         raise SystemExit("Set MCP_HOST and MCP_PORT to valid listen addresses and a port.")
     if any(not is_loopback(host) for host in MCP_HOSTS):
@@ -516,31 +518,44 @@ async def gpu_info() -> dict[str, Any]:
         return {}
 
 
+async def idle_check() -> None:
+    if PAUSE_FLAG.exists():
+        return
+    if not await comfy_up():
+        _state["models_loaded"] = False
+        return
+    response = await _http.get("/queue", timeout=5)
+    response.raise_for_status()
+    queue = response.json()
+    if not isinstance(queue, dict) or not all(
+        isinstance(queue.get(key), list) for key in ("queue_running", "queue_pending")
+    ):
+        return
+    if queue["queue_running"] or queue["queue_pending"]:
+        mark_activity()
+        return
+    response = await _http.get("/history", params={"max_items": 1}, timeout=5)
+    response.raise_for_status()
+    history = response.json()
+    if not isinstance(history, dict):
+        return
+    last_id = next(iter(history), None)
+    if not _state["history_seen"] or last_id != _state["last_history_id"]:
+        _state.update(history_seen=True, last_history_id=last_id)
+        mark_activity()
+        return
+    idle = time.time() - _state["last_activity"]
+    if IDLE_UNLOAD_S > 0 and _state["models_loaded"] and idle >= IDLE_UNLOAD_S:
+        await unload(f"idle {idle / 60:.0f} min")
+
+
 async def idle_watcher() -> None:
     """Track backend activity and optionally unload models when the queue is idle."""
     while True:
         await asyncio.sleep(15)
         try:
             _prune_jobs()
-            if PAUSE_FLAG.exists():
-                continue
-            if not await comfy_up():
-                _state["models_loaded"] = False
-                continue
-            q = (await _http.get("/queue", timeout=5)).json()
-            busy = bool(q.get("queue_running")) or bool(q.get("queue_pending"))
-            h = (await _http.get("/history", params={"max_items": 1}, timeout=5)).json()
-            last_id = next(iter(h), None) if isinstance(h, dict) else None
-            if not _state["history_seen"]:
-                _state.update(history_seen=True, last_history_id=last_id)
-            elif last_id != _state["last_history_id"]:
-                _state["last_history_id"] = last_id
-                mark_activity()
-            if busy:
-                mark_activity()
-            idle = time.time() - _state["last_activity"]
-            if IDLE_UNLOAD_S > 0 and _state["models_loaded"] and not busy and idle >= IDLE_UNLOAD_S:
-                await unload(f"idle {idle / 60:.0f} min")
+            await idle_check()
         except Exception as e:  # noqa: BLE001
             log(f"idle watcher: {e!r}")
 
@@ -4269,6 +4284,33 @@ def bind_listen_sockets(hosts: list[str], port: int) -> list[socket.socket]:
     return socks
 
 
+def rotate_token() -> None:
+    from setup_render_bridge import atomic_text
+
+    if not MCP_HOSTS or not 1 <= MCP_PORT <= 65535:
+        raise SystemExit("Set MCP_HOST and MCP_PORT to the stopped server's listen addresses and port.")
+    # Reserve the configured listener while replacing its credential, so a
+    # concurrent server startup cannot read the previous token and then bind.
+    sockets = bind_listen_sockets(MCP_HOSTS, MCP_PORT)
+    try:
+        metadata = TOKEN_FILE.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or (
+            getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise ValueError("The token is not a regular file.")
+        if metadata.st_size > 4096 or not re.fullmatch(
+            r"[A-Za-z0-9_-]{32,}", TOKEN_FILE.read_text(encoding="utf-8").strip()
+        ):
+            raise ValueError("The existing file does not contain a Render Bridge token.")
+        atomic_text(TOKEN_FILE, secrets.token_urlsafe(32) + "\n")
+    except (OSError, ValueError):
+        raise SystemExit("Could not rotate the existing token file. Check its path and permissions.") from None
+    finally:
+        for sock in sockets:
+            sock.close()
+    print("Token rotated. Start Render Bridge and reconnect its MCP clients.")
+
+
 def set_gaming_mode(enabled: bool) -> None:
     if enabled:
         PAUSE_FLAG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -4307,9 +4349,14 @@ async def enable_gaming_mode() -> None:
 
 async def amain() -> None:
     validate_server_settings()
-    token = load_token()
     app = mcp.streamable_http_app(stateless_http=True, host=MCP_HOSTS[0], max_request_body_size=64 * 1024 * 1024)
     sockets = bind_listen_sockets(MCP_HOSTS, MCP_PORT)
+    try:
+        token = load_token()
+    except BaseException:
+        for sock in sockets:
+            sock.close()
+        raise
     _restore_jobs()
     log(f"Render Bridge listening on {', '.join(MCP_HOSTS)} at port {MCP_PORT}.")
     # Signed upload and download URLs include their own credentials in query strings.
@@ -4345,9 +4392,12 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command")
     game = commands.add_parser("gaming-mode", help="Pause or resume new GPU work through this MCP server")
     game.add_argument("state", choices=("on", "off", "status", "toggle"))
+    commands.add_parser("rotate-token", help="Replace the private token after stopping this server.")
     args = parser.parse_args()
     if args.command is None:
         asyncio.run(amain())
+    elif args.command == "rotate-token":
+        rotate_token()
     elif args.state == "on" or (args.state == "toggle" and not PAUSE_FLAG.exists()):
         asyncio.run(enable_gaming_mode())
     elif args.state in ("off", "toggle"):

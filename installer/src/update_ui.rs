@@ -357,7 +357,9 @@ pub fn apply(request: Result<UpdateRequest, String>) -> eframe::Result {
     eframe::run_native(
         "Render Bridge Update",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size(egui::vec2(490.0, 220.0)),
+            viewport: egui::ViewportBuilder::default()
+                .with_icon(crate::icons::window_icon())
+                .with_inner_size(egui::vec2(490.0, 220.0)),
             ..Default::default()
         },
         Box::new(move |creation| Ok(Box::new(ApplyWindow::new(&creation.egui_ctx, request)))),

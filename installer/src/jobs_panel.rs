@@ -1,25 +1,54 @@
 use eframe::egui::{self, RichText, Ui};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::jobs::{self, QueueStatus};
 use crate::theme;
-use crate::{
-    CAUTION, GREEN, INK, MUTED, RAIL_ACTIVE, SURFACE, VIOLET, activity, caption, card,
-    monitor_button, status,
-};
+use crate::{CAUTION, GREEN, INK, MUTED, SURFACE, VIOLET, caption, card, monitor_button, status};
 
+#[cfg(windows)]
+use crate::RAIL_ACTIVE;
 #[cfg(windows)]
 use crate::job_progress::Observer;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const FRESH_FOR: Duration = Duration::from_secs(3);
+const CHECK_ERROR: &str = "The queue check could not start. Try Refresh.";
+
+type Snapshot = Arc<Result<QueueStatus, String>>;
+
+#[derive(Default)]
+struct QueueState {
+    snapshot: Option<Snapshot>,
+    checked_at: Option<Instant>,
+    checking: bool,
+    manual: bool,
+    stop_waiting: bool,
+}
+
+impl QueueState {
+    fn finish(&mut self, result: Result<QueueStatus, String>, explicit: bool) -> bool {
+        self.checking = false;
+        self.checked_at = Some(Instant::now());
+        if explicit {
+            self.manual = false;
+        }
+        let changed = self.snapshot.as_deref() != Some(&result);
+        if changed {
+            self.snapshot = Some(Arc::new(result));
+        }
+        // Wake an open stop dialog if it observed an in-flight check.
+        let stop_changed = !self.manual && std::mem::take(&mut self.stop_waiting);
+        changed || explicit || stop_changed
+    }
+}
 
 pub struct QueueView {
     url: String,
-    result: Option<Result<QueueStatus, String>>,
-    worker: Option<Receiver<Result<QueueStatus, String>>>,
-    next_check: Instant,
+    state: Arc<Mutex<QueueState>>,
+    refresh: Option<Sender<()>>,
     #[cfg(windows)]
     progress: Option<Observer>,
 }
@@ -28,9 +57,8 @@ impl QueueView {
     pub fn new(url: String) -> Self {
         Self {
             url,
-            result: None,
-            worker: None,
-            next_check: Instant::now(),
+            state: Arc::new(Mutex::new(QueueState::default())),
+            refresh: None,
             #[cfg(windows)]
             progress: None,
         }
@@ -55,57 +83,86 @@ impl QueueView {
 
     #[cfg(windows)]
     pub fn has_active_work(&self) -> bool {
-        matches!(&self.result, Some(Ok(queue)) if !queue.is_idle())
+        self.state.lock().is_ok_and(
+            |state| matches!(state.snapshot.as_deref(), Some(Ok(queue)) if !queue.is_idle()),
+        )
     }
 
-    fn refresh(&mut self, ctx: &egui::Context) {
-        let (sender, receiver) = mpsc::channel();
+    fn start_worker(&mut self, ctx: &egui::Context, mut explicit: bool) {
+        let (refresh, requested) = mpsc::channel();
         let url = self.url.clone();
         let ctx = ctx.clone();
+        let state = Arc::clone(&self.state);
         match thread::Builder::new()
             .name("check-comfyui-jobs".into())
             .spawn(move || {
-                let _ = sender.send(jobs::check(&url));
-                ctx.request_repaint();
+                loop {
+                    let Ok(mut snapshot) = state.lock() else {
+                        break;
+                    };
+                    snapshot.checking = true;
+                    drop(snapshot);
+                    let result = jobs::check(&url);
+                    let changed = state
+                        .lock()
+                        .is_ok_and(|mut state| state.finish(result, explicit));
+                    if changed {
+                        ctx.request_repaint();
+                    }
+                    explicit = match requested.recv_timeout(REFRESH_INTERVAL) {
+                        Ok(()) => true,
+                        Err(RecvTimeoutError::Timeout) => false,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
+                }
             }) {
-            Ok(_) => self.worker = Some(receiver),
-            Err(_) => self.finish(Err("The queue check could not start. Try Refresh.".into())),
+            Ok(_) => self.refresh = Some(refresh),
+            Err(_) => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.finish(Err(CHECK_ERROR.into()), true);
+                }
+            }
         }
     }
 
-    fn finish(&mut self, result: Result<QueueStatus, String>) {
-        self.worker = None;
-        self.result = Some(result);
-        self.next_check = Instant::now() + REFRESH_INTERVAL;
+    fn request_refresh(&mut self, ctx: &egui::Context) {
+        if let Some(refresh) = &self.refresh {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if refresh.send(()).is_ok() {
+                state.manual = true;
+                return;
+            }
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.manual = true;
+        }
+        self.start_worker(ctx, true);
     }
 
     pub fn show(&mut self, ui: &mut Ui) {
-        if let Some(worker) = &self.worker {
-            match worker.try_recv() {
-                Ok(result) => self.finish(result),
-                Err(TryRecvError::Disconnected) => {
-                    self.finish(Err("The queue check did not finish. Try Refresh.".into()));
-                }
-                Err(TryRecvError::Empty) => {}
-            }
+        let (mut snapshot, mut manual) = self
+            .state
+            .lock()
+            .map(|state| (state.snapshot.clone(), state.manual))
+            .unwrap_or_default();
+        if self.refresh.is_none() && snapshot.is_none() {
+            self.start_worker(ui.ctx(), false);
+            (snapshot, manual) = self
+                .state
+                .lock()
+                .map(|state| (state.snapshot.clone(), state.manual))
+                .unwrap_or_default();
         }
-        if self.worker.is_none() && Instant::now() >= self.next_check {
-            self.refresh(ui.ctx());
-        }
-        if self.worker.is_none() {
-            ui.ctx()
-                .request_repaint_after(self.next_check.saturating_duration_since(Instant::now()));
-        }
-        match &self.result {
+        match snapshot.as_deref() {
             Some(Ok(queue)) => {
                 card(ui, |ui| {
-                    let (label, color) =
-                        match (self.worker.is_some(), queue.running > 0, queue.queued > 0) {
-                            (true, false, false) => ("Last check was idle", MUTED),
-                            (_, true, _) => ("Work in progress", VIOLET),
-                            (_, false, true) => ("Waiting to run", VIOLET),
-                            _ => ("Queue is idle", GREEN),
-                        };
+                    let (label, color) = match (queue.running > 0, queue.queued > 0) {
+                        (true, _) => ("Work in progress", VIOLET),
+                        (false, true) => ("Waiting to run", VIOLET),
+                        _ => ("Queue is idle", GREEN),
+                    };
                     ui.label(
                         RichText::new(label)
                             .size(17.0)
@@ -131,16 +188,17 @@ impl QueueView {
                 });
             }
             Some(Err(message)) => status(ui, "Queue status unavailable", message, CAUTION),
-            None => activity(ui, "Checking the ComfyUI queue…"),
+            None => caption(ui, "Checking the ComfyUI queue…"),
         }
         ui.horizontal_wrapped(|ui| {
-            if monitor_button(ui, "Refresh", self.worker.is_none(), SURFACE).clicked() {
-                self.refresh(ui.ctx());
+            if monitor_button(ui, "Refresh", snapshot.is_some() && !manual, SURFACE).clicked() {
+                self.request_refresh(ui.ctx());
+                manual = self.state.lock().is_ok_and(|state| state.manual);
             }
             caption(
                 ui,
-                if self.worker.is_some() {
-                    "Checking queue…"
+                if manual {
+                    "Refreshing queue…"
                 } else {
                     "Queue refreshes automatically"
                 },
@@ -186,29 +244,6 @@ impl QueueView {
             return;
         }
 
-        let (track, response) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::ProgressIndicator,
-                ui.is_enabled(),
-                "Job in progress",
-            )
-        });
-        if ui.is_rect_visible(track) {
-            let width = track.width() * 0.24;
-            let phase = ui.input(|input| (input.time * 2.3).sin() * 0.5 + 0.5) as f32;
-            let left = track.left() + (track.width() - width) * phase;
-            let segment = egui::Rect::from_min_size(
-                egui::pos2(left, track.top()),
-                egui::vec2(width, track.height()),
-            );
-            ui.painter()
-                .rect_filled(track, 5, theme::color(ui.ctx(), RAIL_ACTIVE));
-            ui.painter()
-                .rect_filled(segment, 5, theme::color(ui.ctx(), VIOLET));
-            ui.ctx().request_repaint_after(Duration::from_millis(32));
-        }
         caption(ui, "Step updates appear when available.");
     }
 
@@ -217,10 +252,17 @@ impl QueueView {
         stop: &'static str,
         stop_anyway: &'static str,
     ) -> Option<&'static str> {
-        if self.worker.is_some() {
+        let mut state = self.state.lock().ok()?;
+        if state.checking
+            || state.manual
+            || state
+                .checked_at
+                .is_none_or(|checked| checked.elapsed() > FRESH_FOR)
+        {
+            state.stop_waiting = true;
             return None;
         }
-        self.result.as_ref().map(|result| {
+        state.snapshot.as_deref().map(|result| {
             if result.as_ref().is_ok_and(QueueStatus::is_idle) {
                 stop
             } else {
@@ -236,26 +278,47 @@ mod tests {
 
     #[test]
     fn only_an_observed_idle_queue_gets_the_ordinary_stop_label() {
-        let mut view = QueueView::new("http://127.0.0.1:8188".into());
+        let view = QueueView::new("http://127.0.0.1:8188".into());
         let confirmation =
             |view: &QueueView| view.stop_confirmation("Stop Bridge", "Stop Bridge anyway");
         assert_eq!(confirmation(&view), None);
-        view.finish(Ok(QueueStatus {
-            running: 0,
-            queued: 0,
-            running_ids: Vec::new(),
-        }));
+        view.state.lock().unwrap().finish(Ok(queue(0)), false);
         assert_eq!(confirmation(&view), Some("Stop Bridge"));
-        let (_sender, pending) = mpsc::channel();
-        view.worker = Some(pending);
+        view.state.lock().unwrap().checking = true;
         assert_eq!(confirmation(&view), None);
-        view.finish(Ok(QueueStatus {
+        assert!(view.state.lock().unwrap().finish(Ok(queue(0)), false));
+        view.state.lock().unwrap().manual = true;
+        assert_eq!(confirmation(&view), None);
+        view.state.lock().unwrap().finish(Ok(queue(2)), true);
+        assert_eq!(confirmation(&view), Some("Stop Bridge anyway"));
+        view.state
+            .lock()
+            .unwrap()
+            .finish(Err("unavailable".into()), false);
+        assert_eq!(confirmation(&view), Some("Stop Bridge anyway"));
+        view.state.lock().unwrap().checked_at = Some(Instant::now() - FRESH_FOR * 2);
+        assert_eq!(confirmation(&view), None);
+    }
+
+    #[test]
+    fn unchanged_automatic_checks_keep_the_card_and_manual_checks_acknowledge_completion() {
+        let mut state = QueueState::default();
+        assert!(state.finish(Ok(queue(0)), false));
+        let original = state.snapshot.clone().unwrap();
+        assert!(!state.finish(Ok(queue(0)), false));
+        assert!(Arc::ptr_eq(&original, state.snapshot.as_ref().unwrap()));
+        state.manual = true;
+        assert!(state.finish(Ok(queue(0)), true));
+        assert!(!state.manual);
+        assert!(Arc::ptr_eq(&original, state.snapshot.as_ref().unwrap()));
+        assert!(state.finish(Ok(queue(2)), false));
+    }
+
+    fn queue(queued: usize) -> QueueStatus {
+        QueueStatus {
             running: 0,
-            queued: 2,
+            queued,
             running_ids: Vec::new(),
-        }));
-        assert_eq!(confirmation(&view), Some("Stop Bridge anyway"));
-        view.finish(Err("unavailable".into()));
-        assert_eq!(confirmation(&view), Some("Stop Bridge anyway"));
+        }
     }
 }

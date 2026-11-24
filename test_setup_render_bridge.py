@@ -1,5 +1,6 @@
 import contextlib
 import io
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -73,3 +74,25 @@ class InstallRuntimeTest(unittest.TestCase):
         self.assertEqual(setup.matching_folder_overrides(root, saved),
                          {"COMFY_INPUT_DIR": str(inputs), "COMFY_OUTPUT_DIR": str(outputs)})
         self.assertEqual(setup.matching_folder_overrides(self.data / "new-root", saved), {})
+
+    def test_fresh_terminal_install_saves_split_comfy_folders(self):
+        paths = {key: self.data / key.lower() for key in setup.OPTIONAL_SETTINGS}
+        for folder in [*paths.values(), self.data / "comfy"]:
+            folder.mkdir()
+        overrides = {key: str(path) for key, path in paths.items()}
+        with (
+            patch.dict(os.environ, {**self.settings, **overrides}),
+            patch("builtins.input", side_effect=["", "", "y"]),
+            patch.object(setup, "probe_backend", return_value={}),
+            patch.object(setup, "install_runtime") as install,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup.install(self.data / "settings.json"), 0)
+        install.assert_called_once_with(self.data, {**self.settings, **overrides})
+
+    def test_another_install_cannot_start_while_the_runtime_is_locked(self):
+        with setup.install_lock(self.data), patch.object(setup, "stage_runtime") as stage:
+            with self.assertRaises(setup.InstallFailure):
+                setup.install_runtime(self.data, self.settings)
+        stage.assert_not_called()
+        self.assertEqual(setup.active_runtime(self.data), self.previous)

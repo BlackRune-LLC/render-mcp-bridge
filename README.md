@@ -2,7 +2,7 @@
 
 A self-hosted image MCP server that lets your agents do the work in ComfyUI. Your agent can pick a preset, run a workflow, track the queue, and return the result as a signed download link. ComfyUI runs the pipeline on your own machine. Render Bridge is an independent integration by BlackRune LLC.
 
-[Download v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Windows control panel](#windows-control-panel) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to set it up](#ask-your-agent-to-set-it-up)
+[Download v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Windows control panel](#windows-control-panel) · [Connect an MCP client](#connect-an-mcp-client) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to set it up](#ask-your-agent-to-set-it-up)
 
 ## Install and run
 
@@ -26,7 +26,7 @@ Use [ComfyUI Portable for Windows](https://docs.comfy.org/installation/comfyui_p
 
 #### 3. Choose your agent client and first pipeline
 
-Install [Claude Code](https://code.claude.com/docs/en/quickstart) or [Codex](https://learn.chatgpt.com/docs/codex/cli) on the machine where your agent will run. Complete that client's sign-in in its own app or terminal. You can set up the bridge and check its connection before downloading models. Before your first render, choose a [starter pipeline](docs/pipelines.md#recommended-first-pipeline) and download its listed weights. The [accounts guide](docs/pipelines.md#accounts-and-credentials) covers gated models and hosted nodes.
+Choose a client with authenticated Streamable HTTP support on the device where your agent will run. The connection guide below includes Claude Code, Codex, and VS Code Copilot. Complete any client sign-in in its own app or terminal. You can set up the Bridge and check its connection before downloading models. Before your first render, choose a starter pipeline and download its listed weights. [Client setup](docs/connections.md) · [Starter pipelines](docs/pipelines.md#recommended-first-pipeline) · [Accounts for gated models and hosted nodes](docs/pipelines.md#accounts-and-credentials)
 
 ### Desktop installer
 
@@ -36,10 +36,12 @@ The Windows v0.1.0 download uses the original wizard. Complete the prerequisites
 
 1. Open the wizard. On **Prerequisites**, check Python or follow the official download links. After installing Python, choose **Check Python again**. If it still isn't detected, use **Select Python executable** or reopen the wizard so it sees your updated PATH. Install and start a local ComfyUI build, then continue. On the **ComfyUI** screen, choose your build if several are detected. If its paths cannot be confirmed from its launch settings, copy the port from the build's **Overview** and its input and output locations from **Folders**. [Comfy Desktop build settings](https://docs.comfy.org/installation/desktop/usage/instance-management)
 2. Select **Check ComfyUI**. The wizard compares reported folders and checks starter model files. If the API cannot report absolute paths, as with a typical Windows portable launch, browse to the inner `ComfyUI` folder. Setup checks whether ComfyUI can read a temporary marker in each selected folder and removes the markers afterward. Open **Separate input and output folders** when your build uses different locations. If the wizard still cannot confirm the pairing, verify the paths manually or explicitly continue offline.
-3. Review the starter pipelines. The Models screen groups the files for Z-Image Turbo and NetaYume, shows which are available, and links to each download and its ComfyUI folder. You can add weights later. Select **Install Render Bridge** to set up the server and its Python environment. Setup checks a new runtime in its own directory before activating it. If an update fails or is cancelled, the previous runtime stays usable with the same token. Select **Create a Gaming Mode shortcut** before installing if you want one.
-4. Select **Start & Verify** with **Claude Code**, **Codex**, or both checked. The wizard starts a local Bridge and makes an authenticated `server_status` call without rendering. It also checks the saved user settings for the selected clients. If you run Codex with a named profile, enter its name to check that file too. If an entry is missing, add it using the displayed endpoint and private token file, following [the client instructions](#connect-an-mcp-client). Select **Verify again**, then open a fresh client session to test that client's effective configuration.
+3. Review the starter pipelines on **Models**. You can choose a separate model drive and copy the settings ComfyUI needs to find it. On **Install**, keep the default Render Bridge installation folder or choose another one. Select **Install Render Bridge** to set up the server and its Python environment. Setup checks a new runtime before activating it. If an update fails or is cancelled, the previous runtime stays usable with the same token. Select **Create a Gaming Mode shortcut** before installing if you want one. [Store models on another drive](docs/pipelines.md#store-models-on-another-drive)
+4. On **Connect**, select **Start & Verify**, then **Copy agent setup prompt**. Paste it into the AI agent that will connect on this device. The prompt gives the agent the exact local address and the path to the private token file. Approve any requested user configuration edits, then let the agent verify the connection with `server_status`. Open a fresh client session if it needs to reload the configuration. [Connect an MCP client](#connect-an-mcp-client)
 
-Use **Open existing setup** on **Prerequisites** to return to **Connect** with your installed Bridge runtime. If that button is unavailable after a v0.1.0 installation, go through **Install Render Bridge** again with the same user data directory and ComfyUI build. The installer prepares the updated runtime and keeps your existing token. Open **ComfyUI Jobs** from **ComfyUI** or **Connect** to check the selected build's queue inside the wizard.
+**Start & Verify** also checks saved configuration for selected Claude Code or Codex clients. Enter your named Codex profile if you use one.
+
+Use **Open existing setup** on **Prerequisites** to return to **Connect**. If you installed in a custom location, use **Browse for an installation** and select its Render Bridge installation folder. To upgrade a v0.1.0 installation, go through **Install Render Bridge** again with the same user data directory and ComfyUI build. The installer prepares the updated runtime and keeps your existing token. Open **ComfyUI Jobs** from **ComfyUI** or **Connect** to check the selected build's queue inside the wizard.
 
 When you choose **Stop Bridge** or close a wizard that started the Bridge, review the queue before confirming. Choose **Keep Bridge running** to wait or **Stop Bridge** to confirm. The confirmation reads **Stop Bridge anyway** when work is running or queued, or when the queue is unavailable. ComfyUI runs separately and has its own shutdown controls.
 
@@ -52,8 +54,15 @@ In the installer built from current source, choose **Open Render Bridge** on **C
 - **Jobs** shows running and queued jobs for the local ComfyUI address selected in setup. When ComfyUI sends progress for a running stage, the panel shows its step count and percentage.
 - **Start server** starts Render Bridge using your saved installation. When the server is running, the muted button remains clickable to confirm its status. The red **Stop server** button stops the session started by this panel after you review the queue and confirm. Manage ComfyUI in its own app or through its launch command.
 - **Hide to tray** keeps Render Bridge in the Windows notification area. Click its icon to reopen the panel. If the icon is in the overflow, open **Show hidden icons** first.
+- Select **Connect** to reopen **Connect an agent**, copy connection details, or rotate the token after stopping the server. [Connect after installation](docs/connections.md#connect-after-installation)
 - In **Settings**, turn on **Start hidden when I sign in** to open Render Bridge in the notification area after you sign in to Windows. Use **Start server** in the panel when you want the Render Bridge MCP server to run.
 - Select **Update** to check for a newer stable Windows release on the official GitHub repository. If that release has a signed installer, choose **Install update** to download and verify it from the panel. Render Bridge checks for active jobs and any server session the panel owns before replacing the installed version. The update keeps your saved settings, ComfyUI address, and token on this PC.
+
+#### Storage and configuration
+
+Choose an optional generated asset folder, backup folder, or both during installation. In the Windows panel, open **Settings → Storage** to change those choices. Select **Copy generated assets** when you want a copy of the configured ComfyUI output. The copy keeps subfolders, preserves the original files, and leaves existing destination files in place.
+
+Use **Settings → Advanced configuration → Open configuration file** to review the saved ComfyUI data root, URL, and any separate input or output paths. Stop Render Bridge before editing the file, then restart it and verify the connection. Set runtime tuning variables in the environment that starts Render Bridge. Render Bridge requests a model unload after 10 minutes of idle time by default. Set `IDLE_UNLOAD_MIN=0` to disable idle unloading. [Configuration reference](docs/configuration.md)
 
 #### Build the desktop installer
 
@@ -77,6 +86,8 @@ Windows x64 has a downloadable installer. macOS and Linux use the native source 
 
 For terminal setup, finish the [first-time prerequisites](#first-time-prerequisites), then download and extract the source archive or clone the repository. Run the commands below in the source folder. The terminal setup checks the data directory, the local API, and the starter model filenames. With your confirmation, it creates or updates the bridge's Python virtual environment and saves the ComfyUI path and URL in your user data directory. Use the model guide for any weights or nodes it flags as missing.
 
+For a ComfyUI build with separate folders, set `COMFY_INPUT_DIR` and `COMFY_OUTPUT_DIR` to their absolute paths before running `setup_render_bridge.py install` so setup can check and save them.
+
 **Windows PowerShell**
 
 ```powershell
@@ -91,7 +102,7 @@ python3 setup_render_bridge.py
 python3 setup_render_bridge.py start
 ```
 
-The `start` command uses the saved settings and runs the bridge in your terminal. Leave it running and follow [Connect an MCP client](#connect-an-mcp-client). The wizard prints the token file path so you can add the new entry while preserving your existing client settings.
+The `start` command uses the saved settings and runs the Bridge in your terminal. Setup prints the private token file path. Leave the server running and use the [copy-and-paste connection prompt](docs/connections.md#paste-a-connection-prompt).
 
 ### Manual setup
 
@@ -126,38 +137,17 @@ Leave both processes running and check `http://127.0.0.1:8189/health`. Both `mcp
 | `COMFY_URL` | `http://127.0.0.1:8188`. Set this if your ComfyUI API uses a different port. |
 | `MCP_HOST`, `MCP_PORT` | `127.0.0.1` and `8189`. |
 | `COMFY_MCP_DATA_DIR` | Per-user data directory. Stores the token, gaming-mode state, and project records. |
-| `PUBLIC_URLS` | Served URLs. Defaults to a loopback URL at the MCP port. For a remote client, use a named URL such as `private=https://mcp.example.com`. Signed uploads and downloads use this address. |
-
-For remote access, keep the MCP server bound to loopback and put an HTTPS reverse proxy or private tunnel in front of it. Forward `/mcp`, `/files/`, and `/upload/`. For a reverse proxy, send the upstream `Host` header as `127.0.0.1:8189` (or the configured loopback port), stream MCP responses, and omit query strings from access logs. Set `PUBLIC_URLS` to the client-facing URL. Binding the MCP process itself to a non-loopback address requires the explicit `MCP_ALLOW_REMOTE=1` setting. Give the bearer token only to clients you trust with access to ComfyUI and your asset records.
+| `PUBLIC_URLS` | Comma-separated `name=base-url` entries for signed files, such as `private=https://render.example.com`. Defaults to loopback at the MCP port. |
 
 ## Connect an MCP client
 
-Add a user-scope server named `comfyui` with the Streamable HTTP endpoint displayed by setup (default `http://127.0.0.1:8189/mcp`) and header `Authorization: Bearer <token>`. Start the Bridge first to create its token file. Replace `<token>` in your private client settings with that file's contents. Preserve any MCP entries you already use. Use another name if `comfyui` is taken.
+Use an agent client that supports **Streamable HTTP** and a bearer token or custom HTTP header. Render Bridge and ComfyUI run together on the render host. The agent can run on that host or on another device with a network route to Render Bridge.
 
-For Claude Code, merge this entry into the top-level `mcpServers` object in `~/.claude.json` (`%USERPROFILE%\.claude.json` on Windows). For a custom profile, launch the wizard with that profile's `CLAUDE_CONFIG_DIR`. [Claude Code MCP scopes](https://code.claude.com/docs/en/mcp#user-scope)
+1. On **Connect** in the current Windows installer, start Render Bridge and select **Copy agent setup prompt**. After installation, use **Connect** in the Render Bridge panel to copy the prompt again. If the server is offline, select **Start server** first. Paste the prompt into the client on the render host.
+2. For terminal setup, use the [copy-and-paste connection prompt](docs/connections.md#paste-a-connection-prompt). For a client on another device, set up its [private connection and credentials](docs/connections.md#connect-from-another-device) first.
+3. Verify with `server_status` in the intended client session. If the client does not reload its MCP configuration, reopen it and run the check there.
 
-```json
-{
-  "comfyui": {
-    "type": "http",
-    "url": "http://127.0.0.1:8189/mcp",
-    "headers": { "Authorization": "Bearer <token>" }
-  }
-}
-```
-
-For Codex, add these tables to `~/.codex/config.toml` (`%USERPROFILE%\.codex\config.toml` on Windows). If you set `CODEX_HOME`, use `config.toml` in that directory and launch the wizard with the same setting. [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
-
-```toml
-[mcp_servers.comfyui]
-url = "http://127.0.0.1:8189/mcp"
-tool_timeout_sec = 600.0
-
-[mcp_servers.comfyui.http_headers]
-Authorization = "Bearer <token>"
-```
-
-Start a fresh client session and call `server_status` and `list_jobs`. If `/mcp` returns HTTP 401, check that this profile has the bearer token from Render Bridge's token file. If `/health` reports `comfyui: stopped`, start ComfyUI or check `COMFY_URL`.
+For manual setup, follow the [client examples](docs/connections.md#configure-the-client) for Claude Code, Codex, VS Code Copilot, or another compatible client.
 
 ## Make your first render
 
@@ -187,9 +177,9 @@ Turning gaming mode on pauses new GPU work through the MCP server. If ComfyUI's 
 
 ## Ask your agent to set it up
 
-Give the following prompt to an agent with terminal access on the machine where you want to run the server.
+If Render Bridge is already installed, use the [short connection prompt](docs/connections.md#paste-a-connection-prompt). For a first-time installation, give the following prompt to an agent with terminal access on the render host. [Agent instructions](AGENTS.md)
 
-> Set up Render Bridge on this machine using the README and pipeline guide at https://github.com/BlackRune-LLC/render-mcp-bridge. Start with its first-time prerequisites. Check for Python 3.11 or newer with virtual environment support. If it is missing, guide me through the official Python installer or distribution packages for my OS. Ask before starting a machine-wide install and let me approve any operating system prompt myself. Find my local ComfyUI build, check its API, and identify its data directory. If it is missing, help me choose and start a local build using the official ComfyUI instructions. Walk me through the Rust desktop wizard, the terminal installer, or manual setup according to the tools available. Register the server in the user-scope MCP config for the client I use. Preserve existing entries and keep tokens in private user settings. Never display tokens, put them on a command line, or ask me to send them in chat. Ask me to complete any required client sign-in or gated-model agreement in my own app, browser, or terminal. Recommend one pipeline for my hardware, identify its exact model files and nodes, and ask before installing extra nodes, downloading weights, or generating anything. In a fresh client session, verify `server_status`, `list_jobs`, and `list_models`. Show me the launch, gaming-mode, and first-render commands.
+> Set up Render Bridge on this machine using the README, connection guide, and pipeline guide at https://github.com/BlackRune-LLC/render-mcp-bridge. Start with its first-time prerequisites. Check for Python 3.11 or newer with virtual environment support. If it is missing, guide me through the official Python installer or distribution packages for my OS. Ask before starting a machine-wide install and let me approve any operating system prompt myself. Find my local ComfyUI build, check its API, and identify its data directory. If it is missing, help me choose and start a local build using the official ComfyUI instructions. Walk me through the Rust desktop wizard, the terminal installer, or manual setup according to the tools available. Register the server in the user-scope MCP config for the client I use. If the client runs on another device, follow the private-network setup in the connection guide for both MCP and signed file transfers. Preserve existing entries and keep tokens in private user settings. Never display tokens, put them on a command line, or ask me to send them in chat. Ask me to complete any required client sign-in or gated-model agreement in my own app, browser, or terminal. Recommend one pipeline for my hardware, identify its exact model files and nodes, and ask before installing extra nodes, downloading weights, or generating anything. In a fresh client session, verify `server_status`, `list_jobs`, and `list_models`. Show me the launch, gaming-mode, and first-render commands.
 
 ## License
 

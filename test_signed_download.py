@@ -1,10 +1,15 @@
 """Exercise signed downloads against an in-memory ComfyUI response stream."""
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
+import io
+import socket
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlencode
 
@@ -15,6 +20,34 @@ import comfy_mcp_server as bridge
 
 
 FIXTURE_TOKEN = "signed-download-test-token-only"
+
+
+class TokenRotationTests(unittest.TestCase):
+    def test_requires_a_stopped_server_then_changes_the_token_and_signed_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token.txt"
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                port = listener.getsockname()[1]
+                with (
+                    patch.object(bridge, "TOKEN_FILE", token_file),
+                    patch.object(bridge, "MCP_HOSTS", ["127.0.0.1"]),
+                    patch.object(bridge, "MCP_PORT", port),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    bridge.load_token.cache_clear()
+                    self.addCleanup(bridge.load_token.cache_clear)
+                    before = bridge.load_token()
+                    before_link = bridge._link_sig("fixture.png", "", "output", 42)
+                    with self.assertRaises(SystemExit):
+                        bridge.rotate_token()
+                    self.assertEqual(token_file.read_text().strip(), before)
+                    listener.close()
+                    bridge.rotate_token()
+                    bridge.load_token.cache_clear()
+                    self.assertNotEqual(bridge.load_token(), before)
+                    self.assertNotEqual(bridge._link_sig("fixture.png", "", "output", 42), before_link)
 
 
 class FixtureStream(httpx.AsyncByteStream):

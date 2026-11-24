@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -122,13 +123,16 @@ def backend_url(value: str) -> str:
     return f"{address.scheme}://{authority}"
 
 
-def comfy_root(value: str, previous: dict[str, str] | None = None) -> Path:
+def comfy_root(
+    value: str, previous: dict[str, str] | None = None, overrides: dict[str, str] | None = None,
+) -> Path:
     path = Path(value.strip().strip('"').strip("'")).expanduser().resolve()
-    retained = matching_folder_overrides(path, previous or {})
+    retained = {**matching_folder_overrides(path, previous or {}), **(overrides or {})}
     for folder in ("input", "output"):
         override = retained.get(f"COMFY_{folder.upper()}_DIR")
         if not (Path(override).expanduser() if override else path / folder).is_dir():
-            raise ValueError("Choose the ComfyUI folder that contains both input and output directories.")
+            hint = f"COMFY_{folder.upper()}_DIR" if override else f"the {folder} subfolder"
+            raise ValueError(f"Could not find {hint} for ComfyUI. Check the folder and retry.")
     return path
 
 
@@ -236,8 +240,31 @@ def stop_install_stage(child):
     child.wait()
 
 
-def install_runtime(directory: Path, settings: dict[str, str]) -> None:
+@contextmanager
+def install_lock(directory: Path):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (directory / "install.lock").open("a+b") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise InstallFailure("Could not lock the runtime for setup. Close any other setup and retry.") from None
+        yield
+
+
+def install_runtime(directory: Path, settings: dict[str, str]) -> None:
+    with install_lock(directory):
+        stage_runtime(directory, settings)
+
+
+def stage_runtime(directory: Path, settings: dict[str, str]) -> None:
     staging = Path(tempfile.mkdtemp(prefix=RUNTIME_PREFIX, dir=directory))
     activated = False
     try:
@@ -297,7 +324,15 @@ def install(settings_path: Path) -> int:
         default_url = DEFAULT_URL
     print("Render Bridge setup")
     print(f"Install ComfyUI first if you need it. {COMFY_INSTALL}")
-    root = prompt_for("ComfyUI directory", default_root, lambda value: comfy_root(value, previous))
+    overrides = {
+        key: str(Path(os.environ[key]).expanduser().resolve())
+        for key in OPTIONAL_SETTINGS if os.environ.get(key, "").strip()
+    }
+    for key, path in overrides.items():
+        if not Path(path).is_dir():
+            print(f"{key} must point to an existing directory. Set it again and retry setup.")
+            return 1
+    root = prompt_for("ComfyUI directory", default_root, lambda value: comfy_root(value, previous, overrides))
     url = prompt_for("ComfyUI API URL", default_url, backend_url)
     while True:
         print("Checking the local ComfyUI API and its model loaders.")
@@ -318,7 +353,7 @@ def install(settings_path: Path) -> int:
         return 0
 
     install_runtime(settings_path.parent, {
-        "COMFY_ROOT": str(root), "COMFY_URL": url, **matching_folder_overrides(root, previous),
+        "COMFY_ROOT": str(root), "COMFY_URL": url, **matching_folder_overrides(root, previous), **overrides,
     })
     token = Path(os.environ.get("MCP_TOKEN_FILE") or settings_path.parent / "token.txt").expanduser()
     if not token.is_absolute():
@@ -378,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("install", help="Run guided setup (the default).")
     commands.add_parser("start", help="Run the configured server in the foreground.")
+    rotate = commands.add_parser("rotate-token", help="Rotate the token after stopping the server.")
+    rotate.add_argument("--confirm", action="store_true", help="Confirm that all clients must reconnect.")
     gaming = commands.add_parser("gaming-mode", help="Pause or resume work through the configured server.")
     gaming.add_argument("state", choices=("on", "off", "status", "toggle"))
     gaming.add_argument("--wait", action="store_true", help="Keep the shortcut's terminal open until Enter.")
@@ -389,6 +426,11 @@ def main(argv: list[str] | None = None) -> int:
         settings_path = (args.data_dir.expanduser().resolve() if args.data_dir else data_dir()) / "settings.json"
         if args.command in {None, "install"}:
             return install(settings_path)
+        if args.command == "rotate-token":
+            if not args.confirm:
+                print("Stop Render Bridge, then run rotate-token --confirm. Existing clients must reconnect.")
+                return 1
+            return launch(settings_path, ["rotate-token"])
         server_args = ["gaming-mode", args.state] if args.command == "gaming-mode" else []
         result = launch(settings_path, server_args)
         if args.command == "gaming-mode" and args.wait and sys.stdin.isatty():

@@ -65,7 +65,6 @@ impl RunningBridge {
             .env("MCP_HOST", "127.0.0.1")
             .env("MCP_PORT", port.to_string())
             .env("MCP_TOKEN_FILE", &installed.token_path)
-            .env("PUBLIC_URLS", format!("local={origin}"))
             .env("RENDER_BRIDGE_MANAGED_ID", id)
             .spawn()
             .map_err(|_| "Could not start Render Bridge. Run the copied start command in a terminal for details.")?;

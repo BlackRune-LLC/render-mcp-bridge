@@ -12,15 +12,14 @@ use windows::Win32::UI::Shell::{
     NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu,
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-    EndMenu, FindWindowW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    GetWindowThreadProcessId, HICON, HMENU, IsIconic, LR_DEFAULTCOLOR, MF_STRING, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SW_SHOW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindowAsync, TPM_BOTTOMALIGN, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnregisterClassW, WM_APP,
-    WM_CLOSE, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_PAINT, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EndMenu, FindWindowW, GWLP_USERDATA,
+    GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId, HICON, HMENU, IsIconic,
+    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    SW_RESTORE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, ShowWindowAsync, TPM_BOTTOMALIGN,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    UnregisterClassW, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
+    WM_PAINT, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -250,8 +249,8 @@ impl NativeTray {
                 None,
             )
             .map_err(|_| "The notification-area window could not be created.")?;
-            tray.icon =
-                create_icon().map_err(|_| "The notification-area icon could not be created.")?;
+            tray.icon = crate::icons::tray_icon()
+                .map_err(|_| "The notification-area icon could not be created.")?;
             tray.state = Some(Box::new(WindowState {
                 context,
                 events,
@@ -472,68 +471,13 @@ fn show_menu(
     }
 }
 
-const ICON_SIZE: usize = 32;
-const HEADER_WORDS: usize = 10;
-const ICON_WORDS: usize = HEADER_WORDS + ICON_SIZE * ICON_SIZE + ICON_SIZE;
-
-fn icon_bitmap() -> [u32; ICON_WORDS] {
-    // A BITMAPINFOHEADER, little-endian BGRA pixels, then the 1-bit AND mask.
-    // Using u32 elements ensures the RT_ICON image is DWORD aligned.
-    let mut bitmap = [0; ICON_WORDS];
-    bitmap[..HEADER_WORDS].copy_from_slice(&[
-        40,
-        ICON_SIZE as u32,
-        (ICON_SIZE * 2) as u32,
-        (32 << 16) | 1,
-        0,
-        (ICON_SIZE * ICON_SIZE * 4) as u32,
-        0,
-        0,
-        0,
-        0,
-    ]);
-    for y in 0..ICON_SIZE {
-        for x in 0..ICON_SIZE {
-            let dx = x.abs_diff(x.clamp(7, 24));
-            let dy = y.abs_diff(y.clamp(7, 24));
-            let pixel = if dx * dx + dy * dy > 36 {
-                bitmap[HEADER_WORDS + ICON_SIZE * ICON_SIZE + ICON_SIZE - 1 - y] |= 1 << (x ^ 7);
-                0
-            } else if (8..=23).contains(&x) && matches!(y, 8..=11 | 14..=17) {
-                0xffe0d4f9
-            } else if (8..=17).contains(&x) && (20..=23).contains(&y) {
-                0xffe0d4f9
-            } else if (20..=24).contains(&x) && (20..=24).contains(&y) {
-                0xffcbe87a
-            } else {
-                0xff533585
-            };
-            bitmap[HEADER_WORDS + (ICON_SIZE - 1 - y) * ICON_SIZE + x] = pixel;
-        }
-    }
-    bitmap
-}
-
-fn create_icon() -> windows::core::Result<HICON> {
-    let bitmap = icon_bitmap();
-    // The DWORD-aligned bitmap remains alive while Windows copies these bytes.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(bitmap.as_ptr().cast(), std::mem::size_of_val(&bitmap))
-    };
-    unsafe { CreateIconFromResourceEx(bytes, true, 0x00030000, 32, 32, LR_DEFAULTCOLOR) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn native_icon_bitmap_can_be_loaded_without_a_tray() {
-        let bitmap = icon_bitmap();
-        assert_eq!(&bitmap[..4], &[40, 32, 64, 0x00200001]);
-        assert_eq!(bitmap[HEADER_WORDS], 0);
-        assert!(bitmap.contains(&0xff533585));
-        let icon = create_icon().unwrap();
+    fn native_icon_can_be_loaded_without_a_tray() {
+        let icon = crate::icons::tray_icon().unwrap();
         // This test created the icon handle and does not share it with Windows Explorer.
         unsafe { DestroyIcon(icon).unwrap() };
     }

@@ -4,7 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -21,6 +21,56 @@ def job_record(**overrides):
         "status": "running", "created": time.time(), "prompt_ids": ["fixture-prompt"],
         **overrides,
     }
+
+
+class ModelLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.enterContext(patch.object(server, "PAUSE_FLAG", Path(directory.name) / "pause"))
+        self.enterContext(patch.object(server, "IDLE_UNLOAD_S", 60))
+        self.state = {**server._state, "history_seen": True, "last_history_id": "last",
+                      "last_activity": time.time() - 120, "models_loaded": True}
+        self.enterContext(patch.object(server, "_state", self.state))
+        self.enterContext(patch.object(server, "comfy_up", AsyncMock(return_value=True)))
+
+    async def test_idle_models_unload_only_after_a_verified_empty_queue(self):
+        backend = AsyncMock()
+        backend.get.side_effect = [response(queue_running=[], queue_pending=[]), response(last={})]
+        backend.post.return_value = response()
+        with (
+            patch.object(server, "_http", backend),
+            patch.object(server.asyncio, "sleep", AsyncMock()),
+            patch.object(server, "gpu_info", AsyncMock(return_value={})),
+        ):
+            await server.idle_check()
+        backend.post.assert_awaited_once_with(
+            "/free", json={"unload_models": True, "free_memory": True}, timeout=10,
+        )
+        self.assertFalse(self.state["models_loaded"])
+        self.assertTrue(self.state["last_unload_reason"].startswith("idle "))
+
+    async def test_pending_jobs_or_unknown_queue_never_trigger_idle_unload(self):
+        for queue in [response(queue_running=[], queue_pending=[{}]), response(state="unknown")]:
+            with self.subTest(queue=queue.json()):
+                backend = AsyncMock()
+                backend.get.return_value = queue
+                with patch.object(server, "_http", backend):
+                    await server.idle_check()
+                backend.post.assert_not_called()
+
+    async def test_load_models_uses_a_preview_warmup_without_writing_an_asset(self):
+        queue = AsyncMock(return_value=({}, [], 1.2))
+        with (
+            patch.object(server, "ensure_comfy", AsyncMock()),
+            patch.object(server, "resolve_preset", AsyncMock(return_value={"cfg": 1})),
+            patch.object(server, "build_graph", return_value={}),
+            patch.object(server, "queue_and_wait", queue),
+            patch.object(server, "gpu_info", AsyncMock(return_value={})),
+        ):
+            result = json.loads(await server.load_models())
+        self.assertEqual(result["loaded_preset"], "z_image_turbo")
+        self.assertEqual(queue.await_args.args[0]["save"]["class_type"], "PreviewImage")
 
 
 class JobTests(unittest.IsolatedAsyncioTestCase):
