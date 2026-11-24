@@ -2426,8 +2426,10 @@ dependencies = [
 name = "render-bridge-setup"
 version = "0.2.0"
 dependencies = [
+ "ab_glyph",
  "base64",
  "eframe",
+ "image",
  "libc",
  "raw-window-handle",
  "rfd",

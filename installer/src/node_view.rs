@@ -7,7 +7,10 @@ use serde_json::Value;
 
 use crate::node_packages::{ManagedPack, Source, StagedPack, Target};
 use crate::setup::{Installed, loopback_agent, validate_comfy_url};
-use crate::{CAUTION, LIME, activity, caption, card, primary, secondary, status};
+use crate::{
+    CAUTION, GREEN, INK, LIME, MUTED, RAIL, activity, caption, card, primary, secondary, status,
+    theme,
+};
 
 const MAX_NODES: usize = 8192;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -211,7 +214,15 @@ impl NodePanel {
             }
         }
 
-        ui.heading("Nodes");
+        ui.horizontal_wrapped(|ui| {
+            theme::heading(ui, "Nodes", 30.0);
+            if self.backend.is_some()
+                && !self.manage_open
+                && secondary(ui, "Recheck", self.worker.is_none()).clicked()
+            {
+                self.refresh(ui.ctx());
+            }
+        });
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.manage_open, false, "Inventory");
             ui.selectable_value(&mut self.manage_open, true, "Manage packs");
@@ -224,11 +235,13 @@ impl NodePanel {
             caption(ui, "Connect a local ComfyUI build to view its nodes.");
             return;
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search nodes"));
-            if secondary(ui, "Recheck", self.worker.is_none()).clicked() {
-                self.refresh(ui.ctx());
-            }
+        let search = ui.add(
+            egui::TextEdit::singleline(&mut self.query)
+                .desired_width(ui.available_width().min(380.0))
+                .hint_text("Search nodes"),
+        );
+        search.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Search nodes")
         });
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.origin, None, "All");
@@ -285,40 +298,107 @@ impl NodePanel {
                 rows.extend(matches.map(Row::Node));
             }
         }
+        const ROW_HEIGHT: f32 = 29.0;
         let list = |ui: &mut Ui, selected: &mut Option<usize>| {
             card(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
                 egui::ScrollArea::vertical()
                     .id_salt("node-inventory")
-                    .max_height(330.0)
-                    .show_rows(ui, 32.0, rows.len(), |ui, range| {
+                    .max_height(333.0)
+                    .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
                         for row in range {
                             match rows[row] {
                                 Row::Group(origin, count) => {
-                                    ui.add_sized(
-                                        [ui.available_width(), 32.0],
-                                        egui::Label::new(
-                                            egui::RichText::new(format!(
-                                                "{} ({count})",
-                                                origin.label()
-                                            ))
-                                            .strong(),
-                                        ),
+                                    let fill = theme::color(ui.ctx(), RAIL);
+                                    let (bounds, response) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), ROW_HEIGHT),
+                                        egui::Sense::hover(),
+                                    );
+                                    let label = format!("{} ({count})", origin.label());
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Label,
+                                            true,
+                                            &label,
+                                        )
+                                    });
+                                    let painter = ui.painter_at(bounds);
+                                    painter.rect_filled(bounds, 7, fill);
+                                    painter.text(
+                                        egui::pos2(bounds.left() + 8.0, bounds.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        label,
+                                        theme::display_font(15.0),
+                                        theme::on_fill(fill),
                                     );
                                 }
                                 Row::Node(index) => {
                                     let node = &self.nodes[index];
-                                    if ui
-                                        .add_sized(
-                                            [ui.available_width(), 32.0],
-                                            egui::Button::selectable(
-                                                *selected == Some(index),
-                                                &node.title,
-                                            )
-                                            .truncate(),
+                                    let origin = match node.origin {
+                                        Origin::BuiltIn => "Available",
+                                        Origin::Custom => "Custom source",
+                                        Origin::Unreported => "Origin unreported",
+                                    };
+                                    let mut row = egui::text::LayoutJob::default();
+                                    row.append(
+                                        &node.title,
+                                        0.0,
+                                        egui::TextFormat::simple(
+                                            theme::display_font(14.0),
+                                            theme::color(ui.ctx(), INK),
+                                        ),
+                                    );
+                                    row.append(
+                                        &format!("  ·  {origin}"),
+                                        0.0,
+                                        egui::TextFormat::simple(
+                                            egui::FontId::proportional(12.0),
+                                            theme::color(
+                                                ui.ctx(),
+                                                if node.origin == Origin::BuiltIn {
+                                                    GREEN
+                                                } else {
+                                                    MUTED
+                                                },
+                                            ),
+                                        ),
+                                    );
+                                    let active = *selected == Some(index);
+                                    let (bounds, response) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), ROW_HEIGHT),
+                                        egui::Sense::click(),
+                                    );
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::selected(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            active,
+                                            format!("{} · {origin}", node.title),
                                         )
-                                        .on_hover_text(&node.id)
-                                        .clicked()
-                                    {
+                                    });
+                                    let visuals = ui.style().interact_selectable(&response, active);
+                                    let painter = ui.painter_at(bounds);
+                                    if active || response.hovered() || response.has_focus() {
+                                        painter.rect(
+                                            bounds,
+                                            7,
+                                            visuals.weak_bg_fill,
+                                            visuals.bg_stroke,
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    row.wrap.max_width = (bounds.width() - 16.0).max(1.0);
+                                    row.wrap.max_rows = 1;
+                                    let text = painter.layout_job(row);
+                                    painter.galley(
+                                        egui::pos2(
+                                            bounds.left() + 8.0,
+                                            bounds.center().y - text.size().y * 0.5,
+                                        ),
+                                        text,
+                                        visuals.text_color(),
+                                    );
+                                    if response.on_hover_text(&node.id).clicked() {
                                         *selected = Some(index);
                                     }
                                 }
@@ -347,16 +427,18 @@ impl NodePanel {
 
     fn details(&self, ui: &mut Ui, node: &Node) {
         card(ui, |ui| {
-            ui.heading(&node.title);
-            crate::code_label(ui, &node.id);
+            theme::heading(ui, node.title.as_str(), 23.0);
             caption(ui, node.origin.label());
+            crate::code_label(ui, &node.id);
+            ui.separator();
             for (label, value) in [
                 ("Category", &node.category),
                 ("Module", &node.module),
                 ("Version", &node.version),
             ] {
                 if !value.is_empty() {
-                    ui.label(format!("{label} · {value}"));
+                    theme::heading(ui, label, 13.0);
+                    crate::code_label(ui, value);
                 }
             }
             if !node.description.is_empty() {

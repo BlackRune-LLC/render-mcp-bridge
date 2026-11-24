@@ -260,7 +260,104 @@ pub fn configure_for(ctx: &egui::Context, preference: ThemePreference, data_dir:
 fn configure_with(ctx: &egui::Context, preference: ThemePreference, plugin: Option<ThemePlugin>) {
     ctx.options_mut(|options| options.fallback_theme = Theme::Dark);
     ctx.set_theme(preference);
+    install_typefaces(ctx);
     apply_plugin(ctx, plugin);
+}
+
+fn title_family() -> egui::FontFamily {
+    egui::FontFamily::Name("render-bridge-bold".into())
+}
+
+pub(crate) fn display_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, title_family())
+}
+
+pub(crate) fn strong(text: impl Into<String>, size: f32) -> egui::RichText {
+    egui::RichText::new(text).font(display_font(size)).strong()
+}
+
+pub(crate) fn heading(ui: &mut egui::Ui, text: impl Into<String>, size: f32) -> egui::Response {
+    ui.add(egui::Label::new(strong(text, size)).wrap())
+}
+
+fn install_typefaces(ctx: &egui::Context) {
+    let id = egui::Id::new("render-bridge-typefaces");
+    if ctx.data(|data| data.get_temp::<bool>(id)).unwrap_or(false) {
+        return;
+    }
+    let mut fonts = egui::FontDefinitions::default();
+    let mut body = fonts.families[&egui::FontFamily::Proportional].clone();
+    let mut bold = body.clone();
+    if let Some((regular_path, bold_path)) = system_faces() {
+        for (name, path, family) in [
+            ("render-bridge-body", regular_path, &mut body),
+            ("render-bridge-display", bold_path, &mut bold),
+        ] {
+            if let Some(bytes) = read_platform_face(&path) {
+                fonts
+                    .font_data
+                    .insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+                family.insert(0, name.into());
+            }
+        }
+    }
+    fonts.families.insert(egui::FontFamily::Proportional, body);
+    fonts.families.insert(title_family(), bold);
+    ctx.set_fonts(fonts);
+    ctx.data_mut(|data| data.insert_temp(id, true));
+}
+
+fn read_platform_face(path: &Path) -> Option<Vec<u8>> {
+    const MAX_FONT_BYTES: u64 = 8 * 1024 * 1024;
+    let file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_FONT_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_FONT_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_FONT_BYTES || ab_glyph::FontRef::try_from_slice(&bytes).is_err() {
+        return None;
+    }
+    Some(bytes)
+}
+
+#[cfg(windows)]
+fn system_faces() -> Option<(PathBuf, PathBuf)> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
+
+    let mut buffer = [0u16; 260];
+    // The API writes at most the number of elements in the slice.
+    let length = unsafe { GetWindowsDirectoryW(Some(&mut buffer)) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    let directory = PathBuf::from(OsString::from_wide(&buffer[..length])).join("Fonts");
+    Some((
+        directory.join("segoeui.ttf"),
+        directory.join("segoeuib.ttf"),
+    ))
+}
+
+#[cfg(not(windows))]
+fn system_faces() -> Option<(PathBuf, PathBuf)> {
+    let (directory, body, bold) = if cfg!(target_os = "macos") {
+        (
+            "/System/Library/Fonts/Supplemental",
+            "Arial.ttf",
+            "Arial Bold.ttf",
+        )
+    } else {
+        (
+            "/usr/share/fonts/truetype/dejavu",
+            "DejaVuSans.ttf",
+            "DejaVuSans-Bold.ttf",
+        )
+    };
+    let directory = Path::new(directory);
+    Some((directory.join(body), directory.join(bold)))
 }
 
 pub(crate) fn apply_plugin(ctx: &egui::Context, plugin: Option<ThemePlugin>) {
@@ -273,7 +370,18 @@ pub(crate) fn apply_plugin(ctx: &egui::Context, plugin: Option<ThemePlugin>) {
     for theme in [Theme::Light, Theme::Dark] {
         ctx.style_mut_of(theme, |style| {
             let color = |role| resolve_color(theme, role, plugin.as_deref());
-            style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+            style.spacing.item_spacing = egui::vec2(9.0, 9.0);
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::new(21.0, title_family()),
+            );
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::new(14.0, title_family()),
+            );
             style.spacing.button_padding = egui::vec2(13.0, 8.0);
             style.visuals.override_text_color = Some(color(ColorRole::Text));
             style.visuals.hyperlink_color = color(ColorRole::Accent);
@@ -388,20 +496,20 @@ fn default_color(theme: Theme, role: ColorRole) -> Color32 {
     }
     match role {
         Background => Color32::BLACK,
-        Surface => Color32::from_rgba_unmultiplied(14, 45, 44, 248),
-        Rail => Color32::from_rgb(16, 42, 42),
-        Selection => Color32::from_rgb(59, 41, 85),
+        Surface => Color32::from_rgba_unmultiplied(11, 37, 39, 248),
+        Rail => Color32::from_rgb(10, 24, 26),
+        Selection => Color32::from_rgb(46, 36, 73),
         RailText => Color32::from_rgb(192, 208, 205),
         Text => Color32::from_rgb(243, 247, 245),
         Muted => Color32::from_rgb(168, 194, 189),
-        Border => Color32::from_rgb(58, 105, 101),
+        Border => Color32::from_rgb(48, 93, 94),
         Accent => Color32::from_rgb(197, 170, 255),
-        Primary => Color32::from_rgb(159, 122, 251),
+        Primary => Color32::from_rgb(115, 69, 218),
         Success => Color32::from_rgb(109, 230, 192),
         Warning => Color32::from_rgb(245, 199, 146),
         Error => Color32::from_rgb(248, 148, 156),
         Destructive => Color32::from_rgb(162, 50, 67),
-        Logo => Color32::from_rgb(104, 211, 194),
+        Logo => Color32::from_rgb(76, 199, 170),
     }
 }
 
@@ -410,13 +518,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalid_platform_fonts_fall_back_to_the_default_faces() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), b"not a typeface").unwrap();
+        assert!(read_platform_face(file.path()).is_none());
+        file.as_file().set_len(8 * 1024 * 1024 + 1).unwrap();
+        assert!(read_platform_face(file.path()).is_none());
+    }
+
+    #[test]
     fn dark_defaults_keep_teal_surfaces_and_purple_actions() {
         let ctx = egui::Context::default();
         configure(&ctx, ThemePreference::Dark);
 
         assert_eq!(color(&ctx, CREAM), Color32::BLACK);
-        assert_eq!(color(&ctx, RAIL), Color32::from_rgb(16, 42, 42));
-        assert_eq!(color(&ctx, LIME), Color32::from_rgb(159, 122, 251));
+        assert_eq!(color(&ctx, RAIL), Color32::from_rgb(10, 24, 26));
+        assert_eq!(color(&ctx, LIME), Color32::from_rgb(115, 69, 218));
     }
 
     #[test]

@@ -5,12 +5,14 @@ use serde_json::Value;
 use crate::setup::{fetch_json, loopback_agent, validate_comfy_url};
 
 const ACTIVE_JOBS: &str = "/api/jobs?status=in_progress,pending&limit=100";
+const VISIBLE_PENDING_JOBS: usize = 2;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct QueueStatus {
     pub running: usize,
     pub queued: usize,
     pub running_ids: Vec<String>,
+    pub pending_ids: Vec<String>,
 }
 
 impl QueueStatus {
@@ -48,6 +50,7 @@ fn from_jobs(response: &Value) -> Option<QueueStatus> {
         running: 0,
         queued: 0,
         running_ids: Vec::new(),
+        pending_ids: Vec::new(),
     };
     for job in jobs {
         match job.get("status")?.as_str()? {
@@ -57,7 +60,13 @@ fn from_jobs(response: &Value) -> Option<QueueStatus> {
                     status.running_ids.push(id.into());
                 }
             }
-            "pending" => status.queued += 1,
+            "pending" => {
+                status.queued += 1;
+                push_pending_id(
+                    &mut status.pending_ids,
+                    job.get("id").and_then(Value::as_str),
+                );
+            }
             _ => return None,
         }
     }
@@ -72,15 +81,31 @@ fn from_queue(response: &Value) -> Option<QueueStatus> {
         item.get(0)?.as_f64()?;
         running_ids.push(item.get(1)?.as_str()?.to_owned());
     }
+    let mut pending_ids = Vec::new();
     for item in pending {
         item.get(0)?.as_f64()?;
-        item.get(1)?.as_str()?;
+        push_pending_id(&mut pending_ids, Some(item.get(1)?.as_str()?));
     }
     Some(QueueStatus {
         running: running.len(),
         queued: pending.len(),
         running_ids,
+        pending_ids,
     })
+}
+
+fn push_pending_id(ids: &mut Vec<String>, id: Option<&str>) {
+    if let Some(id) = id
+        && ids.len() < VISIBLE_PENDING_JOBS
+        && !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && !ids.iter().any(|entry| entry == id)
+    {
+        ids.push(id.to_owned());
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +176,7 @@ mod tests {
                 assert_eq!(status.running, 1);
                 assert_eq!(status.queued, 2);
                 assert_eq!(status.running_ids, ["render-id"]);
+                assert_eq!(status.pending_ids, ["queued-1"]);
                 assert!(!status.is_idle());
             },
         );
@@ -197,7 +223,7 @@ mod tests {
     fn counts_legacy_entries_without_using_prompt_contents() {
         let status = from_queue(&json!({
             "queue_running": [[0, "running prompt", {"discarded": "workflow"}, {}, []]],
-            "queue_pending": [[1, "pending prompt", {}, {}, []]]
+            "queue_pending": [[1, "pending-prompt", {}, {}, []]]
         }))
         .unwrap();
         assert_eq!(
@@ -205,9 +231,27 @@ mod tests {
             QueueStatus {
                 running: 1,
                 queued: 1,
-                running_ids: vec!["running prompt".into()]
+                running_ids: vec!["running prompt".into()],
+                pending_ids: vec!["pending-prompt".into()]
             }
         );
+    }
+
+    #[test]
+    fn pending_rows_are_bounded_without_changing_queue_counts() {
+        let result = from_jobs(&json!({
+            "jobs": [
+                {"id":"not a job id", "status":"pending"},
+                {"id":"pending-a", "status":"pending"},
+                {"id":"pending-a", "status":"pending"},
+                {"id":"pending-b", "status":"pending"},
+                {"id":"pending-c", "status":"pending"},
+            ],
+            "pagination": {"offset":0,"total":5,"has_more":false},
+        }))
+        .unwrap();
+        assert_eq!(result.queued, 5);
+        assert_eq!(result.pending_ids, ["pending-a", "pending-b"]);
     }
 
     #[test]

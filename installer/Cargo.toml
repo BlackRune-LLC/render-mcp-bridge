@@ -7,7 +7,9 @@ description = "Desktop setup wizard for the Render Bridge image MCP server"
 publish = false
 
 [dependencies]
+ab_glyph = "0.2.32"
 eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 rfd = "0.16.0"
 ring = "0.17.14"
 serde = { version = "1", features = ["derive"] }

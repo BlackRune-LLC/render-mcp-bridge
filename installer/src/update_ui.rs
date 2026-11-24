@@ -370,7 +370,7 @@ impl eframe::App for ApplyWindow {
             .frame(
                 egui::Frame::new()
                     .fill(theme::color(ctx, CREAM))
-                    .inner_margin(egui::Margin::same(20)),
+                    .inner_margin(egui::Margin::symmetric(20, 12)),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {

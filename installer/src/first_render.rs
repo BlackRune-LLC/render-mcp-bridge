@@ -39,7 +39,7 @@ impl FirstRender {
         self.poll(ui.ctx());
 
         card(ui, |ui| {
-            field_label(ui, "First render");
+            theme::heading(ui, "First render", 19.0);
             if matches!(self.result, Some(Ok(()))) {
                 ui.horizontal_wrapped(|ui| {
                     if let Some(preview) = &self.preview {
@@ -61,23 +61,17 @@ impl FirstRender {
                 });
                 return;
             }
-            check_label(
-                ui,
-                "Render Bridge",
-                if server_verified {
-                    "Verified"
-                } else {
-                    "Start and verify first"
-                },
-                server_verified,
-            );
-            check_label(ui, "Agent connection", "Awaiting test output", false);
-            check_label(ui, "Test PNG", "Awaiting signed link", false);
-
-            caption(
-                ui,
-                "Use the Z-Image Turbo starter pack for one 512 × 512 test. It uses your render GPU when you run the prompt in your agent.",
-            );
+            if server_verified {
+                caption(
+                    ui,
+                    "Run a 512 × 512 test with the Z-Image Turbo starter pack, then verify the signed result here.",
+                );
+            } else {
+                caption(
+                    ui,
+                    "Start & Verify enables the first-render test. The test runs only when you give its prompt to a connected agent.",
+                );
+            }
             let copy = if self.prefix.is_some() {
                 "Copy test prompt again"
             } else {
@@ -171,14 +165,6 @@ impl FirstRender {
             }
         }
     }
-}
-
-fn check_label(ui: &mut Ui, label: &str, status: &str, passed: bool) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new(label).strong());
-        let color = theme::color(ui.ctx(), if passed { GREEN } else { CAUTION });
-        ui.label(egui::RichText::new(status).color(color));
-    });
 }
 
 fn new_prefix() -> Option<String> {

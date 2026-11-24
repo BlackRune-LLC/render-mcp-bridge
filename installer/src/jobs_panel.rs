@@ -1,12 +1,14 @@
-use eframe::egui::{self, RichText, Ui};
+use eframe::egui::{self, Ui};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use crate::INK;
 use crate::jobs::{self, QueueStatus};
 use crate::theme;
-use crate::{CAUTION, GREEN, INK, LINE, SURFACE, VIOLET, caption, monitor_button, status};
+use crate::{CAUTION, CREAM, GREEN, LINE, MUTED, SURFACE, VIOLET, caption, monitor_button, status};
 
 #[cfg(windows)]
 use crate::RAIL_ACTIVE;
@@ -142,11 +144,14 @@ impl QueueView {
     }
 
     pub fn show(&mut self, ui: &mut Ui) {
-        self.show_card(ui);
-        ui.horizontal_wrapped(|ui| self.show_refresh(ui));
+        self.show_queue(ui, false);
     }
 
     pub fn show_card(&mut self, ui: &mut Ui) {
+        self.show_queue(ui, true);
+    }
+
+    fn show_queue(&mut self, ui: &mut Ui, dashboard: bool) {
         let mut snapshot = self
             .state
             .lock()
@@ -161,62 +166,81 @@ impl QueueView {
                 .and_then(|state| state.snapshot.clone());
         }
         match snapshot.as_deref() {
-            Some(Ok(queue)) => {
-                egui::Frame::new()
-                    .fill(theme::color(ui.ctx(), SURFACE))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
-                    .corner_radius(12)
-                    .inner_margin(12)
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        let (label, color) = match (queue.running > 0, queue.queued > 0) {
-                            (true, _) => ("Render in progress", GREEN),
-                            (false, true) => ("Waiting to run", VIOLET),
-                            _ => ("Queue is idle", GREEN),
-                        };
-                        ui.label(
-                            RichText::new(label)
-                                .size(17.0)
-                                .strong()
-                                .color(theme::color(ui.ctx(), color)),
-                        );
-                        if queue.running > 0 {
-                            self.show_progress(ui, queue);
-                            ui.separator();
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            for (label, count) in
-                                [("running", queue.running), ("queued", queue.queued)]
-                            {
-                                ui.label(
-                                    RichText::new(format!("{count} {label}"))
-                                        .strong()
-                                        .color(theme::color(ui.ctx(), INK)),
-                                );
-                            }
-                        });
-                    });
+            Some(Ok(queue)) => self.queue_snapshot(ui, queue, dashboard),
+            Some(Err(message)) => {
+                status(ui, "Queue status unavailable", message, CAUTION);
+                ui.horizontal_wrapped(|ui| self.show_refresh(ui));
             }
-            Some(Err(message)) => status(ui, "Queue status unavailable", message, CAUTION),
-            None => caption(ui, "Checking the ComfyUI queue…"),
+            None => queue_frame(ui, 12, |ui| caption(ui, "Checking the ComfyUI queue…")),
+        }
+        if self.state.lock().is_ok_and(|state| state.manual) {
+            caption(ui, "Refreshing queue…");
         }
     }
 
-    pub fn show_refresh(&mut self, ui: &mut Ui) {
-        let (available, mut manual) = self
+    fn queue_snapshot(&mut self, ui: &mut Ui, queue: &QueueStatus, dashboard: bool) {
+        let (title, tone, shape) = if queue.running > 0 {
+            ("Render in progress", GREEN, QueueGlyph::Active)
+        } else if queue.queued > 0 {
+            ("Waiting to render", VIOLET, QueueGlyph::Layers)
+        } else {
+            ("Queue idle", GREEN, QueueGlyph::Ready)
+        };
+        queue_frame(ui, if dashboard { 10 } else { 12 }, |ui| {
+            ui.horizontal_top(|ui| {
+                if dashboard {
+                    queue_glyph(ui, shape, tone, 49.0);
+                    ui.add_space(5.0);
+                }
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        theme::heading(ui, title, if dashboard { 19.0 } else { 16.0 });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.show_refresh(ui);
+                        });
+                    });
+                    if queue.running > 0 {
+                        self.show_progress(ui, queue);
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        queue_count(ui, queue.running, "running", tone);
+                        queue_count(ui, queue.queued, "queued", VIOLET);
+                    });
+                });
+            });
+        });
+        if dashboard {
+            for id in &queue.pending_ids {
+                queue_frame(ui, 5, |ui| {
+                    ui.horizontal(|ui| {
+                        queue_glyph(ui, QueueGlyph::Layers, VIOLET, 22.0);
+                        let short: String = id.chars().take(10).collect();
+                        let title = theme::strong(format!("Job {short}"), 13.0);
+                        ui.add(egui::Label::new(title).truncate()).on_hover_text(id);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            queue_tag(ui, "Queued", VIOLET);
+                        });
+                    });
+                });
+            }
+            let unlisted = queue.queued.saturating_sub(queue.pending_ids.len());
+            if unlisted > 0 && !queue.pending_ids.is_empty() {
+                caption(ui, &format!("{unlisted} more queued"));
+            }
+        }
+    }
+
+    fn show_refresh(&mut self, ui: &mut Ui) {
+        let (available, manual) = self
             .state
             .lock()
             .map(|state| (state.snapshot.is_some(), state.manual))
             .unwrap_or_default();
         if monitor_button(ui, "Refresh", available && !manual, SURFACE)
-            .on_hover_text("The queue also refreshes automatically")
+            .on_hover_text("Check the queue now. The queue also refreshes automatically.")
             .clicked()
         {
             self.request_refresh(ui.ctx());
-            manual = self.state.lock().is_ok_and(|state| state.manual);
-        }
-        if manual {
-            caption(ui, "Refreshing queue…");
         }
     }
 
@@ -228,22 +252,21 @@ impl QueueView {
                 .iter()
                 .find_map(|id| observer.latest_for(id))
         }) {
-            let fraction = progress.value / progress.max;
+            let fraction = (progress.value / progress.max).clamp(0.0, 1.0);
             let percent = if progress.value < progress.max {
                 (fraction * 100.0).round().min(99.0)
             } else {
                 100.0
             };
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 caption(
                     ui,
                     &format!("Current stage {:.0} of {:.0}", progress.value, progress.max),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format!("{percent:.0}%"))
-                            .strong()
-                            .color(theme::color(ui.ctx(), GREEN)),
+                        theme::strong(format!("{percent:.0}%"), 17.0)
+                            .color(theme::color(ui.ctx(), INK)),
                     );
                 });
             });
@@ -257,8 +280,7 @@ impl QueueView {
             });
             return;
         }
-
-        caption(ui, "Step updates appear when available.");
+        caption(ui, "Waiting for stage progress.");
     }
 
     pub fn stop_confirmation(
@@ -284,6 +306,84 @@ impl QueueView {
             }
         })
     }
+}
+
+fn queue_frame(ui: &mut Ui, margin: i8, content: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .fill(theme::color(ui.ctx(), SURFACE))
+        .stroke(egui::Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
+        .corner_radius(12)
+        .inner_margin(margin)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            content(ui);
+        });
+}
+
+fn queue_count(ui: &mut Ui, count: usize, label: &str, color: egui::Color32) {
+    let color = if count > 0 { color } else { MUTED };
+    ui.label(theme::strong(format!("{count} {label}"), 13.0).color(theme::color(ui.ctx(), color)));
+}
+
+fn queue_tag(ui: &mut Ui, title: &str, tone: egui::Color32) {
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(theme::strong(title, 12.0).color(theme::color(ui.ctx(), tone)));
+        });
+}
+
+enum QueueGlyph {
+    Active,
+    Ready,
+    Layers,
+}
+
+fn queue_glyph(ui: &mut Ui, shape: QueueGlyph, tone: egui::Color32, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+    let painter = ui.painter();
+    let border = theme::color(ui.ctx(), LINE);
+    if size > 30.0 {
+        painter.rect(
+            rect,
+            10,
+            theme::color(ui.ctx(), CREAM),
+            egui::Stroke::new(1.0_f32, border),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let stroke = egui::Stroke::new(
+        if size > 30.0 { 2.0_f32 } else { 1.2_f32 },
+        theme::color(ui.ctx(), tone),
+    );
+    let at = |x, y| rect.min + egui::vec2(x, y) * size;
+    let path = match shape {
+        QueueGlyph::Active => vec![
+            at(0.18, 0.54),
+            at(0.33, 0.54),
+            at(0.43, 0.31),
+            at(0.54, 0.70),
+            at(0.64, 0.46),
+            at(0.82, 0.46),
+        ],
+        QueueGlyph::Ready => vec![at(0.28, 0.51), at(0.44, 0.66), at(0.72, 0.36)],
+        QueueGlyph::Layers => {
+            painter.add(egui::Shape::line(
+                vec![at(0.18, 0.58), at(0.50, 0.75), at(0.82, 0.58)],
+                stroke,
+            ));
+            vec![
+                at(0.13, 0.45),
+                at(0.50, 0.25),
+                at(0.87, 0.45),
+                at(0.50, 0.65),
+                at(0.13, 0.45),
+            ]
+        }
+    };
+    painter.add(egui::Shape::line(path, stroke));
 }
 
 #[cfg(test)]
@@ -333,6 +433,7 @@ mod tests {
             running: 0,
             queued,
             running_ids: Vec::new(),
+            pending_ids: Vec::new(),
         }
     }
 }

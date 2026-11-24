@@ -62,7 +62,7 @@ impl WorkflowPanel {
             self.error = None;
         }
         self.poll();
-        ui.heading("Workflow editor");
+        crate::theme::heading(ui, "Workflow editor", 30.0);
         ui.horizontal_wrapped(|ui| {
             if primary(ui, "Import API JSON", self.worker.is_none()).clicked() {
                 self.import();
@@ -90,6 +90,14 @@ impl WorkflowPanel {
             .clicked()
             {
                 self.start(ui.ctx(), None);
+            }
+            if secondary(ui, "Test run…", self.test_ready(installed))
+                .on_disabled_hover_text(
+                    "Check dependencies on a local installation with Gaming Mode off.",
+                )
+                .clicked()
+            {
+                self.confirm_run = true;
             }
         });
         if let Some(error) = &self.error {
@@ -345,6 +353,13 @@ impl WorkflowPanel {
         }
     }
 
+    fn test_ready(&self, installed: Option<&Installed>) -> bool {
+        self.schema.is_some()
+            && self.issues.is_empty()
+            && self.worker.is_none()
+            && installed.and_then(crate::gaming_mode) == Some(false)
+    }
+
     fn review(&mut self, ui: &mut Ui, installed: Option<&Installed>) {
         if self.schema.is_some() {
             ui.separator();
@@ -377,18 +392,6 @@ impl WorkflowPanel {
                 });
             }
         }
-        let ready = self.schema.is_some()
-            && self.issues.is_empty()
-            && self.worker.is_none()
-            && installed.and_then(crate::gaming_mode) == Some(false);
-        if secondary(ui, "Test run…", ready)
-            .on_disabled_hover_text(
-                "Check dependencies on a local installation with Gaming Mode off.",
-            )
-            .clicked()
-        {
-            self.confirm_run = true;
-        }
         if self.worker.as_ref().is_some_and(|worker| worker.test) {
             activity(ui, "Checking and submitting this workflow…");
         }
@@ -412,7 +415,7 @@ impl WorkflowPanel {
                     if secondary(ui, "Cancel", true).clicked() {
                         self.confirm_run = false;
                     }
-                    if primary(ui, "Queue test", ready).clicked() {
+                    if primary(ui, "Queue test", self.test_ready(installed)).clicked() {
                         self.confirm_run = false;
                         self.start(ui.ctx(), installed.cloned());
                     }

@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32, Frame, RichText, Shape, Stroke, Ui};
+use eframe::egui::{self, Color32, Frame, Shape, Stroke, Ui};
 
 use crate::{LINE, SURFACE, VIOLET, caption, theme};
 
@@ -6,11 +6,12 @@ use crate::{LINE, SURFACE, VIOLET, caption, theme};
 pub(crate) enum UtilityIcon {
     Download,
     Maintenance,
+    Python,
 }
 
 pub(crate) fn heading(ui: &mut Ui, icon: UtilityIcon, title: &str, detail: Option<&str>) {
     ui.horizontal_top(|ui| {
-        let (bounds, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+        let (bounds, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
         let line = theme::color(ui.ctx(), LINE);
         let fill = theme::color(ui.ctx(), SURFACE);
         let accent = theme::color(ui.ctx(), VIOLET);
@@ -24,7 +25,7 @@ pub(crate) fn heading(ui: &mut Ui, icon: UtilityIcon, title: &str, detail: Optio
         draw(ui.painter(), bounds, icon, accent);
         ui.add_space(5.0);
         ui.vertical(|ui| {
-            ui.add(egui::Label::new(RichText::new(title).size(22.0).strong()).wrap());
+            theme::heading(ui, title, 26.0);
             if let Some(detail) = detail {
                 caption(ui, detail);
             }
@@ -35,7 +36,7 @@ pub(crate) fn heading(ui: &mut Ui, icon: UtilityIcon, title: &str, detail: Optio
 
 fn draw(painter: &egui::Painter, bounds: egui::Rect, icon: UtilityIcon, color: Color32) {
     let stroke = Stroke::new(2.6_f32, color);
-    let at = |x, y| bounds.min + egui::vec2(x, y);
+    let at = |x: f32, y: f32| bounds.min + egui::vec2(x + 4.0, y + 4.0);
     match icon {
         UtilityIcon::Download => {
             painter.line_segment([at(24.0, 11.0), at(24.0, 28.0)], stroke);
@@ -52,6 +53,34 @@ fn draw(painter: &egui::Painter, bounds: egui::Rect, icon: UtilityIcon, color: C
                 ],
                 stroke,
             ));
+        }
+        UtilityIcon::Python => {
+            painter.add(Shape::line(
+                vec![
+                    at(13.0, 25.0),
+                    at(13.0, 19.0),
+                    at(18.0, 13.0),
+                    at(28.0, 13.0),
+                    at(33.0, 18.0),
+                    at(33.0, 25.0),
+                    at(25.0, 25.0),
+                ],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![
+                    at(35.0, 23.0),
+                    at(35.0, 29.0),
+                    at(30.0, 35.0),
+                    at(20.0, 35.0),
+                    at(15.0, 30.0),
+                    at(15.0, 23.0),
+                    at(23.0, 23.0),
+                ],
+                stroke,
+            ));
+            painter.circle_filled(at(22.0, 18.0), 1.8, color);
+            painter.circle_filled(at(26.0, 30.0), 1.8, color);
         }
         UtilityIcon::Maintenance => {
             painter.add(Shape::line(

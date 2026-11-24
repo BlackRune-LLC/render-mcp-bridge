@@ -38,6 +38,12 @@ The Windows workflow and node milestone passed 131 Rust tests and 72 Python test
 
 Desktop and terminal setup now accept a reusable settings JSON file. Existing saved values take precedence per field. Setup aborts before activation if the selected saved configuration changes while preparing the runtime.
 
+## Concept fidelity pass
+
+The second visual pass uses larger headings, black workspaces, dark teal panels, and purple selection. It adds illustrated model packs, a wider pipeline graph and swap inspector, grouped node inventory, and a compact Jobs footer. Setup and Settings adopt the same navigation and visual hierarchy. Jobs shows queue data from the selected server, and Connect shows a first-render receipt after verification.
+
+The Windows release build passed 137 Rust tests. Dark and Light native captures at 125% Windows scaling used an isolated installation and local fixture data. At the default window sizes, the Jobs controls and two queued items fit, pipeline labels stay within their nodes, Setup displays the model license and download action, and the Nodes list and source details are legible. The Workflow test action is visible in its toolbar.
+
 ## Verification boundaries
 
 Confirm missing and unknown resources separately when the backend is offline or returns incomplete data. Display current state after a backend switch and discard results from an earlier backend. Invalid theme files leave the previous appearance active. Keep theme files and saved revisions independent of the server token and user settings. Verify agent-facing pipeline arguments against the shipped tool schema.

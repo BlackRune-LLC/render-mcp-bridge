@@ -6,8 +6,8 @@ use eframe::egui::{self, Button, Color32, Frame, Margin, RichText, ScrollArea, S
 
 use crate::pipeline::{self, Availability, Dependencies, Dependency, Revision, Variant};
 use crate::{
-    CAUTION, GREEN, LINE, MODEL_GUIDE, MUTED, RAIL_ACTIVE, SURFACE, VIOLET, activity, caption,
-    code_label, primary, secondary, status, theme,
+    CAUTION, CREAM, GREEN, INK, LINE, MODEL_GUIDE, MUTED, RAIL_ACTIVE, SURFACE, VIOLET, activity,
+    caption, code_label, primary, secondary, status, theme,
 };
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -102,14 +102,23 @@ impl PipelinePanel {
             self.workflow.show(ui, backend, installed);
             return;
         }
-        ui.heading("Wan Animate 2");
-        caption(ui, "Motion transfer");
-        if ui.available_width() >= 860.0 {
-            ui.columns(2, |columns| {
-                self.graph(&mut columns[0]);
-                self.show_validation(&mut columns[0]);
-                self.swap_panel(&mut columns[1]);
-                self.show_revision_actions(&mut columns[1]);
+        ui.add_space(4.0);
+        caption(ui, "Pipelines / Motion transfer");
+        theme::heading(ui, "Wan Animate 2", 32.0);
+        ui.add_space(5.0);
+        let available = ui.available_width();
+        if available >= 830.0 {
+            let canvas = (available * 0.64).max(510.0);
+            let inspector = available - canvas - ui.spacing().item_spacing.x;
+            ui.horizontal_top(|ui| {
+                pipeline_column(ui, canvas, |ui| {
+                    self.graph(ui);
+                    self.show_validation(ui);
+                });
+                pipeline_column(ui, inspector, |ui| {
+                    self.swap_panel(ui);
+                    self.show_revision_actions(ui);
+                });
             });
         } else {
             self.graph(ui);
@@ -164,93 +173,138 @@ impl PipelinePanel {
 
     fn graph(&mut self, ui: &mut Ui) {
         Frame::new()
+            .fill(theme::color(ui.ctx(), CREAM))
             .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
             .corner_radius(12)
-            .inner_margin(Margin::same(8))
+            .inner_margin(Margin::same(10))
             .show(ui, |ui| {
                 ScrollArea::horizontal()
                     .id_salt("wan-graph")
                     .show(ui, |ui| {
-                        let width = ui.available_width().max(410.0);
-                        let (bounds, _) =
-                            ui.allocate_exact_size(egui::vec2(width, 198.0), egui::Sense::hover());
-                        let dot = theme::color(ui.ctx(), LINE).gamma_multiply(0.40);
-                        for x in (10..(width as usize)).step_by(14) {
-                            for y in (10..198).step_by(14) {
-                                ui.painter().circle_filled(
-                                    bounds.min + egui::vec2(x as f32, y as f32),
+                        let width = ui.available_width().max(490.0);
+                        let height = 340.0;
+                        let (canvas, _) =
+                            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+                        let painter = ui.painter_at(canvas);
+                        let dot = theme::color(ui.ctx(), LINE).gamma_multiply(0.48);
+                        for x in (12..width as usize).step_by(14) {
+                            for y in (12..height as usize).step_by(14) {
+                                painter.circle_filled(
+                                    canvas.min + egui::vec2(x as f32, y as f32),
                                     0.8,
                                     dot,
                                 );
                             }
                         }
-                        let slot = (width - 16.0) / 4.0;
-                        let rect = |col: u8, row: u8| {
+                        let slot = (width - 8.0) / 5.0;
+                        let node_rect = |column: u8, y: f32| {
                             egui::Rect::from_min_size(
-                                bounds.min
-                                    + egui::vec2(
-                                        8.0 + f32::from(col) * slot,
-                                        10.0 + f32::from(row) * 62.0,
-                                    ),
-                                egui::vec2(slot - 14.0, 51.0),
+                                canvas.min + egui::vec2(4.0 + f32::from(column) * slot, y),
+                                egui::vec2(slot - 12.0, 57.0),
                             )
                         };
-                        let inputs = [
-                            (Node::Character, rect(0, 0)),
-                            (Node::DrivingClip, rect(0, 1)),
-                            (Node::MotionModel, rect(0, 2)),
+                        let image = node_rect(0, 76.0);
+                        let clip = node_rect(0, 206.0);
+                        let model = node_rect(1, 141.0);
+                        let animate = node_rect(2, 141.0);
+                        let decode = node_rect(3, 141.0);
+                        let output = node_rect(4, 141.0);
+                        let nodes = [
+                            (Node::Character, image),
+                            (Node::DrivingClip, clip),
+                            (Node::MotionModel, model),
+                            (Node::Animate, animate),
+                            (Node::Decode, decode),
+                            (Node::Output, output),
                         ];
-                        let stages = [
-                            (Node::Animate, rect(1, 1)),
-                            (Node::Decode, rect(2, 1)),
-                            (Node::Output, rect(3, 1)),
+                        let paths = [
+                            (image, animate, -15.0),
+                            (clip, animate, 15.0),
+                            (model, animate, 0.0),
+                            (animate, decode, 0.0),
+                            (decode, output, 0.0),
                         ];
-                        let edge_color = theme::color(ui.ctx(), GREEN);
-                        let edge = |from: egui::Rect, to: egui::Rect, offset: f32| {
+                        let wire = theme::color(ui.ctx(), GREEN);
+                        for (from, to, offset) in paths {
                             let start = from.right_center();
                             let end = to.left_center() + egui::vec2(0.0, offset);
-                            let middle = (start.x + end.x) * 0.5;
-                            ui.painter()
-                                .add(egui::epaint::CubicBezierShape::from_points_stroke(
-                                    [
-                                        start,
-                                        egui::pos2(middle, start.y),
-                                        egui::pos2(middle, end.y),
-                                        end,
-                                    ],
-                                    false,
-                                    Color32::TRANSPARENT,
-                                    Stroke::new(1.8_f32, edge_color),
-                                ));
-                        };
-                        for (index, (_, source)) in inputs.iter().enumerate() {
-                            edge(*source, stages[0].1, (index as f32 - 1.0) * 10.0);
+                            let bend = (start.x + end.x) / 2.0;
+                            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                                [
+                                    start,
+                                    egui::pos2(bend, start.y),
+                                    egui::pos2(bend, end.y),
+                                    end,
+                                ],
+                                false,
+                                Color32::TRANSPARENT,
+                                Stroke::new(1.8_f32, wire),
+                            ));
                         }
-                        for pair in stages.windows(2) {
-                            edge(pair[0].1, pair[1].1, 0.0);
-                        }
-                        for (node, bounds) in inputs.into_iter().chain(stages) {
-                            let selected = self.node == node;
-                            let fill = theme::color(
-                                ui.ctx(),
-                                if selected { RAIL_ACTIVE } else { SURFACE },
-                            );
-                            let border =
-                                theme::color(ui.ctx(), if selected { VIOLET } else { LINE });
-                            let label = format!("{}\n{}", node.title(), node.summary(self.draft));
-                            if ui
-                                .put(
-                                    bounds,
-                                    Button::new(RichText::new(label).size(13.0))
-                                        .fill(fill)
-                                        .stroke(Stroke::new(1.0_f32, border))
-                                        .corner_radius(9),
-                                )
-                                .on_hover_text(node.description())
-                                .clicked()
-                            {
+                        for (node, rect) in nodes {
+                            let response =
+                                ui.interact(rect, ui.id().with(node.title()), egui::Sense::click());
+                            if response.clicked() {
                                 self.node = node;
                             }
+                            let selected = self.node == node;
+                            response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    selected,
+                                    node.title(),
+                                )
+                            });
+                            let highlighted = selected || response.has_focus();
+                            let fill = theme::color(
+                                ui.ctx(),
+                                if selected || response.hovered() {
+                                    RAIL_ACTIVE
+                                } else {
+                                    SURFACE
+                                },
+                            );
+                            let border =
+                                theme::color(ui.ctx(), if highlighted { VIOLET } else { LINE });
+                            painter.rect(
+                                rect,
+                                9,
+                                fill,
+                                Stroke::new(if highlighted { 2.0_f32 } else { 1.0_f32 }, border),
+                                egui::StrokeKind::Inside,
+                            );
+                            let inner = rect.shrink2(egui::vec2(5.0, 3.0));
+                            let label = painter.with_clip_rect(inner);
+                            node_line(
+                                &label,
+                                inner,
+                                -8.0,
+                                node.title(),
+                                theme::display_font(13.0),
+                                theme::color(ui.ctx(), INK),
+                            );
+                            node_line(
+                                &label,
+                                inner,
+                                10.0,
+                                node.summary(self.draft),
+                                egui::FontId::proportional(11.0),
+                                theme::color(ui.ctx(), MUTED),
+                            );
+                            response.on_hover_text(node.description());
+                        }
+                        for (from, to, offset) in paths {
+                            let start = from.right_center();
+                            let end = to.left_center() + egui::vec2(0.0, offset);
+                            let selected = self.node == Node::MotionModel && from == model;
+                            let color = if selected {
+                                theme::color(ui.ctx(), VIOLET)
+                            } else {
+                                wire
+                            };
+                            painter.circle_filled(start, 3.4, color);
+                            painter.circle_filled(end, 3.4, color);
                         }
                     });
             });
@@ -269,11 +323,15 @@ impl PipelinePanel {
     }
 
     fn inspector(&mut self, ui: &mut Ui) {
-        ui.heading(if self.node == Node::MotionModel {
-            "Swap model"
-        } else {
-            self.node.title()
-        });
+        theme::heading(
+            ui,
+            if self.node == Node::MotionModel {
+                "Swap model"
+            } else {
+                self.node.title()
+            },
+            22.0,
+        );
         caption(ui, self.node.description());
         if self.node != Node::MotionModel {
             if secondary(ui, "Select Motion model", true).clicked() {
@@ -282,16 +340,23 @@ impl PipelinePanel {
             return;
         }
         let previous = self.draft;
-        ui.horizontal_wrapped(|ui| {
-            for candidate in [Variant::Distilled, Variant::FullQuality] {
-                ui.selectable_value(&mut self.draft, candidate, candidate.label());
+        for candidate in [Variant::Distilled, Variant::FullQuality] {
+            let selected = self.draft == candidate;
+            let edge = theme::color(ui.ctx(), if selected { VIOLET } else { LINE });
+            let fill = theme::color(ui.ctx(), if selected { RAIL_ACTIVE } else { CREAM });
+            let button = Button::selectable(selected, theme::strong(candidate.label(), 15.0))
+                .fill(fill)
+                .stroke(Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, edge))
+                .corner_radius(8);
+            if ui.add_sized([ui.available_width(), 37.0], button).clicked() {
+                self.draft = candidate;
             }
-        });
+        }
         if self.draft != previous {
             self.invalidate_validation();
         }
         ui.separator();
-        ui.label(RichText::new("Review changes").strong());
+        theme::heading(ui, "Review changes", 17.0);
         let baseline = self
             .latest
             .map_or(Variant::Distilled, |revision| revision.variant);
@@ -323,10 +388,12 @@ impl PipelinePanel {
         } else {
             caption(ui, &format!("{} LCM sampler steps", self.draft.steps()));
         }
-        code_label(ui, self.draft.weight());
-        if let Some(lora) = self.draft.lora() {
-            code_label(ui, lora);
-        }
+        ui.collapsing("Required files", |ui| {
+            code_label(ui, self.draft.weight());
+            if let Some(lora) = self.draft.lora() {
+                code_label(ui, lora);
+            }
+        });
         caption(
             ui,
             "Text encoder, vision encoder, and VAE are shared by both variants.",
@@ -461,6 +528,34 @@ impl PipelinePanel {
         }
         self.worker = Some((target, receiver));
     }
+}
+
+fn node_line(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    offset: f32,
+    text: &str,
+    mut font: egui::FontId,
+    color: Color32,
+) {
+    let mut galley = painter.layout_no_wrap(text.to_owned(), font.clone(), color);
+    if galley.size().x > rect.width() {
+        font.size *= rect.width() / galley.size().x;
+        galley = painter.layout_no_wrap(text.to_owned(), font, color);
+    }
+    let center = rect.center() + egui::vec2(0.0, offset);
+    painter.galley(center - galley.size() * 0.5, galley, color);
+}
+
+fn pipeline_column(ui: &mut Ui, width: f32, contents: impl FnOnce(&mut Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(width);
+            contents(ui);
+        },
+    );
 }
 
 fn show_unready(ui: &mut Ui, label: &str, dependencies: &[Dependency]) {

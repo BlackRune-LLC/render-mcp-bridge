@@ -11,7 +11,6 @@ pub fn folder_option(ui: &mut Ui, label: &str, path: &mut Option<PathBuf>, fallb
     folder_picker(ui, label, path, fallback, false)
 }
 
-#[cfg(windows)]
 pub(crate) fn compact_folder_option(
     ui: &mut Ui,
     label: &str,
@@ -28,23 +27,23 @@ fn folder_picker(
     fallback: &str,
     compact: bool,
 ) -> bool {
-    if !compact {
-        field_label(ui, label);
-    }
-    let button = |ui: &mut Ui, action| {
-        if compact {
-            crate::monitor_button(ui, action, true, crate::SURFACE)
+    let value = |ui: &mut Ui, path: &Option<PathBuf>| {
+        if let Some(path) = path {
+            caption(ui, &path.to_string_lossy());
         } else {
-            secondary(ui, action, true)
+            caption(ui, fallback);
         }
     };
-    let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
-        if compact {
-            field_label(ui, label);
-        }
-        let picker = button(ui, "Browse…");
-        if picker.clicked() {
+    let actions = |ui: &mut Ui, path: &mut Option<PathBuf>| {
+        let button = |ui: &mut Ui, title| {
+            if compact {
+                crate::monitor_button(ui, title, true, crate::SURFACE)
+            } else {
+                secondary(ui, title, true)
+            }
+        };
+        let mut changed = false;
+        if button(ui, "Browse…").clicked() {
             let mut dialog = rfd::FileDialog::new().set_title(label);
             if let Some(existing) = &path {
                 dialog = dialog.set_directory(existing);
@@ -58,12 +57,29 @@ fn folder_picker(
             *path = None;
             changed = true;
         }
-    });
-    if let Some(path) = path {
-        caption(ui, &path.to_string_lossy());
-    } else {
-        caption(ui, fallback);
+        changed
+    };
+    if compact && ui.available_width() >= 300.0 {
+        let action_width = if path.is_some() { 154.0 } else { 100.0 };
+        let width = (ui.available_width() - action_width).max(92.0);
+        return ui
+            .horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    eframe::egui::vec2(width, 0.0),
+                    eframe::egui::Layout::top_down(eframe::egui::Align::Min),
+                    |ui| {
+                        ui.set_width(width);
+                        field_label(ui, label);
+                        value(ui, path);
+                    },
+                );
+                actions(ui, path)
+            })
+            .inner;
     }
+    field_label(ui, label);
+    let changed = ui.horizontal_wrapped(|ui| actions(ui, path)).inner;
+    value(ui, path);
     changed
 }
 
@@ -87,13 +103,14 @@ impl AssetEditor {
     }
 
     pub fn fields(&mut self, ui: &mut Ui) {
-        folder_option(
+        compact_folder_option(
             ui,
             "Generated assets folder",
             &mut self.folders.library,
             "Optional",
         );
-        folder_option(ui, "Backup folder", &mut self.folders.backup, "Optional");
+        ui.separator();
+        compact_folder_option(ui, "Backup folder", &mut self.folders.backup, "Optional");
         caption(
             ui,
             "Copy finished assets into these folders from Settings. ComfyUI keeps its original output.",

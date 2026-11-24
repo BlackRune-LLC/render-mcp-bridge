@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod artwork;
 mod asset_folders;
 mod asset_ui;
 mod connection;
@@ -305,13 +306,8 @@ impl StartupSetting {
                             bridge_mark(ui);
                             ui.label(
                                 RichText::new("Render Bridge")
-                                    .size(19.0)
+                                    .size(17.0)
                                     .strong()
-                                    .color(theme::on_fill(fill)),
-                            );
-                            ui.label(
-                                RichText::new("Settings")
-                                    .size(15.0)
                                     .color(theme::on_fill(fill)),
                             );
                         });
@@ -320,14 +316,19 @@ impl StartupSetting {
                 let roomy = ctx.content_rect().width() >= SETTINGS_RAIL_MIN_WIDTH;
                 if roomy {
                     egui::SidePanel::left("settings-navigation")
-                        .exact_width(144.0)
+                        .exact_width(160.0)
                         .resizable(false)
                         .frame(
                             Frame::new()
-                                .fill(surface)
-                                .inner_margin(egui::Margin::same(10)),
+                                .fill(fill)
+                                .stroke(Stroke::new(1.0_f32, theme::color(ctx, LINE)))
+                                .inner_margin(egui::Margin::symmetric(11, 15)),
                         )
-                        .show(ctx, |ui| self.navigation(ui, true));
+                        .show(ctx, |ui| {
+                            ui.label(theme::strong("Settings", 22.0).color(theme::on_fill(fill)));
+                            ui.add_space(7.0);
+                            self.navigation(ui, true);
+                        });
                 } else {
                     egui::TopBottomPanel::top("settings-navigation")
                         .frame(
@@ -372,9 +373,12 @@ impl StartupSetting {
         let labels = |ui: &mut Ui| {
             for tab in SettingsTab::ALL {
                 let width = if rail { ui.available_width() } else { 0.0 };
-                if settings_choice(ui, tab.title(), self.selected == tab, width).clicked()
-                    && self.selected != tab
-                {
+                let choice = if rail {
+                    settings_rail_choice(ui, tab, self.selected == tab, width)
+                } else {
+                    settings_choice(ui, tab.title(), self.selected == tab, width)
+                };
+                if choice.clicked() && self.selected != tab {
                     self.selected = tab;
                     self.message = None;
                 }
@@ -394,7 +398,7 @@ impl StartupSetting {
         data_dir: Option<&Path>,
         installed: Option<&Installed>,
     ) {
-        ui.label(RichText::new(self.selected.title()).size(24.0).strong());
+        theme::heading(ui, self.selected.title(), 31.0);
         ui.add_space(8.0);
         match self.selected {
             SettingsTab::Appearance => self.appearance(ui, appearance, data_dir),
@@ -417,8 +421,8 @@ impl StartupSetting {
         data_dir: Option<&Path>,
     ) {
         card(ui, |ui| {
-            field_label(ui, "Theme");
             ui.horizontal_wrapped(|ui| {
+                field_label(ui, "Theme");
                 for (label, preference) in [
                     ("Dark", egui::ThemePreference::Dark),
                     ("Light", egui::ThemePreference::Light),
@@ -446,10 +450,6 @@ impl StartupSetting {
             theme_preview(ui);
         });
         card(ui, |ui| {
-            self.theme_editor.show(ui, data_dir);
-        });
-        card(ui, |ui| {
-            field_label(ui, "Sign-in");
             let mut enabled = self.enabled.unwrap_or_default();
             if ui
                 .add_enabled(
@@ -474,6 +474,7 @@ impl StartupSetting {
                 caption(ui, error);
             }
         });
+        setup_card(ui, |ui| self.theme_editor.show(ui, data_dir));
     }
 
     fn storage(&mut self, ui: &mut Ui, installed: Option<&Installed>) {
@@ -557,10 +558,14 @@ impl StartupSetting {
                 Ok(settings) => {
                     field_label(ui, "ComfyUI address");
                     code_label(ui, &settings.comfy_url);
-                    for (label, kind) in [("Input folder", "input"), ("Output folder", "output")] {
-                        field_label(ui, label);
-                        code_label(ui, &setup::folder(&settings, kind).to_string_lossy());
-                    }
+                    ui.collapsing("Input and output folders", |ui| {
+                        for (label, kind) in
+                            [("Input folder", "input"), ("Output folder", "output")]
+                        {
+                            field_label(ui, label);
+                            code_label(ui, &setup::folder(&settings, kind).to_string_lossy());
+                        }
+                    });
                 }
                 Err(error) => caption(ui, &error),
             }
@@ -726,10 +731,20 @@ impl SettingsDiagnostics {
     }
 
     fn row(ui: &mut Ui, label: &str, state: &str, color: Color32) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(label).strong());
-            ui.label(RichText::new(state).color(theme::color(ui.ctx(), color)));
-        });
+        let state = RichText::new(state).color(theme::color(ui.ctx(), color));
+        if ui.available_width() >= 300.0 {
+            ui.horizontal(|ui| {
+                ui.label(theme::strong(label, 15.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(state)
+                });
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(theme::strong(label, 15.0));
+                ui.label(state);
+            });
+        }
     }
 
     fn start(&mut self, ctx: &egui::Context, installed: Option<Installed>, url: Option<String>) {
@@ -777,65 +792,182 @@ fn settings_choice(ui: &mut Ui, label: &str, selected: bool, width: f32) -> egui
 }
 
 #[cfg(windows)]
-fn theme_preview(ui: &mut Ui) {
-    let width = ui.available_width().min(280.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 88.0), egui::Sense::hover());
-    let fill = |role| theme::color(ui.ctx(), role);
-    let painter = ui.painter();
-    painter.rect(
-        rect,
-        8,
-        fill(CREAM),
-        Stroke::new(1.0_f32, fill(LINE)),
-        egui::StrokeKind::Inside,
-    );
-    let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 19.0));
-    painter.rect_filled(
-        top,
-        egui::CornerRadius {
-            nw: 8,
-            ne: 8,
-            ..Default::default()
+fn settings_rail_choice(
+    ui: &mut Ui,
+    tab: SettingsTab,
+    selected: bool,
+    width: f32,
+) -> egui::Response {
+    let (bounds, response) = ui.allocate_exact_size(egui::vec2(width, 39.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, tab.title())
+    });
+    let fill = theme::color(
+        ui.ctx(),
+        if selected {
+            LIME
+        } else if response.hovered() {
+            RAIL_ACTIVE
+        } else {
+            RAIL
         },
-        fill(RAIL),
     );
-    for index in 0..3 {
-        painter.circle_filled(
-            top.min + egui::vec2(12.0 + index as f32 * 11.0, 9.0),
-            2.5,
-            fill(LIME),
-        );
+    let ink = theme::on_fill(fill);
+    let focus = if response.has_focus() {
+        Stroke::new(2.0_f32, theme::color(ui.ctx(), VIOLET))
+    } else {
+        Stroke::NONE
+    };
+    let painter = ui.painter_at(bounds);
+    painter.rect(bounds, 8, fill, focus, egui::StrokeKind::Inside);
+    painter.text(
+        egui::pos2(bounds.left() + 31.0, bounds.center().y),
+        egui::Align2::LEFT_CENTER,
+        tab.title(),
+        theme::display_font(14.0),
+        ink,
+    );
+    let center = egui::pos2(bounds.left() + 15.0, bounds.center().y);
+    let stroke = Stroke::new(1.4_f32, ink);
+    let at = |x, y| center + egui::vec2(x, y);
+    match tab {
+        SettingsTab::Appearance => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(at(-6.0, -5.0), at(6.0, 3.0)),
+                1,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment([at(0.0, 3.0), at(0.0, 6.0)], stroke);
+            painter.line_segment([at(-4.0, 6.0), at(4.0, 6.0)], stroke);
+        }
+        SettingsTab::Storage => {
+            for y in [-4.0, 0.0, 4.0] {
+                painter.rect_stroke(
+                    egui::Rect::from_min_max(at(-6.0, y - 2.0), at(6.0, y + 2.0)),
+                    2,
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        SettingsTab::Advanced => {
+            for (x, y) in [(-3.0, -4.0), (3.0, 4.0)] {
+                painter.line_segment([at(-6.0, y), at(6.0, y)], stroke);
+                painter.circle_filled(at(x, y), 2.1, ink);
+            }
+        }
+        SettingsTab::Diagnostics => {
+            painter.add(egui::Shape::line(
+                vec![
+                    at(-7.0, 0.0),
+                    at(-4.0, 0.0),
+                    at(-1.0, -5.0),
+                    at(2.0, 5.0),
+                    at(4.0, 0.0),
+                    at(7.0, 0.0),
+                ],
+                stroke,
+            ));
+        }
     }
-    let body = egui::Rect::from_min_max(
-        rect.min + egui::vec2(10.0, 28.0),
-        rect.max - egui::vec2(10.0, 9.0),
-    );
-    let rail = egui::Rect::from_min_max(
-        body.min,
-        egui::pos2(body.min.x + (body.width() * 0.30), body.max.y),
-    );
-    painter.rect_filled(rail, 6, fill(SURFACE));
-    painter.rect_filled(
-        egui::Rect::from_min_size(
-            rail.min + egui::vec2(5.0, 6.0),
-            egui::vec2((rail.width() - 10.0).max(1.0), 11.0),
-        ),
-        4,
-        fill(LIME),
-    );
-    let pane = egui::Rect::from_min_max(egui::pos2(rail.max.x + 8.0, body.min.y), body.max);
-    painter.rect_filled(pane, 6, fill(SURFACE));
-    for (offset, fraction) in [(10.0, 0.70), (24.0, 0.50), (37.0, 0.60)] {
+    response
+}
+
+#[cfg(windows)]
+fn theme_preview(ui: &mut Ui) {
+    let width = ui.available_width().min(346.0);
+    if width < 140.0 {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(((ui.available_width() - width) * 0.5).max(0.0));
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 124.0), egui::Sense::hover());
+        let fill = |role| theme::color(ui.ctx(), role);
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            11,
+            fill(CREAM),
+            Stroke::new(1.0_f32, fill(LINE)),
+            egui::StrokeKind::Inside,
+        );
+        let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 24.0));
         painter.rect_filled(
-            egui::Rect::from_min_size(
-                pane.min + egui::vec2(8.0, offset),
-                egui::vec2(pane.width().max(1.0) * fraction, 5.0),
-            ),
-            2,
-            fill(LINE),
+            top,
+            egui::CornerRadius {
+                nw: 11,
+                ne: 11,
+                ..Default::default()
+            },
+            fill(RAIL),
         );
-    }
-    response.on_hover_text("Preview of the active theme");
+        for (x, y, role) in [
+            (9.0, 11.0, MARK_SHADE),
+            (14.0, 7.0, RAIL_ACTIVE),
+            (19.0, 3.0, LIME),
+        ] {
+            painter.rect_filled(
+                egui::Rect::from_min_size(top.min + egui::vec2(x, y), egui::vec2(8.0, 8.0)),
+                2,
+                fill(role),
+            );
+        }
+        for offset in [36.0, 50.0, 64.0] {
+            let x = top.max.x - offset;
+            painter.line_segment(
+                [
+                    egui::pos2(x, top.center().y),
+                    egui::pos2(x + 5.0, top.center().y),
+                ],
+                Stroke::new(1.0_f32, theme::on_fill(fill(RAIL))),
+            );
+        }
+        let rail = egui::Rect::from_min_max(
+            rect.min + egui::vec2(9.0, 31.0),
+            egui::pos2(rect.min.x + width * 0.33, rect.max.y - 8.0),
+        );
+        painter.rect_filled(rail, 7, fill(RAIL));
+        let rail_row = |offset, ratio| {
+            egui::Rect::from_min_size(
+                rail.min + egui::vec2(6.0, offset),
+                egui::vec2((rail.width() - 12.0) * ratio, 10.0),
+            )
+        };
+        painter.rect_filled(rail_row(6.0, 1.0), 3, fill(LIME));
+        for (offset, ratio) in [(25.0, 0.72), (43.0, 0.86), (61.0, 0.65)] {
+            painter.rect_filled(rail_row(offset, ratio), 3, fill(LINE));
+        }
+        let pane = egui::Rect::from_min_max(
+            egui::pos2(rail.max.x + 8.0, rail.min.y),
+            rect.max - egui::vec2(10.0, 8.0),
+        );
+        painter.rect_filled(pane, 7, fill(SURFACE));
+        for (offset, ratio) in [(11.0, 0.49), (26.0, 0.76), (67.0, 0.58)] {
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    pane.min + egui::vec2(9.0, offset),
+                    egui::vec2(pane.width() * ratio, 5.0),
+                ),
+                2,
+                fill(LINE),
+            );
+        }
+        let gutter = 8.0;
+        let card_width = (pane.width() - 18.0 - gutter) * 0.5;
+        for offset in [9.0, 9.0 + card_width + gutter] {
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    pane.min + egui::vec2(offset, 40.0),
+                    egui::vec2(card_width, 18.0),
+                ),
+                4,
+                fill(RAIL_ACTIVE),
+            );
+        }
+        response.on_hover_text("Preview of the active theme");
+    });
 }
 
 #[cfg(windows)]
@@ -2001,6 +2133,32 @@ impl Installer {
         }
     }
 
+    fn setup_titlebar(&self, ctx: &egui::Context) {
+        let rail = theme::color(ctx, RAIL);
+        let line = theme::color(ctx, LINE);
+        egui::TopBottomPanel::top("setup-titlebar")
+            .show_separator_line(false)
+            .frame(
+                Frame::new()
+                    .fill(rail)
+                    .inner_margin(egui::Margin::symmetric(14, 0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    bridge_mark(ui);
+                    ui.label(
+                        RichText::new("Render Bridge Setup")
+                            .size(17.0)
+                            .strong()
+                            .color(theme::on_fill(rail)),
+                    );
+                });
+                let y = ui.min_rect().bottom();
+                let x = ctx.content_rect().x_range();
+                ui.painter().hline(x, y, Stroke::new(1.0_f32, line));
+            });
+    }
+
     fn rail(&self, ctx: &egui::Context) {
         let width = if ctx.content_rect().width() < 850.0 {
             154.0
@@ -2014,17 +2172,11 @@ impl Installer {
             .frame(
                 Frame::new()
                     .fill(theme::color(ctx, RAIL))
-                    .inner_margin(egui::Margin::symmetric(12, 18)),
+                    .stroke(Stroke::new(1.0_f32, theme::color(ctx, LINE)))
+                    .inner_margin(egui::Margin::symmetric(11, 16)),
             )
             .show(ctx, |ui| {
-                bridge_mark(ui);
-                ui.label(
-                    RichText::new("Render Bridge")
-                        .size(17.0)
-                        .strong()
-                        .color(theme::on_fill(theme::color(ctx, RAIL))),
-                );
-                ui.add_space(12.0);
+                ui.spacing_mut().item_spacing.y = 5.0;
                 for (step, label) in STEPS {
                     let selected = step == self.step;
                     let fill = if selected {
@@ -2040,10 +2192,10 @@ impl Installer {
                     Frame::new()
                         .fill(fill)
                         .corner_radius(9)
-                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .inner_margin(egui::Margin::symmetric(12, 11))
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
-                            ui.label(RichText::new(label).size(14.0).strong().color(foreground));
+                            ui.label(RichText::new(label).size(15.0).strong().color(foreground));
                         });
                 }
             });
@@ -2053,151 +2205,146 @@ impl Installer {
         header(
             ui,
             "Get ready to render",
-            "Check the three things you need to run your first job.",
+            "Set up Python, a local ComfyUI build, and an agent.",
         );
-        ui.hyperlink_to("Privacy and network use", PRIVACY_GUIDE);
         let idle = self.worker.is_none();
         let ready = self.python_ready();
-        setup_card(ui, |ui| {
-            field_label(ui, "Python 3.11 or newer");
-            if self.python_check_failed {
-                caption(ui, "Python could not be checked. Try the check again.");
-            } else if !idle {
-                #[cfg(windows)]
-                let installing = self.python_installing;
-                #[cfg(not(windows))]
-                let installing = false;
-                activity(
-                    ui,
-                    if installing {
-                        "Waiting for Windows Python setup to finish…"
-                    } else {
-                        "Checking Python and virtual environment support…"
-                    },
-                );
-            } else if let Some(readiness) = &self.python {
-                match readiness {
-                    PythonReadiness::Ready {
-                        version,
-                        executable,
-                    } => {
-                        ui.label(
-                            RichText::new(format!("Python {version} is ready"))
-                                .strong()
-                                .color(theme::color(ui.ctx(), GREEN)),
-                        );
-                        ui.collapsing("Python executable", |ui| {
-                            code_label(ui, &executable.to_string_lossy())
-                        });
-                    }
-                    PythonReadiness::TooOld { version } => {
-                        ui.label(
-                            RichText::new(format!("Python {version} is too old"))
-                                .strong()
-                                .color(theme::color(ui.ctx(), CAUTION)),
-                        );
-                        caption(ui, "Install Python 3.11 or newer, then check again.");
-                    }
-                    PythonReadiness::MissingVenv { version } => {
-                        ui.label(
-                            RichText::new(format!(
-                                "Python {version} needs virtual environment support"
-                            ))
-                            .strong()
-                            .color(theme::color(ui.ctx(), CAUTION)),
-                        );
-                        caption(ui, python_venv_help());
-                    }
-                    PythonReadiness::Missing => {
-                        ui.label(
-                            RichText::new("Python was not found")
-                                .strong()
-                                .color(theme::color(ui.ctx(), CAUTION)),
-                        );
-                        caption(ui, "Install Python 3.11 or newer, then check again.");
-                    }
-                    PythonReadiness::InvalidSelection => {
-                        ui.label(
-                            RichText::new("This file could not be verified as Python")
-                                .strong()
-                                .color(theme::color(ui.ctx(), CAUTION)),
-                        );
-                        caption(
-                            ui,
-                            "Select the Python executable from an installation, or use automatic detection.",
-                        );
-                    }
-                }
-            }
-            if !ready {
-                caption(ui, "Python 3.13 is recommended for a new installation.");
-                #[cfg(windows)]
-                if setup::winget_available()
-                    && secondary(ui, "Install Python with WinGet", idle).clicked()
-                {
-                    self.python_install_offer = true;
-                }
-                let (label, url) = python_install_link();
-                ui.hyperlink_to(label, url);
-                #[cfg(target_os = "linux")]
-                if secondary(ui, "Copy Debian or Ubuntu command", true).clicked() {
-                    ui.ctx().copy_text(
-                        "sudo apt update && sudo apt install python3 python3-venv".into(),
-                    );
-                    self.copied =
-                        Some("Run the copied command in a terminal, then check Python again.");
-                }
-            }
+        let python_status = if self.python_check_failed {
+            "Python check failed".into()
+        } else if !idle {
             #[cfg(windows)]
-            if let Some(message) = &self.python_install_error {
-                caption(ui, message);
+            let installing = self.python_installing;
+            #[cfg(not(windows))]
+            let installing = false;
+            if installing {
+                "Waiting for Windows Python setup…".into()
+            } else {
+                "Checking Python…".into()
             }
-            ui.collapsing("Python options", |ui| {
+        } else {
+            match &self.python {
+                Some(PythonReadiness::Ready { version, .. }) => {
+                    format!("Detected · Python {version}")
+                }
+                Some(PythonReadiness::TooOld { version }) => format!("Python {version} is too old"),
+                Some(PythonReadiness::MissingVenv { version }) => {
+                    format!("Python {version} needs virtual environment support")
+                }
+                Some(PythonReadiness::Missing) => "Python was not found".into(),
+                Some(PythonReadiness::InvalidSelection) => {
+                    "Could not verify the selected executable".into()
+                }
+                None => "Requires Python 3.11 or newer".into(),
+            }
+        };
+        let needs_python = idle && !ready && (self.python.is_some() || self.python_check_failed);
+        wizard_readiness(
+            ui,
+            "Python",
+            &python_status,
+            if ready && idle {
+                GREEN
+            } else if needs_python {
+                CAUTION
+            } else {
+                MUTED
+            },
+            |ui| {
+                if needs_python {
+                    if matches!(self.python, Some(PythonReadiness::MissingVenv { .. })) {
+                        caption(ui, python_venv_help());
+                    } else {
+                        caption(ui, "Install Python 3.11 or newer, then check again.");
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        #[cfg(windows)]
+                        if setup::winget_available()
+                            && secondary(ui, "Install Python with WinGet", idle).clicked()
+                        {
+                            self.python_install_offer = true;
+                        }
+                        let (label, url) = python_install_link();
+                        ui.hyperlink_to(label, url);
+                        #[cfg(target_os = "linux")]
+                        if secondary(ui, "Copy Debian or Ubuntu command", true).clicked() {
+                            ui.ctx().copy_text(
+                                "sudo apt update && sudo apt install python3 python3-venv".into(),
+                            );
+                            self.copied = Some(
+                                "Run the copied command in a terminal, then check Python again.",
+                            );
+                        }
+                    });
+                }
+                #[cfg(windows)]
+                if let Some(message) = &self.python_install_error {
+                    caption(ui, message);
+                }
+                ui.collapsing("Python options", |ui| {
+                    if let Some(PythonReadiness::Ready { executable, .. }) = &self.python {
+                        code_label(ui, &executable.to_string_lossy());
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if secondary(ui, "Select Python executable", idle).clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .set_title("Select your Python executable")
+                                .pick_file()
+                        {
+                            self.selected_python = Some(path);
+                            self.check_python(ui.ctx());
+                        }
+                        if self.selected_python.is_some()
+                            && secondary(ui, "Use automatic detection", idle).clicked()
+                        {
+                            self.selected_python = None;
+                            self.check_python(ui.ctx());
+                        } else if ready && secondary(ui, "Check Python again", idle).clicked() {
+                            self.check_python(ui.ctx());
+                        }
+                    });
+                });
+                if let Some(message) = self.copied {
+                    caption(ui, message);
+                }
+            },
+        );
+
+        let paired = matches!(self.check, Some(CheckOutcome::Models(_, true, _)));
+        let comfy_status = if paired {
+            "Local build and folders verified"
+        } else if !self.instances.is_empty() {
+            "Local build detected"
+        } else {
+            "Choose a build on the next screen"
+        };
+        wizard_readiness(
+            ui,
+            "ComfyUI",
+            comfy_status,
+            if paired { GREEN } else { MUTED },
+            |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if secondary(ui, "Select Python executable", idle).clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .set_title("Select your Python executable")
-                            .pick_file()
-                    {
-                        self.selected_python = Some(path);
-                        self.check_python(ui.ctx());
-                    }
-                    if self.selected_python.is_some()
-                        && secondary(ui, "Use automatic detection", idle).clicked()
-                    {
-                        self.selected_python = None;
-                        self.check_python(ui.ctx());
-                    } else if ready && secondary(ui, "Check Python again", idle).clicked() {
-                        self.check_python(ui.ctx());
-                    }
-                })
-            });
-            if let Some(message) = self.copied {
-                caption(ui, message);
-            }
-        });
-        setup_card(ui, |ui| {
-            field_label(ui, "ComfyUI on this computer");
-            caption(
-                ui,
-                "Start Comfy Desktop or a portable or manual build. Setup checks its connection and folders on the next screen.",
-            );
-            ui.horizontal_wrapped(|ui| {
-                ui.hyperlink_to("Get Comfy Desktop", COMFY_DOWNLOAD);
-                ui.hyperlink_to("Manual ComfyUI setup", COMFY_GUIDE);
-            });
-        });
-        setup_card(ui, |ui| {
-            field_label(ui, "Agent client");
-            caption(
-                ui,
-                "Choose an agent that supports MCP. You can connect it after installing.",
-            );
+                    ui.hyperlink_to("Get Comfy Desktop", COMFY_DOWNLOAD);
+                    ui.hyperlink_to("Manual setup", COMFY_GUIDE);
+                });
+            },
+        );
+
+        let claude = connection::profile_path(Client::Claude).is_some_and(|path| path.is_file());
+        let codex = connection::profile_path(Client::Codex).is_some_and(|path| path.is_file());
+        let agent_status = match (claude, codex) {
+            (true, true) => "Claude Code and Codex settings found",
+            (true, false) => "Claude Code settings found",
+            (false, true) => "Codex settings found",
+            (false, false) => "Connect an MCP client after installation",
+        };
+        wizard_readiness(ui, "Agent", agent_status, MUTED, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.hyperlink_to("Set up Claude Code", CLAUDE_SETUP);
                 ui.hyperlink_to("Set up Codex", CODEX_SETUP);
             });
         });
+        ui.hyperlink_to("Privacy and network use", PRIVACY_GUIDE);
         self.setup_config_picker(ui, idle);
         ui.collapsing("Existing installations", |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -2243,8 +2390,8 @@ impl Installer {
         if self.python_install_offer {
             let prompt = panel_modal(ui.ctx(), "python-install-approval").show(ui.ctx(), |ui| {
                 ui.set_width((ui.ctx().content_rect().width() - 32.0).clamp(120.0, 360.0));
-                ui.heading("Install Python on this PC?");
-                caption(ui, "WinGet will request the latest available Python 3.13 patch for all users on this PC. Windows will ask for administrator approval.");
+                utility_ui::heading(ui, utility_ui::UtilityIcon::Python, "Install Python?", Some("Administrator approval required"));
+                caption(ui, "WinGet asks Windows to install the latest available Python 3.13 update for all users.");
                 let (label, url) = python_install_link();
                 ui.hyperlink_to(label, url);
                 ui.horizontal_wrapped(|ui| {
@@ -2271,15 +2418,6 @@ impl Installer {
         );
         let idle = self.worker.is_none();
         let mut changed = false;
-        self.setup_config_picker(ui, idle);
-        ui.horizontal_wrapped(|ui| {
-            if secondary(ui, "Detect running ComfyUI", idle).clicked() {
-                self.start_discovery(ui.ctx());
-            }
-            if secondary(ui, "Check jobs", idle).clicked() {
-                self.show_jobs(QueueAction::Inspect);
-            }
-        });
         if !self.instances.is_empty() {
             let mut chosen = None;
             for (index, instance) in self.instances.iter().enumerate() {
@@ -2289,23 +2427,30 @@ impl Installer {
                 let stroke = if selected { VIOLET } else { LINE };
                 Frame::new()
                     .fill(theme::color(ui.ctx(), SURFACE))
-                    .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), stroke)))
-                    .corner_radius(12)
-                    .inner_margin(egui::Margin::symmetric(12, 9))
+                    .stroke(Stroke::new(
+                        if selected { 2.0_f32 } else { 1.0_f32 },
+                        theme::color(ui.ctx(), stroke),
+                    ))
+                    .corner_radius(13)
+                    .inner_margin(egui::Margin::symmetric(14, 13))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        if ui
-                            .add_enabled(
-                                idle,
-                                egui::RadioButton::new(
-                                    selected,
-                                    RichText::new(&instance.url).strong(),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            chosen = Some(index);
-                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(
+                                    idle,
+                                    egui::RadioButton::new(
+                                        selected,
+                                        theme::strong("ComfyUI", 18.0),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                chosen = Some(index);
+                            }
+                            code_label(ui, &instance.url);
+                            wizard_tag(ui, "Detected", GREEN);
+                        });
                         if let Some(root) = &instance.root {
                             code_label(ui, &root.to_string_lossy());
                         } else {
@@ -2323,6 +2468,15 @@ impl Installer {
                 "No running instance reported its folders. Start ComfyUI or enter the build's address and folders.",
             );
         }
+        ui.horizontal_wrapped(|ui| {
+            if secondary(ui, "Detect running ComfyUI", idle).clicked() {
+                self.start_discovery(ui.ctx());
+            }
+            if secondary(ui, "Check jobs", idle).clicked() {
+                self.show_jobs(QueueAction::Inspect);
+            }
+        });
+        self.setup_config_picker(ui, idle);
         egui::CollapsingHeader::new("ComfyUI address and folders")
             .default_open(self.instances.is_empty())
             .show(ui, |ui| {
@@ -2440,7 +2594,7 @@ impl Installer {
     }
 
     fn installed_connect(&mut self, ui: &mut Ui) {
-        ui.heading(RichText::new("Connect an agent").size(25.0).strong());
+        theme::heading(ui, "Connect an agent", 27.0);
         let Some(installed) = self.installed.clone() else {
             status(
                 ui,
@@ -2492,7 +2646,7 @@ impl Installer {
 
     fn installed_client_fields(&mut self, ui: &mut Ui, installed: &Installed, idle: bool) {
         card(ui, |ui| {
-            field_label(ui, "MCP client");
+            theme::heading(ui, "MCP client", 18.0);
             ui.horizontal_wrapped(|ui| {
                 for client in [
                     ConnectClient::Codex,
@@ -2541,22 +2695,27 @@ impl Installer {
                 ui.hyperlink_to("Manual setup", self.connect_client.guide());
             });
             ui.separator();
-            if connect_copy_row(ui, "MCP endpoint", "Copy address", &installed.mcp_url) {
+            if connect_copy_row(ui, "Local MCP endpoint", "Copy address", &installed.mcp_url) {
                 self.copied = Some("MCP endpoint copied.");
             }
-            if connect_copy_row(
-                ui,
-                "Private token file",
-                "Copy path",
-                &installed.token_path.to_string_lossy(),
-            ) {
-                self.copied = Some("Private token file path copied.");
-            }
+            ui.collapsing("Connection details", |ui| {
+                if connect_copy_row(
+                    ui,
+                    "Private token file",
+                    "Copy path",
+                    &installed.token_path.to_string_lossy(),
+                ) {
+                    self.copied = Some("Private token file path copied.");
+                }
+            });
             if let Some(message) = self.copied {
                 caption(ui, message);
             }
             ui.separator();
-            if monitor_button(ui, "Start & Verify", idle, SURFACE).clicked() {
+            if monitor_button(ui, "Start & Verify", idle, SURFACE)
+                .on_hover_text("Verify the running server and the selected client settings")
+                .clicked()
+            {
                 self.start_or_verify_panel(ui.ctx(), true, true);
             }
             if !idle && self.worker.is_some() {
@@ -2591,9 +2750,22 @@ impl Installer {
     fn installed_receipt_fields(&mut self, ui: &mut Ui, installed: &Installed, can_rotate: bool) {
         let server_verified = self.server_ready_for_render();
         self.first_render.show(ui, installed, server_verified);
-        ui.collapsing("Token security", |ui| {
+        ui.add_space(3.0);
+        card(ui, |ui| {
+            theme::heading(ui, "Private token", 18.0);
+            caption(
+                ui,
+                if installed.token_path.is_file() {
+                    "Stored in a local credential file."
+                } else {
+                    "Created when Render Bridge starts."
+                },
+            );
             if self.confirm_rotation {
-                caption(ui, "Stop every server that uses this token file. Rotation revokes current credentials and signed links. Reconnect your agents after restarting Render Bridge.");
+                caption(
+                    ui,
+                    "Stop every server that uses this token file. Rotation revokes current credentials and signed links. Reconnect your agents after restarting Render Bridge.",
+                );
                 ui.horizontal_wrapped(|ui| {
                     if monitor_button(ui, "Cancel", true, SURFACE).clicked() {
                         self.confirm_rotation = false;
@@ -2756,9 +2928,9 @@ impl Installer {
         card(ui, |ui| {
             ui.add_enabled_ui(self.worker.is_none(), |ui| {
                 let default = setup::data_dir().ok();
-                if asset_ui::folder_option(
+                if asset_ui::compact_folder_option(
                     ui,
-                    "Render Bridge installation folder",
+                    "Install folder",
                     &mut self.installation_dir,
                     &default.as_ref().map_or_else(
                         || "Default user folder".into(),
@@ -2769,7 +2941,6 @@ impl Installer {
                     self.install_assets.load(&data);
                     self.use_setup_destination(&data);
                 }
-                caption(ui, "Choose a private folder for the app and its settings.");
                 ui.separator();
                 self.install_assets.fields(ui);
                 if let Some(error) = &self.install_assets.message {
@@ -2790,7 +2961,7 @@ impl Installer {
         });
         caption(
             ui,
-            "Setup will download Python packages for Render Bridge's private environment.",
+            "Setup downloads Python packages into Render Bridge's private environment.",
         );
         if self.worker.is_some() {
             ui.add_space(9.0);
@@ -2847,19 +3018,26 @@ impl Installer {
         let Some(installed) = self.installed.clone() else {
             return;
         };
+        if server_verified {
+            self.first_render.show(ui, &installed, true);
+        }
         let mut copied = None;
         let idle = self.worker.is_none();
         let mut selection_changed = false;
         card(ui, |ui| {
-            field_label(ui, "Agent settings to verify");
-            ui.add_enabled_ui(idle, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    selection_changed |= ui
-                        .checkbox(&mut self.verify_claude, "Claude Code")
-                        .changed();
-                    selection_changed |= ui.checkbox(&mut self.verify_codex, "Codex").changed();
-                });
+            field_label(ui, "Clients to verify");
+            ui.horizontal_wrapped(|ui| {
+                for (label, selected) in [
+                    ("Codex", &mut self.verify_codex),
+                    ("Claude Code", &mut self.verify_claude),
+                ] {
+                    if wizard_client_choice(ui, label, *selected, idle).clicked() {
+                        *selected = !*selected;
+                        selection_changed = true;
+                    }
+                }
             });
+            copied = copy_agent_prompt(ui, &installed, idle).or(copied);
             if self.verify_claude || self.verify_codex {
                 ui.collapsing("Client paths and profiles", |ui| {
                     for (client, selected) in [
@@ -2882,11 +3060,6 @@ impl Installer {
                     }
                 });
             }
-            caption(
-                ui,
-                "Setup checks these saved user settings and leaves them intact.",
-            );
-            copied = copy_agent_prompt(ui, &installed, idle).or(copied);
             ui.collapsing("Endpoint and private token file", |ui| {
                 if copy_row(ui, "MCP endpoint", "Copy address", &installed.mcp_url) {
                     copied = Some("MCP endpoint copied");
@@ -2909,7 +3082,9 @@ impl Installer {
             ui.hyperlink_to("Connect an MCP client", CLIENT_GUIDE);
             ui.hyperlink_to("Connect from another device", REMOTE_GUIDE);
         });
-        self.first_render.show(ui, &installed, server_verified);
+        if !server_verified {
+            self.first_render.show(ui, &installed, false);
+        }
         if self.worker.is_some() {
             activity(ui, &self.progress);
         } else if let Some(verification) = &self.verification {
@@ -3145,6 +3320,134 @@ impl Installer {
         self.workspace_tab = tab;
     }
 
+    fn panel_is_tray(&self) -> bool {
+        #[cfg(windows)]
+        return self.tray_panel.is_some();
+        #[cfg(not(windows))]
+        false
+    }
+
+    fn hide_or_close_controls(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        if let Some(tray) = &mut self.tray_panel {
+            tray.hide(ctx);
+            return;
+        }
+        if self.model_manager.downloading() {
+            self.select_workspace(ctx, WorkspaceTab::Models);
+            self.model_manager.cancel();
+            return;
+        }
+        if self.running.as_mut().is_some_and(RunningBridge::is_running) {
+            self.show_jobs(QueueAction::CloseWindow);
+            return;
+        }
+        if self.worker.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    #[cfg(windows)]
+    fn monitor_update_action(&mut self, ui: &mut Ui) {
+        if self.installed.is_some()
+            && self
+                .controls
+                .as_ref()
+                .is_some_and(|controls| controls.update_available_here)
+            && job_action_button(ui, "Update", true, SURFACE, JobActionGlyph::Update).clicked()
+        {
+            self.update.check(ui.ctx());
+        }
+    }
+
+    fn jobs_footer(&mut self, ui: &mut Ui) {
+        let idle = self.worker.is_none() && !self.update_in_progress();
+        #[cfg(windows)]
+        {
+            let owned = self.running.as_mut().is_some_and(RunningBridge::is_running);
+            let online = owned
+                || self
+                    .controls
+                    .as_ref()
+                    .is_some_and(|controls| controls.bridge_online);
+            let compact = ui.available_width() < 620.0;
+            if ui.available_width() >= 445.0 {
+                ui.horizontal(|ui| {
+                    self.job_server_actions(ui, online, owned, idle, compact);
+                    ui.separator();
+                    self.job_gaming_action(ui, idle);
+                });
+                return;
+            }
+            ui.horizontal_wrapped(|ui| self.job_server_actions(ui, online, owned, idle, compact));
+        }
+        ui.horizontal_wrapped(|ui| self.job_gaming_action(ui, idle));
+    }
+
+    #[cfg(windows)]
+    fn job_server_actions(
+        &mut self,
+        ui: &mut Ui,
+        online: bool,
+        owned: bool,
+        idle: bool,
+        compact: bool,
+    ) {
+        server_state(ui, online, owned, compact);
+        ui.add_space(3.0);
+        let start_fill = if online { LINE } else { SURFACE };
+        if job_action_button(
+            ui,
+            if compact { "Start" } else { "Start server" },
+            idle,
+            start_fill,
+            JobActionGlyph::Start,
+        )
+        .on_hover_text(if online {
+            "Confirm the server is running"
+        } else {
+            "Start Render Bridge"
+        })
+        .clicked()
+        {
+            self.request_server_action(ui.ctx(), ServerAction::Start);
+        }
+        let stop_fill = if owned { ERROR } else { LINE };
+        if job_action_button(
+            ui,
+            if compact { "Stop" } else { "Stop server" },
+            idle && owned,
+            stop_fill,
+            JobActionGlyph::Stop,
+        )
+        .on_disabled_hover_text(if online {
+            "This panel can stop the server it starts."
+        } else {
+            "Start the server to enable Stop."
+        })
+        .clicked()
+        {
+            self.request_server_action(ui.ctx(), ServerAction::Stop);
+        }
+    }
+
+    fn job_gaming_action(&mut self, ui: &mut Ui, idle: bool) {
+        if let Some(installed) = &self.installed {
+            match gaming_mode(installed) {
+                Some(on) => {
+                    if gaming_mode_button(ui, on, idle).clicked() {
+                        self.change_gaming_mode(ui.ctx(), !on);
+                    }
+                }
+                None => {
+                    monitor_button(ui, "Gaming Mode unavailable", false, LINE)
+                        .on_disabled_hover_text("Run the status command in a terminal.");
+                }
+            }
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+
     fn controls_screen(&mut self, ctx: &egui::Context) {
         if self.controls.as_ref().is_some_and(|controls| {
             controls.data_dir.is_some() && Instant::now() >= controls.next_load
@@ -3152,23 +3455,43 @@ impl Installer {
             self.load_controls(ctx);
         }
         egui::TopBottomPanel::top("controls-banner")
-            .show_separator_line(false)
+            .show_separator_line(true)
             .frame(
                 Frame::new()
                     .fill(theme::color(ctx, RAIL))
-                    .inner_margin(egui::Margin::symmetric(16, 5)),
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
             )
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    monitor_mark(ui);
+                    ui.label(
+                        theme::strong("Render Bridge", 19.0)
+                            .color(theme::on_fill(theme::color(ctx, RAIL))),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (close_label, hint) = if self.panel_is_tray() {
+                            ("Hide", "Hide Render Bridge to the tray")
+                        } else {
+                            ("Close", "Close Render Bridge")
+                        };
+                        if monitor_button(ui, close_label, true, RAIL)
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            self.hide_or_close_controls(ctx);
+                        }
+                        #[cfg(windows)]
+                        if let Some(setting) = &mut self.startup_setting
+                            && monitor_button(ui, "Settings", true, RAIL).clicked()
+                        {
+                            setting.open(ctx, self.installed.as_ref());
+                        }
+                        #[cfg(windows)]
+                        self.monitor_update_action(ui);
+                    });
+                });
+                ui.add_space(3.0);
                 ui.horizontal_wrapped(|ui| {
-                    if ui.available_width() >= 560.0 {
-                        bridge_mark(ui);
-                        ui.label(
-                            RichText::new("Render Bridge")
-                                .size(20.0)
-                                .strong()
-                                .color(theme::on_fill(theme::color(ctx, RAIL))),
-                        );
-                    }
                     let has_installation = self
                         .controls
                         .as_ref()
@@ -3181,68 +3504,21 @@ impl Installer {
                     }
                 });
             });
-        egui::TopBottomPanel::bottom("controls-actions")
-            .show_separator_line(false)
-            .frame(
-                Frame::new()
-                    .fill(theme::color(ctx, CREAM))
-                    .inner_margin(egui::Margin::symmetric(16, 8)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    #[cfg(windows)]
-                    if let Some(setting) = &mut self.startup_setting
-                        && monitor_button(ui, "Settings", true, SURFACE).clicked()
-                    {
-                        setting.open(ctx, self.installed.as_ref());
-                    }
-                    #[cfg(windows)]
-                    if self.installed.is_some()
-                        && self
-                            .controls
-                            .as_ref()
-                            .is_some_and(|controls| controls.update_available_here)
-                        && monitor_button(ui, "Update", true, SURFACE).clicked()
-                    {
-                        self.update.check(ctx);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        #[cfg(windows)]
-                        let close_label = if self.tray_panel.is_some() {
-                            "Hide to tray"
-                        } else {
-                            "Close"
-                        };
-                        #[cfg(not(windows))]
-                        let close_label = "Close";
-                        if monitor_button(ui, close_label, true, LIME).clicked() {
-                            #[cfg(windows)]
-                            if let Some(tray) = &mut self.tray_panel {
-                                tray.hide(ctx);
-                                return;
-                            }
-                            if self.model_manager.downloading() {
-                                self.select_workspace(ctx, WorkspaceTab::Models);
-                                self.model_manager.cancel();
-                                return;
-                            }
-                            if self.running.as_mut().is_some_and(RunningBridge::is_running) {
-                                self.show_jobs(QueueAction::CloseWindow);
-                                return;
-                            }
-                            if self.worker.is_some() {
-                                return;
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                });
-            });
+        if self.workspace_tab == WorkspaceTab::Jobs && self.installed.is_some() {
+            egui::TopBottomPanel::bottom("controls-actions")
+                .show_separator_line(true)
+                .frame(
+                    Frame::new()
+                        .fill(theme::color(ctx, SURFACE))
+                        .inner_margin(egui::Margin::symmetric(14, 6)),
+                )
+                .show(ctx, |ui| self.jobs_footer(ui));
+        }
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(theme::color(ctx, CREAM)).inner_margin(egui::Margin::symmetric(16, 6)))
+            .frame(Frame::new().fill(theme::color(ctx, CREAM)).inner_margin(egui::Margin::symmetric(14, 9)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().id_salt(self.workspace_tab).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 7.0;
+                    ui.spacing_mut().item_spacing.y = if self.workspace_tab == WorkspaceTab::Jobs { 5.0 } else { 7.0 };
                     if self.workspace_tab == WorkspaceTab::Connect {
                         self.installed_connect(ui);
                         return;
@@ -3269,43 +3545,15 @@ impl Installer {
                         }
                         return;
                     }
-                    #[cfg(windows)]
-                    if self.installed.is_some() {
-                        let idle = self.worker.is_none() && !self.update.blocks_controls();
-                        let owned = self.running.as_mut().is_some_and(RunningBridge::is_running);
-                        let online = owned || self.controls.as_ref().is_some_and(|controls| controls.bridge_online);
-                        ui.horizontal_wrapped(|ui| {
-                            server_state(ui, online, owned);
-                            let start_fill = if online { LINE } else { SURFACE };
-                            if monitor_button(ui, "Start server", idle, start_fill)
-                                .on_hover_text(if online { "Confirm the server is running" } else { "Start Render Bridge" })
-                                .clicked()
-                            {
-                                self.request_server_action(ctx, ServerAction::Start);
-                            }
-                            let stop_fill = if owned { ERROR } else { LINE };
-                            if monitor_button(ui, "Stop server", idle && owned, stop_fill)
-                                .on_disabled_hover_text(if online { "This panel can stop the server it starts." } else { "Start the server to enable Stop." })
-                                .clicked()
-                            {
-                                self.request_server_action(ctx, ServerAction::Stop);
-                            }
-                        });
-                    }
                     if let Some(queue) = self.controls.as_mut().and_then(|controls| controls.queue.as_mut()) {
                         queue.show_card(ui);
                     } else {
                         status(ui, "Queue status unavailable",
                             "The saved ComfyUI connection could not be read. Open Render Bridge Setup to review the installation.", CAUTION);
                     }
-                    ui.horizontal_wrapped(|ui| {
-                        if let Some(queue) = self.controls.as_mut().and_then(|controls| controls.queue.as_mut()) {
-                            queue.show_refresh(ui);
-                        }
-                        if let Some(installed) = self.installed.clone() {
-                            self.show_gaming_mode(ui, &installed);
-                        }
-                    });
+                    if let Some(error) = &self.gaming_error {
+                        connection_result(ui, "Gaming Mode", error, false);
+                    }
                     if self.worker.is_some() {
                         activity(ui, &self.progress);
                     }
@@ -3314,9 +3562,9 @@ impl Installer {
                         match verification {
                             Ok(result) => {
                                 let (message, passed) = bridge_status(result["bridge"].as_str().unwrap_or_default());
-                                status(ui, "Render Bridge", message, if passed { GREEN } else { CAUTION });
+                                connection_result(ui, "Render Bridge", message, passed);
                             }
-                            Err(message) => status(ui, "Render Bridge server", message, CAUTION),
+                            Err(message) => connection_result(ui, "Render Bridge server", message, false),
                         }
                     }
                     #[cfg(windows)]
@@ -3592,13 +3840,14 @@ impl eframe::App for Installer {
                 self.show_jobs(QueueAction::CloseWindow);
             }
         }
+        self.setup_titlebar(ctx);
         self.rail(ctx);
         self.actions(ctx);
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
                     .fill(theme::color(ctx, CREAM))
-                    .inner_margin(egui::Margin::symmetric(24, 19)),
+                    .inner_margin(egui::Margin::symmetric(32, 22)),
             )
             .show(ctx, |ui| {
                 let step = self.step;
@@ -3764,7 +4013,7 @@ fn client_status(code: &str) -> (&'static str, bool) {
 }
 
 fn header(ui: &mut Ui, title: &str, description: &str) {
-    ui.add(egui::Label::new(RichText::new(title).size(31.0).strong()).wrap());
+    theme::heading(ui, title, 32.0);
     ui.add(
         egui::Label::new(
             RichText::new(description)
@@ -3779,9 +4028,13 @@ fn header(ui: &mut Ui, title: &str, description: &str) {
 fn bridge_mark(ui: &mut Ui) {
     let (bounds, _) = ui.allocate_exact_size(egui::vec2(47.0, 44.0), egui::Sense::hover());
     for (x, y, color) in [
-        (2.0, 23.0, theme::color(ui.ctx(), MARK_SHADE)),
-        (13.0, 13.0, theme::color(ui.ctx(), RAIL_ACTIVE)),
-        (24.0, 3.0, theme::color(ui.ctx(), LIME)),
+        (
+            24.0,
+            3.0,
+            theme::color(ui.ctx(), MARK_SHADE).gamma_multiply(0.67),
+        ),
+        (13.0, 13.0, theme::color(ui.ctx(), MARK_SHADE)),
+        (2.0, 23.0, theme::color(ui.ctx(), GREEN)),
     ] {
         ui.painter().rect_filled(
             egui::Rect::from_min_size(bounds.min + egui::vec2(x, y), egui::vec2(19.0, 19.0)),
@@ -3789,6 +4042,78 @@ fn bridge_mark(ui: &mut Ui) {
             color,
         );
     }
+}
+
+fn wizard_client_choice(ui: &mut Ui, title: &str, selected: bool, enabled: bool) -> egui::Response {
+    let fill = theme::color(ui.ctx(), if selected { RAIL_ACTIVE } else { SURFACE });
+    let border = theme::color(ui.ctx(), if selected { VIOLET } else { LINE });
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(theme::strong(title, 17.0).color(theme::on_fill(fill)))
+            .selected(selected)
+            .fill(fill)
+            .stroke(Stroke::new(1.5_f32, border))
+            .corner_radius(9)
+            .min_size(egui::vec2(154.0, 42.0)),
+    )
+}
+
+fn wizard_tag(ui: &mut Ui, text: &str, tone: Color32) {
+    let fill = theme::color(ui.ctx(), tone);
+    Frame::new()
+        .fill(fill)
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .size(12.0)
+                    .strong()
+                    .color(theme::on_fill(fill)),
+            )
+        });
+}
+
+fn wizard_readiness(
+    ui: &mut Ui,
+    title: &str,
+    label: &str,
+    tone: Color32,
+    controls: impl FnOnce(&mut Ui),
+) {
+    setup_card(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.horizontal_top(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
+            let center = rect.center();
+            let color = theme::color(ui.ctx(), tone);
+            let painter = ui.painter();
+            if tone == GREEN {
+                painter.circle_filled(center, 15.0, color);
+                let stroke = Stroke::new(2.4_f32, theme::on_fill(color));
+                painter.add(egui::Shape::line(
+                    vec![
+                        center + egui::vec2(-7.0, 0.0),
+                        center + egui::vec2(-2.0, 5.0),
+                        center + egui::vec2(8.0, -6.0),
+                    ],
+                    stroke,
+                ));
+            } else {
+                painter.circle_stroke(center, 12.0, Stroke::new(1.5_f32, color));
+                painter.hline(
+                    egui::Rangef::new(center.x - 4.5, center.x + 4.5),
+                    center.y,
+                    Stroke::new(1.5_f32, color),
+                );
+            }
+            ui.vertical(|ui| {
+                ui.label(theme::strong(title, 20.0));
+                ui.add(egui::Label::new(RichText::new(label).size(14.0).color(color)).wrap());
+                controls(ui);
+            });
+        });
+    });
 }
 
 fn setup_card(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
@@ -3826,7 +4151,7 @@ fn panel_modal(ctx: &egui::Context, id: &'static str) -> egui::Modal {
 }
 
 fn field_label(ui: &mut Ui, label: &str) -> egui::Id {
-    ui.label(RichText::new(label).size(15.0).strong()).id
+    theme::heading(ui, label, 15.0).id
 }
 
 fn code_label(ui: &mut Ui, value: &str) {
@@ -3862,12 +4187,7 @@ fn caption(ui: &mut Ui, message: &str) {
 fn status(ui: &mut Ui, title: &str, detail: &str, color: Color32) {
     ui.add_space(5.0);
     card(ui, |ui| {
-        ui.label(
-            RichText::new(title)
-                .size(15.0)
-                .strong()
-                .color(theme::color(ui.ctx(), color)),
-        );
+        ui.label(theme::strong(title, 15.0).color(theme::color(ui.ctx(), color)));
         caption(ui, detail);
     });
 }
@@ -3891,22 +4211,17 @@ fn primary(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
     let fill = theme::color(ui.ctx(), LIME);
     ui.add_enabled(
         enabled,
-        egui::Button::new(
-            RichText::new(title)
-                .size(15.0)
-                .strong()
-                .color(theme::on_fill(fill)),
-        )
-        .fill(fill)
-        .min_size(egui::vec2(143.0, 44.0))
-        .corner_radius(12),
+        egui::Button::new(theme::strong(title, 15.0).color(theme::on_fill(fill)))
+            .fill(fill)
+            .min_size(egui::vec2(143.0, 44.0))
+            .corner_radius(12),
     )
 }
 
 fn secondary(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(title).size(14.0).strong())
+        egui::Button::new(theme::strong(title, 14.0))
             .min_size(egui::vec2(78.0, 44.0))
             .corner_radius(12),
     )
@@ -3916,15 +4231,10 @@ fn destructive(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
     let fill = destructive_fill(ui.ctx());
     ui.add_enabled(
         enabled,
-        egui::Button::new(
-            RichText::new(title)
-                .size(15.0)
-                .strong()
-                .color(theme::on_fill(fill)),
-        )
-        .fill(fill)
-        .min_size(egui::vec2(143.0, 44.0))
-        .corner_radius(12),
+        egui::Button::new(theme::strong(title, 15.0).color(theme::on_fill(fill)))
+            .fill(fill)
+            .min_size(egui::vec2(143.0, 44.0))
+            .corner_radius(12),
     )
 }
 
@@ -3976,17 +4286,34 @@ fn connect_option(
 }
 
 fn connect_copy_row(ui: &mut Ui, label: &str, action: &str, value: &str) -> bool {
-    let clicked = ui
-        .horizontal_wrapped(|ui| {
-            field_label(ui, label);
-            monitor_button(ui, action, true, SURFACE).clicked()
+    field_label(ui, label);
+    let display = Frame::new()
+        .fill(theme::color(ui.ctx(), CREAM))
+        .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
+        .inner_margin(egui::Margin::symmetric(9, 5))
+        .corner_radius(8)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - 108.0).max(40.0);
+                let text = egui::Label::new(RichText::new(value).monospace().size(13.0)).truncate();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 32.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| ui.add(text).on_hover_text(value),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    monitor_button(ui, action, true, SURFACE).clicked()
+                })
+                .inner
+            })
+            .inner
         })
         .inner;
-    code_label(ui, value);
-    if clicked {
+    if display {
         ui.ctx().copy_text(value.to_owned());
     }
-    clicked
+    display
 }
 
 fn connection_result(ui: &mut Ui, label: &str, message: &str, passed: bool) {
@@ -3998,21 +4325,124 @@ fn connection_result(ui: &mut Ui, label: &str, message: &str, passed: bool) {
 }
 
 #[cfg(windows)]
-fn server_state(ui: &mut Ui, online: bool, owned: bool) {
-    let (label, color) = match (online, owned) {
-        (true, true) => ("Server online", GREEN),
-        (true, false) => ("Server started elsewhere", GREEN),
-        _ => ("Server offline", MUTED),
+#[derive(Clone, Copy)]
+enum JobActionGlyph {
+    Start,
+    Stop,
+    Update,
+}
+
+#[cfg(windows)]
+fn job_action_button(
+    ui: &mut Ui,
+    title: &str,
+    enabled: bool,
+    fill: Color32,
+    glyph: JobActionGlyph,
+) -> egui::Response {
+    let ctx = ui.ctx();
+    let muted = fill == LINE;
+    let fill = match fill {
+        ERROR => destructive_fill(ctx),
+        LINE if ctx.theme() == egui::Theme::Dark => theme::color(ctx, RAIL),
+        _ => theme::color(ctx, fill),
     };
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+    let ink = theme::on_fill(fill);
+    let ink = if muted { ink.gamma_multiply(0.78) } else { ink };
+    let mut label = egui::text::LayoutJob::default();
+    label.append(
+        title,
+        17.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(13.0),
+            color: ink,
+            ..Default::default()
+        },
+    );
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new(label)
+            .fill(fill)
+            .min_size(egui::vec2(0.0, 32.0))
+            .corner_radius(9),
+    );
+    let center = response.rect.left_center() + egui::vec2(13.0, 0.0);
+    let point = |x, y| center + egui::vec2(x, y);
+    let stroke = Stroke::new(
+        1.3_f32,
+        if enabled {
+            ink
+        } else {
+            ink.gamma_multiply(0.5)
+        },
+    );
+    let path = match glyph {
+        JobActionGlyph::Start => vec![
+            point(-3.5, -5.0),
+            point(5.0, 0.0),
+            point(-3.5, 5.0),
+            point(-3.5, -5.0),
+        ],
+        JobActionGlyph::Stop => vec![
+            point(-4.0, -4.0),
+            point(4.0, -4.0),
+            point(4.0, 4.0),
+            point(-4.0, 4.0),
+            point(-4.0, -4.0),
+        ],
+        JobActionGlyph::Update => {
+            ui.painter().add(egui::Shape::line(
+                vec![point(0.5, -5.5), point(4.5, -4.5), point(4.5, -0.5)],
+                stroke,
+            ));
+            vec![
+                point(2.5, -4.5),
+                point(-2.5, -4.5),
+                point(-4.8, -1.0),
+                point(-3.8, 2.8),
+                point(-0.5, 5.0),
+                point(2.8, 4.2),
+                point(4.8, 1.5),
+            ]
+        }
+    };
+    ui.painter().add(egui::Shape::line(path, stroke));
+    response
+}
+
+fn monitor_mark(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 27.0), egui::Sense::hover());
+    for (x, y, tone) in [
+        (1.0, 13.0, MARK_SHADE),
+        (9.0, 7.0, RAIL_ACTIVE),
+        (17.0, 1.0, LIME),
+    ] {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min + egui::vec2(x, y), egui::Vec2::splat(14.0)),
+            4,
+            theme::color(ui.ctx(), tone),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn server_state(ui: &mut Ui, online: bool, owned: bool, compact: bool) {
+    let color = if online { GREEN } else { MUTED };
+    let label = match (online, compact) {
+        (true, true) => "Online",
+        (false, true) => "Offline",
+        (true, false) => "Server online",
+        (false, false) => "Server offline",
+    };
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
     ui.painter()
         .circle_filled(rect.center(), 4.0, theme::color(ui.ctx(), color));
-    ui.label(
-        RichText::new(label)
-            .size(13.0)
-            .strong()
-            .color(theme::color(ui.ctx(), color)),
-    );
+    ui.label(theme::strong(label, 13.0))
+        .on_hover_text(match (online, owned) {
+            (true, false) => "Render Bridge is running outside this panel.",
+            (true, true) => "Render Bridge is running.",
+            _ => "Render Bridge is offline.",
+        });
 }
 
 fn gaming_mode_button(ui: &mut Ui, on: bool, enabled: bool) -> egui::Response {
