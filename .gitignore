@@ -4,3 +4,12 @@ __pycache__/
 .env
 .env.*
 /installer/target/
+
+# Local agent configuration. The root AGENTS.md is the public usage guide.
+[Aa][Gg][Ee][Nn][Tt].[Mm][Dd]
+[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
+!/AGENTS.md
+[Cc][Ll][Aa][Uu][Dd][Ee].[Mm][Dd]
+.agents/
+.claude/
+.codex/

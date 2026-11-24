@@ -17,10 +17,12 @@ const SERVER: &str = "comfy_mcp_server.py";
 const LAUNCHER: &str = "setup_render_bridge.py";
 const REQUIREMENTS: &str = "requirements.txt";
 const ACTIVE_RUNTIME: &str = "active-runtime";
+const MCP_PORT_FILE: &str = "mcp-port";
+const DEFAULT_MCP_PORT: u16 = 8189;
 const RUNTIME_PREFIX: &str = "app-";
 const INSTALL_CANCELLED: &str = "Setup cancelled. You can retry when ready.";
 const REQUIREMENTS_TEXT: &str = include_str!("../../requirements.txt");
-const RUNTIME_FILES: [(&str, &str); 5] = [
+pub(crate) const RUNTIME_FILES: [(&str, &str); 5] = [
     (SERVER, include_str!("../../comfy_mcp_server.py")),
     (LAUNCHER, include_str!("../../setup_render_bridge.py")),
     (
@@ -172,20 +174,23 @@ fn active_runtime(directory: &Path) -> io::Result<PathBuf> {
         Err(error) => return Err(error),
     };
     let name = pointer.trim();
-    let valid_name = name.strip_prefix(RUNTIME_PREFIX).is_some_and(|suffix| {
-        !suffix.is_empty()
-            && suffix.len() <= 32
-            && suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    });
-    if !valid_name {
+    if !is_runtime_name(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid runtime name",
         ));
     }
     Ok(directory.join(name))
+}
+
+pub(crate) fn is_runtime_name(name: &str) -> bool {
+    name.strip_prefix(RUNTIME_PREFIX).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.len() <= 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
 }
 
 fn settings_directory<'a>(data: &'a Path, runtime: &'a Path) -> &'a Path {
@@ -785,19 +790,53 @@ fn start_command(
     }
 }
 
-fn mcp_port() -> Result<u16, String> {
+fn mcp_port(data_dir: &Path) -> Result<u16, String> {
     let raw_port = env::var("MCP_PORT").ok();
-    raw_port
-        .as_deref()
-        .unwrap_or("8189")
-        .trim()
-        .parse::<u16>()
-        .ok()
-        .filter(|port| *port != 0)
-        .ok_or_else(|| "MCP_PORT must be a valid port.".into())
+    mcp_port_with_env(data_dir, raw_port.as_deref())
 }
 
-fn installation(data_dir: &Path, app_dir: PathBuf) -> Result<Installed, String> {
+fn mcp_port_with_env(data_dir: &Path, inherited: Option<&str>) -> Result<u16, String> {
+    fn parse_port(value: &str) -> Option<u16> {
+        let digits = value.trim();
+        if digits.len() > 5 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse::<u16>().ok().filter(|port| *port != 0)
+    }
+
+    let mut saved = String::new();
+    match fs::File::open(data_dir.join(MCP_PORT_FILE)) {
+        Ok(file) => {
+            const READ_LIMIT: usize = 16;
+            let invalid = || "The saved Render Bridge MCP port is invalid.".to_owned();
+            file.take(READ_LIMIT as u64)
+                .read_to_string(&mut saved)
+                .map_err(|_| invalid())?;
+            if saved.len() == READ_LIMIT {
+                return Err(invalid());
+            }
+            parse_port(&saved).ok_or_else(invalid)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => inherited
+            .map_or(Ok(DEFAULT_MCP_PORT), |port| {
+                parse_port(port).ok_or_else(|| "MCP_PORT must be a valid port.".into())
+            }),
+        Err(_) => Err("The saved Render Bridge MCP port could not be read.".into()),
+    }
+}
+
+fn save_mcp_port(data_dir: &Path, port: u16) -> Result<(), String> {
+    if port != DEFAULT_MCP_PORT {
+        atomic_write(
+            &data_dir.join(MCP_PORT_FILE),
+            format!("{port}\n").as_bytes(),
+        )
+        .map_err(|_| "Could not save the Render Bridge MCP port.".to_owned())?;
+    }
+    Ok(())
+}
+
+fn installation(data_dir: &Path, app_dir: PathBuf, port: u16) -> Result<Installed, String> {
     let python = venv_python(&app_dir);
     let token_path = if let Some(path) = environment_path("MCP_TOKEN_FILE") {
         let path = if path.is_absolute() || path.starts_with("~") {
@@ -810,7 +849,6 @@ fn installation(data_dir: &Path, app_dir: PathBuf) -> Result<Installed, String> 
     } else {
         data_dir.join("token.txt")
     };
-    let port = mcp_port()?;
     Ok(Installed {
         start_command: start_command(data_dir, &app_dir, &python, &token_path, port)?,
         mcp_url: format!("http://127.0.0.1:{port}/mcp"),
@@ -830,13 +868,31 @@ pub fn existing_install_at(data: &Path) -> Option<Installed> {
         return None;
     }
     let app = active_runtime(data).ok()?;
-    let installed = installation(data, app).ok()?;
+    let installed = installation(data, app, mcp_port(data).ok()?).ok()?;
     settings_for_runtime(data, &installed.app_dir)?;
     (venv_python(&installed.app_dir).is_file()
         && RUNTIME_FILES
             .iter()
             .all(|(file, _)| installed.app_dir.join(file).is_file()))
     .then_some(installed)
+}
+
+#[cfg(windows)]
+fn existing_legacy_install_for_repair(data: &Path) -> bool {
+    let app = data.join("app");
+    // The first release did not bundle the connection verifier. Recognize the
+    // old layout for repair alone. It has no ownership marker for removal.
+    crate::asset_folders::check_directory(data).is_ok()
+        && crate::asset_folders::check_directory(&app).is_ok()
+        && settings_for_runtime(data, &app).is_some()
+        && venv_python(&app).is_file()
+        && [SERVER, LAUNCHER, REQUIREMENTS, "LICENSE"]
+            .iter()
+            .all(|file| {
+                app.join(file)
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| metadata.is_file())
+            })
 }
 
 pub fn installed_comfy_url(installed: &Installed) -> Option<String> {
@@ -978,14 +1034,28 @@ fn publish_runtime(directory: &Path, runtime: &Path, settings: &Settings) -> io:
     atomic_write(&directory.join(ACTIVE_RUNTIME), name.as_bytes())
 }
 
-fn lock_install(data_dir: &Path) -> Result<fs::File, String> {
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+pub(crate) fn lock_install(data_dir: &Path) -> Result<fs::File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    let lock = options
         .open(data_dir.join("install.lock"))
         .map_err(|_| "Could not open the Render Bridge install lock.")?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if !lock.metadata().is_ok_and(|metadata| {
+            metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
+        }) {
+            return Err("The existing install lock is not an owned regular file.".into());
+        }
+    }
     lock.try_lock().map_err(
         |_| "Could not lock the runtime for setup. Close any other setup wizard and retry.",
     )?;
@@ -994,6 +1064,7 @@ fn lock_install(data_dir: &Path) -> Result<fs::File, String> {
 
 fn stage_runtime(
     data_dir: &Path,
+    port: u16,
     mut command: Command,
     cancel: &AtomicBool,
     mut progress: impl FnMut(&str),
@@ -1002,7 +1073,7 @@ fn stage_runtime(
         .prefix(RUNTIME_PREFIX)
         .tempdir_in(data_dir)
         .map_err(|_| "Could not create a staging directory for this upgrade.")?;
-    let installed = installation(data_dir, staging.path().to_path_buf())?;
+    let installed = installation(data_dir, staging.path().to_path_buf(), port)?;
     let python = venv_python(&installed.app_dir);
     for (name, content) in RUNTIME_FILES {
         check_cancel(cancel)?;
@@ -1056,6 +1127,7 @@ fn stage_runtime(
             .current_dir(&installed.app_dir)
             .env("COMFY_MCP_DATA_DIR", smoke_data.path())
             .env("MCP_TOKEN_FILE", smoke_data.path().join("token.txt"))
+            .env("MCP_PORT", port.to_string())
             .arg(installed.app_dir.join(SERVER))
             .arg("--help"),
         cancel,
@@ -1063,6 +1135,8 @@ fn stage_runtime(
         Duration::from_secs(30),
     )?;
     drop(smoke_data);
+    #[cfg(windows)]
+    crate::uninstall::mark_runtime(&installed.app_dir)?;
 
     Ok((staging, installed))
 }
@@ -1085,10 +1159,16 @@ pub fn install(
             }
             let entries = fs::read_dir(path)
                 .map_err(|_| "Choose a writable directory for the Render Bridge installation.")?;
+            #[cfg(windows)]
+            let retained_installation =
+                crate::uninstall::is_owned(path) || existing_legacy_install_for_repair(path);
+            #[cfg(not(windows))]
+            let retained_installation = false;
             if entries
                 .into_iter()
                 .any(|entry| entry.map_or(true, |entry| entry.file_name() != "install.lock"))
                 && existing_install_at(path).is_none()
+                && !retained_installation
             {
                 return Err(
                     "Choose an empty folder or an existing Render Bridge installation.".into(),
@@ -1101,9 +1181,13 @@ pub fn install(
     create_private_dir(&data_dir)
         .map_err(|_| "Could not create the Render Bridge data directory.")?;
     let _lock = lock_install(&data_dir)?;
-    let (staging, installed) = stage_runtime(&data_dir, command, cancel, &mut progress)?;
+    let port = mcp_port(&data_dir)?;
+    #[cfg(windows)]
+    crate::uninstall::mark_install(&data_dir)?;
+    let (staging, installed) = stage_runtime(&data_dir, port, command, cancel, &mut progress)?;
     check_cancel(cancel)?;
     progress("Activating the verified Render Bridge runtime.");
+    save_mcp_port(&data_dir, port)?;
     activate_runtime(&data_dir, staging, &settings)
         .map_err(|_| "Could not activate the verified runtime. Retry setup.")?;
     Ok(installed)
@@ -1154,12 +1238,14 @@ pub fn upgrade_existing(
         return Err("The existing Render Bridge data directory could not be located.".into());
     }
     let _lock = lock_install(data_dir)?;
+    let port = mcp_port(data_dir)?;
     let current = active_runtime(data_dir)
         .map_err(|_| "The existing Render Bridge installation could not be read.")?;
     // The previous version may predate some files bundled in this updater.
     let settings = settings_for_runtime(data_dir, &current)
         .ok_or("Bridge setup settings are missing. Run setup again.")?;
     let settings = validate_settings(&settings)?;
+    crate::uninstall::mark_install(data_dir)?;
     let previous_marker = match fs::read(data_dir.join(ACTIVE_RUNTIME)) {
         Ok(marker) => Some(marker),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -1172,9 +1258,10 @@ pub fn upgrade_existing(
     let interpreter = venv_python(&current);
     let command = python_for_creation(Some(&interpreter), cancel)
         .or_else(|_| python_for_creation(None, cancel))?;
-    let (staging, installed) = stage_runtime(data_dir, command, cancel, &mut progress)?;
+    let (staging, installed) = stage_runtime(data_dir, port, command, cancel, &mut progress)?;
     check_cancel(cancel)?;
     progress("Activating the verified Render Bridge runtime.");
+    save_mcp_port(data_dir, port)?;
     activate_upgrade(
         data_dir,
         staging,
@@ -1408,6 +1495,69 @@ mod tests {
             assert!(command.contains("a friend'\"'\"'s token file'"));
         }
         assert!(command.ends_with(" start"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recognizes_the_first_release_layout_for_repair_only() {
+        let data = tempfile::tempdir().unwrap();
+        let app = data.path().join("app");
+        let python = venv_python(&app);
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(python, "").unwrap();
+        for name in [SERVER, LAUNCHER, REQUIREMENTS, "LICENSE"] {
+            fs::write(app.join(name), "").unwrap();
+        }
+        fs::write(
+            data.path().join("settings.json"),
+            r#"{"COMFY_ROOT":"sample","COMFY_URL":"http://127.0.0.1:8188"}"#,
+        )
+        .unwrap();
+        assert!(existing_legacy_install_for_repair(data.path()));
+        assert!(existing_install_at(data.path()).is_none());
+        assert!(!crate::uninstall::is_owned(data.path()));
+        fs::remove_file(app.join(REQUIREMENTS)).unwrap();
+        assert!(!existing_legacy_install_for_repair(data.path()));
+    }
+
+    #[test]
+    fn existing_install_uses_its_saved_mcp_port_after_runtime_repair() {
+        let data = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            comfy_root: data.path().display().to_string(),
+            comfy_url: DEFAULT_COMFY_URL.into(),
+            comfy_input: String::new(),
+            comfy_output: String::new(),
+        };
+        assert_eq!(mcp_port_with_env(data.path(), None), Ok(8189));
+        let port = mcp_port_with_env(data.path(), Some("19189")).unwrap();
+        save_mcp_port(data.path(), port).unwrap();
+        assert_eq!(mcp_port_with_env(data.path(), Some("8188")), Ok(port));
+
+        for runtime in ["app-First", "app-Repaired"] {
+            let directory = data.path().join(runtime);
+            let python = venv_python(&directory);
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::write(python, b"fixture").unwrap();
+            for (file, _) in RUNTIME_FILES {
+                fs::write(directory.join(file), b"fixture").unwrap();
+            }
+            publish_runtime(data.path(), &directory, &settings).unwrap();
+            let installed = existing_install_at(data.path()).unwrap();
+            assert_eq!(installed.app_dir, directory);
+            assert_eq!(installed.mcp_url, "http://127.0.0.1:19189/mcp");
+            assert!(installed.start_command.contains("19189"));
+        }
+    }
+
+    #[test]
+    fn malformed_saved_port_does_not_fall_back_to_a_different_listener() {
+        let data = tempfile::tempdir().unwrap();
+        assert!(mcp_port_with_env(data.path(), Some("0")).is_err());
+        for invalid in ["0", "65536", "8189/", "8189            trailing"] {
+            fs::write(data.path().join(MCP_PORT_FILE), invalid).unwrap();
+            assert!(mcp_port_with_env(data.path(), Some("8188")).is_err());
+        }
     }
 
     #[test]

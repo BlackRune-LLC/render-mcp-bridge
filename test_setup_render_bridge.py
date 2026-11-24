@@ -99,6 +99,31 @@ class InstallRuntimeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             setup.active_runtime(self.data)
 
+    def test_launch_uses_the_saved_install_port_instead_of_the_parent_environment(self):
+        python = setup.venv_python(self.previous)
+        python.parent.mkdir(parents=True)
+        python.touch()
+        (self.data / "mcp-port").write_text("19189\n", encoding="utf-8")
+        for inherited in ({}, {"MCP_PORT": "8188"}):
+            with (
+                patch.dict(os.environ, inherited, clear=True),
+                patch.object(setup.subprocess, "run", return_value=Mock(returncode=0)) as run,
+            ):
+                self.assertEqual(setup.launch(self.data / "settings.json", ["rotate-token"]), 0)
+                self.assertEqual(run.call_args.kwargs["env"]["MCP_PORT"], "19189")
+
+    def test_terminal_install_keeps_a_custom_port_across_later_installs(self):
+        with (
+            patch.dict(os.environ, {"MCP_PORT": "19189"}),
+            patch.object(setup, "run_install_stage"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup.install_runtime(self.data, self.settings)
+            self.assertEqual((self.data / "mcp-port").read_text(encoding="utf-8").strip(), "19189")
+            with patch.dict(os.environ, {"MCP_PORT": "8188"}):
+                setup.install_runtime(self.data, self.settings)
+            self.assertEqual((self.data / "mcp-port").read_text(encoding="utf-8").strip(), "19189")
+
     def test_unchanged_root_keeps_custom_input_and_output_folders(self):
         inputs = self.data / "custom-input"
         outputs = self.data / "custom-output"

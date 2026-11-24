@@ -21,6 +21,10 @@ mod theme;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
+mod uninstall;
+#[cfg(windows)]
+mod uninstall_ui;
+#[cfg(windows)]
 mod update_handoff;
 #[cfg(windows)]
 mod update_ui;
@@ -67,6 +71,9 @@ const REMOTE_GUIDE: &str = "https://github.com/BlackRune-LLC/render-mcp-bridge/b
 #[cfg(windows)]
 const SETTINGS_GUIDE: &str =
     "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/configuration.md";
+#[cfg(windows)]
+const RELEASE_NOTES: &str =
+    "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/CHANGELOG.md";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -160,7 +167,11 @@ struct StartupSetting {
 
 #[cfg(windows)]
 impl StartupSetting {
-    fn open(&mut self, installed: Option<&Installed>) {
+    fn open(&mut self, ctx: &egui::Context, installed: Option<&Installed>) {
+        if self.open {
+            ctx.send_viewport_cmd_to(settings_viewport_id(), egui::ViewportCommand::Focus);
+            return;
+        }
         self.open = true;
         if let Some(installed) = installed {
             self.assets.load(&installed.data_dir);
@@ -187,97 +198,179 @@ impl StartupSetting {
         if !self.open {
             return;
         }
-        let response = panel_modal(ctx, "render-bridge-settings").show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.heading("Render Bridge Settings");
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Theme");
-                for (label, preference) in [
-                    ("Dark", egui::ThemePreference::Dark),
-                    ("Light", egui::ThemePreference::Light),
-                    ("System", egui::ThemePreference::System),
-                ] {
-                    let button = egui::Button::new(label)
-                        .selected(*appearance == preference)
-                        .min_size(egui::vec2(65.0, 30.0));
-                    if ui.add(button).clicked() && *appearance != preference {
-                        match theme::save(data_dir, preference) {
-                            Ok(()) => {
-                                *appearance = preference;
-                                self.appearance_error = None;
-                                ctx.set_theme(preference);
-                                ctx.request_repaint();
-                            }
-                            Err(error) => self.appearance_error = Some(error),
-                        }
-                    }
+        let size = settings_window_size(ctx.input(|input| input.viewport().monitor_size));
+        let closed = ctx.show_viewport_immediate(
+            settings_viewport_id(),
+            egui::ViewportBuilder::default()
+                .with_title("Render Bridge Settings")
+                .with_icon(icons::window_icon())
+                .with_inner_size(size)
+                .with_min_inner_size(size.min(egui::vec2(360.0, 280.0)))
+                .with_clamp_size_to_monitor_size(true),
+            |ctx, class| {
+                if class == egui::ViewportClass::Embedded {
+                    let response = panel_modal(ctx, "render-bridge-settings").show(ctx, |ui| {
+                        ui.set_width((ctx.content_rect().width() - 32.0).clamp(120.0, 520.0));
+                        ui.heading("Render Bridge Settings");
+                        egui::ScrollArea::vertical()
+                            .max_height((ctx.content_rect().height() - 108.0).max(0.0))
+                            .show(ui, |ui| self.contents(ui, appearance, data_dir, installed));
+                        ui.separator();
+                        self.actions(ui)
+                    });
+                    return response.inner || response.should_close();
                 }
-            });
-            if let Some(error) = &self.appearance_error {
-                status(ui, "Theme setting unavailable", error, CAUTION);
-            }
-            ui.separator();
-            if let Some(mut enabled) = self.enabled
-                && ui
-                    .checkbox(&mut enabled, "Start hidden when I sign in")
-                    .changed()
-            {
-                match startup::set_enabled(&self.executable, &self.arguments, enabled) {
-                    Ok(()) => {
-                        self.enabled = Some(enabled);
-                        self.error = None;
-                    }
-                    Err(message) => self.error = Some(message),
-                }
-            }
-            caption(
-                ui,
-                "Open Render Bridge in the Windows tray when you sign in.",
-            );
-            if let Some(error) = &self.error {
-                status(ui, "Settings unavailable", error, CAUTION);
-            }
-            if let Some(installed) = installed {
-                ui.separator();
-                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                    ui.heading("Storage");
-                    caption(ui, &format!("Installation folder: {}", installed.data_dir.display()));
-                    match setup::saved_install_settings(installed) {
-                        Ok(settings) => self.assets.settings(
-                            ui, &setup::folder(&settings, "output"), &setup::folder(&settings, "input"),
-                            &installed.data_dir,
-                        ),
-                        Err(error) => caption(ui, &error),
-                    }
-                    ui.separator();
-                    ui.heading("Advanced configuration");
-                    caption(ui, "Stop Render Bridge before editing its active configuration. Start it again to verify your changes.");
-                    if secondary(ui, "Open configuration file", true).clicked() {
-                        let file = setup::config_file(installed);
-                        if setup::quiet_command("notepad.exe").arg(file).spawn().is_err() {
-                            self.error = Some("Could not open the configuration file.".into());
-                        }
-                    }
-                    ui.hyperlink_to("Server and model settings", SETTINGS_GUIDE);
-                });
-            }
-            ui.horizontal_wrapped(|ui| {
-                let logs = diagnostics::existing_directory();
-                if secondary(ui, "Open crash logs", logs.is_some())
-                    .on_disabled_hover_text("No local crash logs yet.")
-                    .clicked()
-                    && let Some(folder) = logs
-                    && !diagnostics::open_directory(&folder)
-                {
-                    self.error = Some("Could not open the crash logs folder.".into());
-                }
-                secondary(ui, "Done", true).clicked()
-            }).inner
-        });
-        if response.inner || response.should_close() {
+
+                let frame = || {
+                    Frame::new()
+                        .fill(theme::color(ctx, SURFACE))
+                        .inner_margin(egui::Margin::same(16))
+                };
+                let done = egui::TopBottomPanel::bottom("settings-actions")
+                    .frame(frame())
+                    .show(ctx, |ui| self.actions(ui))
+                    .inner;
+                egui::CentralPanel::default()
+                    .frame(frame())
+                    .show(ctx, |ui| {
+                        ui.heading("Render Bridge Settings");
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| self.contents(ui, appearance, data_dir, installed));
+                    });
+                done || ctx.input(|input| {
+                    input.viewport().close_requested() || input.key_pressed(egui::Key::Escape)
+                })
+            },
+        );
+        if closed {
             self.open = false;
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
         }
     }
+
+    fn contents(
+        &mut self,
+        ui: &mut Ui,
+        appearance: &mut egui::ThemePreference,
+        data_dir: Option<&Path>,
+        installed: Option<&Installed>,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            caption(ui, concat!("Version ", env!("CARGO_PKG_VERSION")));
+            ui.hyperlink_to("Release notes", RELEASE_NOTES);
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Theme");
+            for (label, preference) in [
+                ("Dark", egui::ThemePreference::Dark),
+                ("Light", egui::ThemePreference::Light),
+                ("System", egui::ThemePreference::System),
+            ] {
+                let button = egui::Button::new(label)
+                    .selected(*appearance == preference)
+                    .min_size(egui::vec2(65.0, 30.0));
+                if ui.add(button).clicked() && *appearance != preference {
+                    match theme::save(data_dir, preference) {
+                        Ok(()) => {
+                            *appearance = preference;
+                            self.appearance_error = None;
+                            ui.ctx().set_theme(preference);
+                            ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                        }
+                        Err(error) => self.appearance_error = Some(error),
+                    }
+                }
+            }
+        });
+        if let Some(error) = &self.appearance_error {
+            status(ui, "Theme setting unavailable", error, CAUTION);
+        }
+        ui.separator();
+        if let Some(mut enabled) = self.enabled
+            && ui
+                .checkbox(&mut enabled, "Start hidden when I sign in")
+                .changed()
+        {
+            match startup::set_enabled(&self.executable, &self.arguments, enabled) {
+                Ok(()) => {
+                    self.enabled = Some(enabled);
+                    self.error = None;
+                }
+                Err(message) => self.error = Some(message),
+            }
+        }
+        caption(
+            ui,
+            "Open Render Bridge in the Windows tray when you sign in.",
+        );
+        if let Some(error) = &self.error {
+            status(ui, "Settings unavailable", error, CAUTION);
+        }
+        if let Some(installed) = installed {
+            ui.separator();
+            ui.heading("Storage");
+            caption(
+                ui,
+                &format!("Installation folder: {}", installed.data_dir.display()),
+            );
+            match setup::saved_install_settings(installed) {
+                Ok(settings) => self.assets.settings(
+                    ui,
+                    &setup::folder(&settings, "output"),
+                    &setup::folder(&settings, "input"),
+                    &installed.data_dir,
+                ),
+                Err(error) => caption(ui, &error),
+            }
+            ui.separator();
+            ui.heading("Advanced configuration");
+            caption(
+                ui,
+                "Stop Render Bridge before editing its active configuration. Start it again to verify your changes.",
+            );
+            if secondary(ui, "Open configuration file", true).clicked() {
+                let file = setup::config_file(installed);
+                if setup::quiet_command("notepad.exe")
+                    .arg(file)
+                    .spawn()
+                    .is_err()
+                {
+                    self.error = Some("Could not open the configuration file.".into());
+                }
+            }
+            ui.hyperlink_to("Server and model settings", SETTINGS_GUIDE);
+        }
+    }
+
+    fn actions(&mut self, ui: &mut Ui) -> bool {
+        ui.horizontal_wrapped(|ui| {
+            let logs = diagnostics::existing_directory();
+            if secondary(ui, "Open crash logs", logs.is_some())
+                .on_disabled_hover_text("No local crash logs yet.")
+                .clicked()
+                && let Some(folder) = logs
+                && !diagnostics::open_directory(&folder)
+            {
+                self.error = Some("Could not open the crash logs folder.".into());
+            }
+            secondary(ui, "Done", true).clicked()
+        })
+        .inner
+    }
+}
+
+#[cfg(windows)]
+fn settings_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("render-bridge-settings")
+}
+
+#[cfg(windows)]
+fn settings_window_size(monitor: Option<Vec2>) -> Vec2 {
+    let preferred = egui::vec2(550.0, 620.0);
+    monitor.map_or(preferred, |size| {
+        // Leave room for Windows decorations and the taskbar at the monitor's scale.
+        preferred.min((size - egui::vec2(32.0, 64.0)).max(egui::vec2(1.0, 1.0)))
+    })
 }
 
 #[cfg(windows)]
@@ -404,6 +497,8 @@ struct Installer {
     #[cfg(windows)]
     monitor_error: Option<String>,
     #[cfg(windows)]
+    uninstall: uninstall_ui::UninstallDialog,
+    #[cfg(windows)]
     update: update_ui::UpdateDialog,
 }
 
@@ -467,6 +562,8 @@ impl Installer {
             appearance,
             #[cfg(windows)]
             monitor_error: None,
+            #[cfg(windows)]
+            uninstall: uninstall_ui::UninstallDialog::default(),
             #[cfg(windows)]
             update: update_ui::UpdateDialog::default(),
         };
@@ -596,7 +693,12 @@ impl Installer {
                 _ => "Check jobs",
             };
             ui.heading(RichText::new(title).size(25.0).strong());
-            dialog.queue.show(ui);
+            let footer_space = if action == QueueAction::Inspect { 116.0 } else { 164.0 };
+            egui::ScrollArea::vertical()
+                .id_salt("jobs-dialog-body")
+                .auto_shrink([false, true])
+                .max_height((ctx.content_rect().height() - footer_space).max(72.0))
+                .show(ui, |ui| dialog.queue.show(ui));
             if action == QueueAction::Inspect {
                 return (secondary(ui, "Close", true).clicked(), false);
             }
@@ -625,7 +727,7 @@ impl Installer {
                 stop = if in_panel {
                     monitor_button(ui, label_text, label.is_some(), ERROR)
                 } else {
-                    primary(ui, label_text, label.is_some())
+                    destructive(ui, label_text, label.is_some())
                 }.clicked();
             });
             (keep, stop)
@@ -1306,24 +1408,26 @@ impl Installer {
                         Some("That folder does not contain a verified Render Bridge setup.".into());
                 }
             }
+            #[cfg(windows)]
+            if secondary(ui, "Uninstall Render Bridge", idle).clicked() {
+                self.uninstall.choose();
+            }
         });
         if let Some(error) = &self.install_error {
             caption(ui, error);
         }
         #[cfg(windows)]
         if self.python_install_offer {
-            let prompt = egui::Modal::new(egui::Id::new("python-install-approval")).show(ui.ctx(), |ui| {
-                ui.set_width(340.0);
+            let prompt = panel_modal(ui.ctx(), "python-install-approval").show(ui.ctx(), |ui| {
+                ui.set_width((ui.ctx().content_rect().width() - 32.0).clamp(120.0, 360.0));
                 ui.heading("Install Python on this PC?");
                 caption(ui, "WinGet will request the latest available Python 3.13 patch for all users on this PC. Windows will ask for administrator approval.");
                 caption(ui, "You can cancel and use the official Python download instead.");
-                let mut approve = false;
-                let mut cancel = false;
-                ui.horizontal(|ui| {
-                    cancel = secondary(ui, "Cancel", true).clicked();
-                    approve = primary(ui, "Request administrator approval", true).clicked();
-                });
-                (approve, cancel)
+                ui.horizontal_wrapped(|ui| {
+                    let cancel = secondary(ui, "Cancel", true).clicked();
+                    let approve = primary(ui, "Request administrator approval", true).clicked();
+                    (approve, cancel)
+                }).inner
             });
             let (approve, cancel) = prompt.inner;
             if approve || cancel || prompt.should_close() {
@@ -1945,7 +2049,7 @@ impl Installer {
                     if let Some(setting) = &mut self.startup_setting
                         && monitor_button(ui, "Settings", true, SURFACE).clicked()
                     {
-                        setting.open(self.installed.as_ref());
+                        setting.open(ctx, self.installed.as_ref());
                     }
                     if self.installed.is_some()
                         && monitor_button(ui, "Connect", true, SURFACE).clicked()
@@ -2117,11 +2221,15 @@ impl Installer {
         }
         #[cfg(windows)]
         if let Some(setting) = &mut self.startup_setting {
-            let data_dir = self
-                .controls
-                .as_ref()
-                .and_then(|controls| controls.data_dir.as_deref());
-            setting.show(ctx, &mut self.appearance, data_dir, self.installed.as_ref());
+            if self.tray_panel.as_ref().is_some_and(|tray| tray.hidden) {
+                setting.open = false;
+            } else {
+                let data_dir = self
+                    .controls
+                    .as_ref()
+                    .and_then(|controls| controls.data_dir.as_deref());
+                setting.show(ctx, &mut self.appearance, data_dir, self.installed.as_ref());
+            }
         }
         #[cfg(windows)]
         {
@@ -2291,6 +2399,10 @@ impl eframe::App for Installer {
             return;
         }
         let close_requested = ctx.input(|input| input.viewport().close_requested());
+        #[cfg(windows)]
+        if close_requested && self.uninstall.is_running() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         if matches!(self.step, Step::Install | Step::Connect)
             && self.worker.is_some()
             && close_requested
@@ -2337,6 +2449,8 @@ impl eframe::App for Installer {
                     });
             });
         self.jobs_dialog(ctx);
+        #[cfg(windows)]
+        self.uninstall.show(ctx);
     }
 }
 
@@ -2588,6 +2702,23 @@ fn secondary(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
     )
 }
 
+fn destructive(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(title).size(15.0).strong().color(CREAM))
+            .fill(destructive_fill(ui.ctx()))
+            .min_size(egui::vec2(143.0, 44.0))
+            .corner_radius(12),
+    )
+}
+
+fn destructive_fill(ctx: &egui::Context) -> Color32 {
+    match ctx.theme() {
+        egui::Theme::Dark => Color32::from_rgb(148, 53, 67),
+        egui::Theme::Light => theme::color(ctx, ERROR),
+    }
+}
+
 fn monitor_button(ui: &mut Ui, title: &str, enabled: bool, fill: Color32) -> egui::Response {
     let ctx = ui.ctx();
     let text = match fill {
@@ -2596,7 +2727,7 @@ fn monitor_button(ui: &mut Ui, title: &str, enabled: bool, fill: Color32) -> egu
         _ => theme::color(ctx, INK),
     };
     let fill = match (ctx.theme(), fill) {
-        (egui::Theme::Dark, ERROR) => Color32::from_rgb(148, 53, 67),
+        (_, ERROR) => destructive_fill(ctx),
         (egui::Theme::Dark, LINE) => Color32::from_rgb(28, 51, 49),
         _ => theme::color(ctx, fill),
     };
@@ -2821,6 +2952,20 @@ fn startup_setting(mode: &LaunchMode) -> Option<StartupSetting> {
 mod launch_tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[cfg(windows)]
+    #[test]
+    fn settings_window_prefers_roomy_view_and_fits_smaller_logical_displays() {
+        assert_eq!(settings_window_size(None), egui::vec2(550.0, 620.0));
+        assert_eq!(
+            settings_window_size(Some(egui::vec2(1920.0, 1080.0))),
+            egui::vec2(550.0, 620.0)
+        );
+        assert_eq!(
+            settings_window_size(Some(egui::vec2(500.0, 432.0))),
+            egui::vec2(468.0, 368.0)
+        );
+    }
 
     #[test]
     fn shortcut_opens_controls_for_the_exact_data_directory() {

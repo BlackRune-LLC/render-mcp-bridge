@@ -4,6 +4,8 @@ A self-hosted image MCP server that lets your agents do the work in ComfyUI. You
 
 Render Bridge runs locally and sends no telemetry or crash reports to BlackRune. [Privacy and network use](PRIVACY.md)
 
+[Release notes](CHANGELOG.md) · [Support](#support)
+
 [Download v0.1.0 for Windows x64 (unsigned)](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Windows control panel](#windows-control-panel) · [Connect an MCP client](#connect-an-mcp-client) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to set it up](#ask-your-agent-to-set-it-up)
 
 ## Install and run
@@ -51,14 +53,14 @@ To keep the Bridge running after closing setup, use **Shutdown and terminal comm
 
 #### Windows control panel
 
-In the installer built from current source, choose **Open Render Bridge** on **Connect** to launch the compact panel. It also has a per-user **Render Bridge** entry in the Windows Start menu. Dark is the default. In **Settings**, choose **Light**, **Dark**, or **System** to follow Windows appearance.
+In the installer built from current source, choose **Open Render Bridge** on **Connect** to launch the compact panel. It also has a per-user **Render Bridge** entry in the Windows Start menu. **Settings** opens in a separate resizable window. Dark is the default. Choose **Light**, **Dark**, or **System** to follow Windows appearance.
 
 - **Jobs** shows running and queued jobs for the local ComfyUI address selected in setup. When ComfyUI sends progress for a running stage, the panel shows its step count and percentage.
 - **Start server** starts Render Bridge using your saved installation. When the server is running, the muted button remains clickable to confirm its status. The red **Stop server** button stops the session started by this panel after you review the queue and confirm. Manage ComfyUI in its own app or through its launch command.
 - **Hide to tray** keeps Render Bridge in the Windows notification area. Click its icon to reopen the panel. If the icon is in the overflow, open **Show hidden icons** first.
 - Select **Connect** to reopen **Connect an agent**, copy connection details, or rotate the token after stopping the server. [Connect after installation](docs/connections.md#connect-after-installation)
 - In **Settings**, turn on **Start hidden when I sign in** to open Render Bridge in the notification area after you sign in to Windows. Use **Start server** in the panel when you want the Render Bridge MCP server to run.
-- Select **Update** to check for a newer stable Windows release on the official GitHub repository. If that release has a signed installer, choose **Install update** to download and verify it from the panel. Render Bridge checks for active jobs and any server session the panel owns before replacing the installed version. The update keeps your saved settings, ComfyUI address, and token on this PC.
+- Select **Update** to check the official GitHub repository for a stable Windows build. Choose **Install update** when a newer version is available. A preview with the same version number can use **Install published build** when the official installer differs. Render Bridge verifies the download and its Windows signature, checks the queue and its server session, and keeps your settings, ComfyUI address, and token.
 
 #### Storage and configuration
 
@@ -67,6 +69,8 @@ Choose an optional generated asset folder, backup folder, or both during install
 Use **Settings → Advanced configuration → Open configuration file** to review the saved ComfyUI data root, URL, and any separate input or output paths. Stop Render Bridge before editing the file, then restart it and verify the connection. Set runtime tuning variables in the environment that starts Render Bridge. Render Bridge requests a model unload after 10 minutes of idle time by default. Set `IDLE_UNLOAD_MIN=0` to disable idle unloading. [Configuration reference](docs/configuration.md)
 
 Use **Settings → Open crash logs** to find local Render Bridge crash reports on Windows. [Local crash logs](docs/configuration.md#local-crash-logs)
+
+To repair or uninstall an existing Windows setup, run the setup wizard again. [Windows installation, repair, and removal](docs/configuration.md#windows-installation-repair-and-removal)
 
 #### Build the desktop installer
 
@@ -177,6 +181,12 @@ Turning gaming mode on pauses new GPU work through the MCP server. If ComfyUI's 
 If Render Bridge is already installed, use the [connection prompt](docs/connections.md#paste-a-connection-prompt). For first-time setup, give this prompt to an agent with terminal access on the render host.
 
 > Set up Render Bridge and connect my MCP client. Check for Python 3.11 or newer with virtual environment support and a running local ComfyUI build first. Ask me before installing system software, model weights, or nodes. Let me approve administrator prompts and sign in to any required accounts myself. Use the agent instructions to keep my token private and verify with `server_status`, `list_jobs`, and `list_models`. Ask before the first render. [Render Bridge agent instructions](https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/AGENTS.md)
+
+## Support
+
+For setup or runtime problems, include the Render Bridge version, operating system, ComfyUI build, and the step that failed. On Windows, **Settings** shows the version and can open your local crash logs. Review anything you attach and keep tokens, signed file links, and private paths out of the issue. [Open a support issue](https://github.com/BlackRune-LLC/render-mcp-bridge/issues/new)
+
+Use the private reporting instructions for security issues. [Security reporting](SECURITY.md)
 
 ## License
 

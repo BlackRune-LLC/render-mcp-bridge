@@ -113,38 +113,55 @@ impl UpdateDialog {
             }
         }
         let response = panel_modal(ctx, "render-bridge-update").show(ctx, |ui| {
-            ui.set_width(350.0);
+            let viewport = ctx.content_rect();
+            ui.set_width((viewport.width() - 32.0).clamp(160.0, 350.0));
             ui.heading("Render Bridge Update");
             caption(
                 ui,
                 &format!("Installed version {}", env!("CARGO_PKG_VERSION")),
             );
-            if self.downloading {
-                activity(ui, "Downloading and verifying the installer…");
-            } else {
-                match &self.result {
-                    None => activity(ui, "Checking for updates…"),
-                    Some(Ok(None)) => caption(ui, "Render Bridge is up to date."),
-                    Some(Ok(Some(release))) => {
-                        ui.label(format!("Version {} is available.", release.version));
-                        if let Some(reason) = blocked {
-                            caption(ui, reason);
-                        } else {
-                            caption(
-                                ui,
-                                "The update keeps your settings and reopens Render Bridge.",
-                            );
+            egui::ScrollArea::vertical()
+                .max_height((viewport.height() - 145.0).max(50.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    if self.downloading {
+                        activity(ui, "Downloading and verifying the installer…");
+                    } else {
+                        match &self.result {
+                            None => activity(ui, "Checking for updates…"),
+                            Some(Ok(None)) => caption(ui, "Render Bridge is up to date."),
+                            Some(Ok(Some(release))) => {
+                                if release.is_installed_version() {
+                                    ui.label("The published build of this version is available.");
+                                } else {
+                                    ui.label(format!("Version {} is available.", release.version));
+                                }
+                                if let Some(reason) = blocked {
+                                    caption(ui, reason);
+                                } else {
+                                    caption(
+                                        ui,
+                                        "The update keeps your settings and reopens Render Bridge.",
+                                    );
+                                }
+                            }
+                            Some(Err(error)) => status(ui, "Update unavailable", error, CAUTION),
                         }
                     }
-                    Some(Err(error)) => status(ui, "Update unavailable", error, CAUTION),
-                }
-            }
+                });
             let mut install = false;
             let mut retry = false;
             let mut close = false;
             ui.horizontal_wrapped(|ui| {
-                if !self.downloading && matches!(self.result, Some(Ok(Some(_)))) {
-                    install = primary(ui, "Install update", blocked.is_none()).clicked();
+                if !self.downloading
+                    && let Some(Ok(Some(release))) = &self.result
+                {
+                    let label = if release.is_installed_version() {
+                        "Install published build"
+                    } else {
+                        "Install update"
+                    };
+                    install = primary(ui, label, blocked.is_none()).clicked();
                 } else if matches!(self.result, Some(Err(_))) {
                     retry = primary(ui, "Check again", true).clicked();
                 }
@@ -328,27 +345,30 @@ impl eframe::App for ApplyWindow {
                     .inner_margin(egui::Margin::same(20)),
             )
             .show(ctx, |ui| {
-                ui.heading("Updating Render Bridge");
-                if let Some(error) = &self.error {
-                    status(ui, "Update could not finish", error, CAUTION);
-                    if self.target.is_some() && secondary(ui, "Open Render Bridge", true).clicked()
-                    {
-                        self.reopen(ctx);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Updating Render Bridge");
+                    if let Some(error) = &self.error {
+                        status(ui, "Update could not finish", error, CAUTION);
+                        if self.target.is_some()
+                            && secondary(ui, "Open Render Bridge", true).clicked()
+                        {
+                            self.reopen(ctx);
+                        }
+                    } else {
+                        let cancelling = self.cancel.load(Ordering::Relaxed);
+                        activity(
+                            ui,
+                            if cancelling {
+                                "Cancelling the update…"
+                            } else {
+                                &self.progress
+                            },
+                        );
+                        if secondary(ui, "Cancel", !cancelling).clicked() {
+                            self.cancel.store(true, Ordering::Relaxed);
+                        }
                     }
-                } else {
-                    let cancelling = self.cancel.load(Ordering::Relaxed);
-                    activity(
-                        ui,
-                        if cancelling {
-                            "Cancelling the update…"
-                        } else {
-                            &self.progress
-                        },
-                    );
-                    if secondary(ui, "Cancel", !cancelling).clicked() {
-                        self.cancel.store(true, Ordering::Relaxed);
-                    }
-                }
+                });
             });
     }
 }
@@ -359,7 +379,8 @@ pub fn apply(request: Result<UpdateRequest, String>) -> eframe::Result {
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_icon(crate::icons::window_icon())
-                .with_inner_size(egui::vec2(490.0, 220.0)),
+                .with_inner_size(egui::vec2(500.0, 270.0))
+                .with_min_inner_size(egui::vec2(340.0, 210.0)),
             ..Default::default()
         },
         Box::new(move |creation| Ok(Box::new(ApplyWindow::new(&creation.egui_ctx, request)))),

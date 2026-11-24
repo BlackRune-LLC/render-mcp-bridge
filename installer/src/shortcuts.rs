@@ -6,7 +6,9 @@ use tempfile::NamedTempFile;
 #[cfg(windows)]
 const MONITOR_LINK_NAME: &str = "Render Bridge.lnk";
 #[cfg(windows)]
-const MONITOR_DIR: &str = "monitor";
+const DESKTOP_LINK_NAME: &str = "Render Bridge Gaming Mode.lnk";
+#[cfg(windows)]
+pub(crate) const MONITOR_DIR: &str = "monitor";
 #[cfg(windows)]
 const MONITOR_EXECUTABLE: &str = "RenderBridgeMonitor.exe";
 #[cfg(windows)]
@@ -128,6 +130,37 @@ pub(crate) fn existing_monitor_executable(data: &Path) -> Result<PathBuf, String
         return Err(MONITOR_CONFLICT.into());
     }
     Ok(executable)
+}
+
+#[cfg(windows)]
+pub(crate) fn remove_monitor_links(data: &Path, executable: &Path) -> Result<(), String> {
+    use std::ffi::OsString;
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs, FOLDERID_Startup};
+
+    let mut arguments = vec![
+        OsString::from("--job-monitor"),
+        OsString::from("--data-dir"),
+        data.as_os_str().to_owned(),
+    ];
+    for (folder, name, starts_hidden) in [
+        (FOLDERID_Programs, MONITOR_LINK_NAME, false),
+        (FOLDERID_Desktop, DESKTOP_LINK_NAME, false),
+        (FOLDERID_Startup, MONITOR_LINK_NAME, true),
+    ] {
+        let Ok(folder) =
+            windows_known_folder(&folder, "The per-user shortcut folder is unavailable.")
+        else {
+            continue;
+        };
+        let Ok(_parents) = crate::uninstall::pin_local_directories(&folder) else {
+            continue;
+        };
+        if starts_hidden {
+            arguments.push(OsString::from("--start-in-tray"));
+        }
+        crate::startup::remove_matching_link(&folder.join(name), executable, &arguments)?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -374,7 +407,7 @@ fn write_windows_shortcut(
         .collect::<Vec<_>>()
         .join(" ");
     write_windows_link(
-        &desktop.join("Render Bridge Gaming Mode.lnk"),
+        &desktop.join(DESKTOP_LINK_NAME),
         Path::new(command[0]),
         app_dir,
         &arguments,

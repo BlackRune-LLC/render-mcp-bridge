@@ -4,6 +4,14 @@ In the Windows control panel, open **Settings** to change appearance, sign-in be
 
 To keep your runtime, shortcuts, and token when reinstalling, select the existing Render Bridge installation directory. Use **Storage** to choose where to copy generated assets or their backups. To change where ComfyUI writes the originals or searches for models, configure that ComfyUI build. [ComfyUI folder settings](https://docs.comfy.org/installation/desktop/usage/instance-management) · [Model storage](pipelines.md#store-models-on-another-drive)
 
+## Windows installation, repair, and removal
+
+On the wizard's **Install** step, choose a **Render Bridge installation folder** or accept the default. Select an empty folder for a new install. The **Settings → Storage** panel shows the folder for an installed copy.
+
+To repair Render Bridge, exit the tray app and stop that installation's Render Bridge server. Run the standard setup wizard again, select the same ComfyUI build, and choose the same Render Bridge installation folder. Setup checks a replacement runtime before activating it.
+
+To uninstall, run the setup wizard from a location outside the installation folder. On **Prerequisites**, choose **Uninstall Render Bridge**, select the installation folder, and confirm. Close the matching tray app and stop its Render Bridge server first. The uninstaller removes the runtime and tray files it can verify and the shortcuts that still point to that installation. It preserves saved settings, the private token, project records, job history, crash reports, and ComfyUI assets. If an older installation has no ownership information, repair it in place first. Older runtime files whose ownership cannot be verified stay in the selected folder.
+
 ## Local crash logs
 
 In the Windows control panel, use **Settings → Open crash logs** after a report exists. You can also open the folder directly after a crash.
@@ -27,7 +35,7 @@ Set other environment variables on the render host before starting Render Bridge
 | `COMFY_INPUT_DIR`, `COMFY_OUTPUT_DIR` | Absolute folders used by the selected ComfyUI build. Default `input` and `output` under `COMFY_ROOT`. |
 | `COMFY_URL` | Loopback HTTP or HTTPS API address for ComfyUI, default `http://127.0.0.1:8188`. Set this if your build uses a different local port. |
 | `COMFY_MCP_DATA_DIR` | Choose a private runtime and data location. The desktop installer can also choose one. |
-| `MCP_PORT` | MCP endpoint port, default `8189`. Update the client or tunnel if you change it. |
+| `MCP_PORT` | MCP endpoint port, default `8189`. Setup remembers a custom port in the installation's `mcp-port` file so shortcuts and updates reuse it. To change a saved port, stop Render Bridge, edit or remove that file, and update your MCP client or tunnel. |
 | `MCP_TOKEN_FILE` | Private file containing the MCP bearer token. Keep it outside shared folders. |
 | `PUBLIC_URLS` | Comma-separated named base URLs for signed uploads and downloads. Defaults to loopback at the MCP port. Example `local=http://127.0.0.1:8189,private=https://render.example.net`. |
 | `MCP_HOST`, `MCP_ALLOW_REMOTE` | MCP listen address, default `127.0.0.1`, and explicit opt-in for a terminal listener on another address. A private SSH tunnel or HTTPS proxy can keep the listener on loopback. |

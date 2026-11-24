@@ -24,6 +24,12 @@ pub struct Release {
     installer: ReleaseAsset,
 }
 
+impl Release {
+    pub fn is_installed_version(&self) -> bool {
+        self.version == INSTALLED_VERSION
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ReleaseAsset {
     url: String,
@@ -75,10 +81,18 @@ pub fn check() -> Result<Option<Release>, String> {
         .limit(MAX_RESPONSE_BYTES)
         .read_json()
         .map_err(|_| RELEASE_ERROR.to_owned())?;
-    newer_release(metadata, INSTALLED_VERSION)
+    applicable_release(
+        metadata,
+        INSTALLED_VERSION,
+        windows_download::installed_matches,
+    )
 }
 
-fn newer_release(metadata: ReleaseMetadata, installed: &str) -> Result<Option<Release>, String> {
+fn applicable_release(
+    metadata: ReleaseMetadata,
+    installed: &str,
+    installed_matches: impl FnOnce(&ReleaseAsset) -> Result<bool, String>,
+) -> Result<Option<Release>, String> {
     if metadata.draft
         || metadata.prerelease
         || metadata
@@ -92,7 +106,7 @@ fn newer_release(metadata: ReleaseMetadata, installed: &str) -> Result<Option<Re
     let available = stable_version(version).ok_or(RELEASE_ERROR)?;
     let installed =
         stable_version(installed).ok_or("This Render Bridge version cannot be compared.")?;
-    if available <= installed {
+    if available < installed {
         return Ok(None);
     }
     let mut installers = metadata
@@ -116,17 +130,21 @@ fn newer_release(metadata: ReleaseMetadata, installed: &str) -> Result<Option<Re
         .as_deref()
         .and_then(parse_sha256)
         .ok_or(ASSET_ERROR)?;
+    let installer = ReleaseAsset {
+        url: expected_url,
+        size: asset.size,
+        sha256,
+    };
+    if available == installed && installed_matches(&installer)? {
+        return Ok(None);
+    }
     Ok(Some(Release {
         version: version.into(),
         url: format!(
             "https://github.com/{REPOSITORY}/releases/tag/{}",
             metadata.tag_name
         ),
-        installer: ReleaseAsset {
-            url: expected_url,
-            size: asset.size,
-            sha256,
-        },
+        installer,
     }))
 }
 
@@ -189,6 +207,13 @@ mod windows_download {
 
     const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
     const MAX_REDIRECTS: usize = 4;
+
+    pub(super) fn installed_matches(asset: &ReleaseAsset) -> Result<bool, String> {
+        let error = "Could not compare the installed Render Bridge executable.".to_owned();
+        let path = std::env::current_exe().map_err(|_| error.clone())?;
+        let file = File::open(path).map_err(|_| error)?;
+        Ok(copy_verified(file, std::io::sink(), asset).is_ok())
+    }
 
     pub struct StagedInstaller {
         // Keep writes and replacement blocked until the caller starts the
@@ -437,6 +462,24 @@ pub use windows_download::{StagedInstaller, download};
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn newer_release(
+        metadata: ReleaseMetadata,
+        installed: &str,
+    ) -> Result<Option<Release>, String> {
+        applicable_release(metadata, installed, |_| Ok(true))
+    }
+
+    #[test]
+    fn offers_the_official_asset_for_a_different_build_of_the_same_version() {
+        let result = applicable_release(metadata("v0.2.0"), "0.2.0", |asset| {
+            assert_eq!(asset.sha256, [1; 32]);
+            Ok(false)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.version, "0.2.0");
+    }
 
     fn metadata(tag: &str) -> ReleaseMetadata {
         serde_json::from_value(json!({

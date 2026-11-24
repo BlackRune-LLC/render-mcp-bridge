@@ -28,6 +28,8 @@ COMFY_INSTALL = "https://docs.comfy.org/installation/manual_install"
 SETTINGS_KEYS = {"COMFY_ROOT", "COMFY_URL"}
 OPTIONAL_SETTINGS = {"COMFY_INPUT_DIR", "COMFY_OUTPUT_DIR"}
 ACTIVE_RUNTIME = "active-runtime"
+MCP_PORT_FILE = "mcp-port"
+DEFAULT_MCP_PORT = 8189
 RUNTIME_PREFIX = "app-"
 RUNTIME_FILES = (
     "comfy_mcp_server.py",
@@ -157,6 +159,28 @@ def active_runtime(directory: Path) -> Path | None:
 
 def runtime_settings(legacy_settings: Path, runtime: Path | None) -> Path:
     return runtime / "settings.json" if runtime else legacy_settings
+
+
+def configured_mcp_port(directory: Path) -> int:
+    invalid = "The saved Render Bridge MCP port is invalid."
+    try:
+        with (directory / MCP_PORT_FILE).open(encoding="ascii") as saved:
+            raw = saved.read(16)
+        if len(raw) == 16:
+            raise ValueError(invalid)
+    except FileNotFoundError:
+        raw = os.environ.get("MCP_PORT", str(DEFAULT_MCP_PORT))
+        invalid = "MCP_PORT must be a valid port."
+    except UnicodeError:
+        raise ValueError(invalid) from None
+
+    digits = raw.strip()
+    if not 1 <= len(digits) <= 5 or not digits.isascii() or not digits.isdecimal():
+        raise ValueError(invalid)
+    port = int(digits)
+    if not 1 <= port <= 65535:
+        raise ValueError(invalid)
+    return port
 
 
 def backend_url(value: str) -> str:
@@ -326,6 +350,7 @@ def install_runtime(directory: Path, settings: dict[str, str]) -> None:
 
 
 def stage_runtime(directory: Path, settings: dict[str, str]) -> None:
+    port = configured_mcp_port(directory)
     staging = Path(tempfile.mkdtemp(prefix=RUNTIME_PREFIX, dir=directory))
     activated = False
     try:
@@ -352,10 +377,12 @@ def stage_runtime(directory: Path, settings: dict[str, str]) -> None:
             run_install_stage(
                 [python, str(staging / "comfy_mcp_server.py"), "--help"],
                 staging, "Render Bridge startup check", 30,
-                {**os.environ, "COMFY_MCP_DATA_DIR": smoke,
+                {**os.environ, "COMFY_MCP_DATA_DIR": smoke, "MCP_PORT": str(port),
                  "MCP_TOKEN_FILE": str(Path(smoke) / "token.txt")},
             )
         save_settings(staging / "settings.json", settings)
+        if port != DEFAULT_MCP_PORT:
+            atomic_text(directory / MCP_PORT_FILE, f"{port}\n")
         atomic_text(directory / ACTIVE_RUNTIME, staging.name)
         activated = True
     finally:
@@ -459,7 +486,15 @@ def launch(settings_path: Path, server_args: list[str]) -> int:
     except (OSError, ValueError):
         print("The saved ComfyUI directory or URL is invalid. Rerun setup.", file=sys.stderr)
         return 1
-    env = {**os.environ, **settings, "COMFY_MCP_DATA_DIR": str(settings_path.parent)}
+    try:
+        port = configured_mcp_port(settings_path.parent)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except OSError:
+        print("The saved Render Bridge MCP port could not be read.", file=sys.stderr)
+        return 1
+    env = {**os.environ, **settings, "COMFY_MCP_DATA_DIR": str(settings_path.parent), "MCP_PORT": str(port)}
     if env.get("MCP_TOKEN_FILE"):
         token = Path(env["MCP_TOKEN_FILE"]).expanduser()
         if not token.is_absolute():

@@ -45,6 +45,19 @@ pub(crate) fn matches_existing_link(
         .map_err(|_| "An existing Render Bridge app-menu shortcut could not be verified. Your shortcut was kept.".into())
 }
 
+pub(crate) fn remove_matching_link(
+    path: &Path,
+    executable: &Path,
+    arguments: &[OsString],
+) -> Result<(), String> {
+    match owned_entry(path, executable, arguments, true) {
+        Ok(Some(file)) => delete_link(file),
+        Ok(None) => Ok(()),
+        Err(error) if error == CONFLICT => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn startup_link() -> Result<PathBuf, String> {
     let folder = windows_known_folder(
         &FOLDERID_Startup,
@@ -91,21 +104,25 @@ fn set_enabled_at(
             }
             Ok(())
         }
-        (false, Some(file)) => {
-            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-            // Delete the verified file by handle. A rename or replacement of
-            // the path cannot make this delete a different shortcut.
-            unsafe {
-                SetFileInformationByHandle(
-                    HANDLE(file.as_raw_handle()),
-                    FileDispositionInfo,
-                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
-                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-                )
-            }
-            .map_err(|_| REMOVE_ERROR.to_owned())
-        }
+        (false, Some(file)) => delete_link(file),
         _ => Ok(()),
+    }
+}
+
+fn delete_link(file: File) -> Result<(), String> {
+    delete_by_handle(&file).map_err(|_| REMOVE_ERROR.to_owned())
+}
+
+pub(crate) fn delete_by_handle(file: &File) -> windows::core::Result<()> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // A rename or replacement of the path cannot change the open target.
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
     }
 }
 
@@ -239,9 +256,10 @@ mod tests {
             set_enabled_at(&path, &target, &other, false).unwrap_err(),
             CONFLICT
         );
+        remove_matching_link(&path, &target, &other).unwrap();
         assert_eq!(fs::read(&path).unwrap(), original);
 
-        set_enabled_at(&path, &target, &args, false).unwrap();
+        remove_matching_link(&path, &target, &args).unwrap();
         assert!(!path.exists());
         set_enabled_at(&path, &target, &args, false).unwrap();
     }

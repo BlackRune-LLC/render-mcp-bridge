@@ -33,6 +33,12 @@ foreach ($mapping in $paths.GetEnumerator()) {
 
 $target = 'x86_64-pc-windows-msvc'
 $manifest = Join-Path $PSScriptRoot 'Cargo.toml'
+$manifestVersion = Select-String -LiteralPath $manifest -Pattern '^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$' |
+    Select-Object -First 1
+if (!$manifestVersion) {
+    throw 'Cargo.toml must contain a three-part release version.'
+}
+$releaseVersion = $manifestVersion.Matches[0].Groups[1].Value
 $buildArguments = @('build', '--release', '--locked', '--target', $target,
     '--manifest-path', $manifest, '--target-dir', $TargetDirectory)
 if ($Offline) {
@@ -51,4 +57,16 @@ finally {
     $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags
 }
 
-Get-Item -LiteralPath (Join-Path $TargetDirectory "$target/release/render-bridge-setup.exe")
+$installer = Get-Item -LiteralPath (Join-Path $TargetDirectory "$target/release/render-bridge-setup.exe")
+$metadata = $installer.VersionInfo
+if ($metadata.ProductName -cne 'Render Bridge' -or
+    $metadata.CompanyName -cne 'BlackRune LLC' -or
+    $metadata.FileDescription -cne 'Render Bridge Setup' -or
+    $metadata.OriginalFilename -cne 'RenderBridgeSetup.exe' -or
+    $metadata.FileVersion -cne $releaseVersion -or
+    $metadata.ProductVersion -cne $releaseVersion -or
+    ($metadata.FileMajorPart, $metadata.FileMinorPart, $metadata.FileBuildPart, $metadata.FilePrivatePart -join '.') -ne "$releaseVersion.0" -or
+    ($metadata.ProductMajorPart, $metadata.ProductMinorPart, $metadata.ProductBuildPart, $metadata.ProductPrivatePart -join '.') -ne "$releaseVersion.0") {
+    throw "The Windows installer has missing or stale product metadata. Update the version in installer/assets/render-bridge.rc and regenerate render-bridge.res for $releaseVersion."
+}
+$installer
