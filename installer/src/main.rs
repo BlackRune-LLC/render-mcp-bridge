@@ -3,13 +3,15 @@
 mod connection;
 mod discovery;
 mod models;
+#[cfg(windows)]
+mod python_install;
 mod setup;
 mod shortcuts;
 
 use connection::{Client, RunningBridge};
 use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui, Vec2};
-use setup::{Installed, ModelCheck, Settings};
-use std::path::Path;
+use setup::{Installed, ModelCheck, PythonReadiness, Settings};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -31,6 +33,9 @@ const CAUTION: Color32 = Color32::from_rgb(118, 72, 25);
 const ERROR: Color32 = Color32::from_rgb(133, 46, 40);
 
 const COMFY_GUIDE: &str = "https://docs.comfy.org/installation/manual_install";
+const COMFY_DOWNLOAD: &str = "https://comfy.org/download";
+const CLAUDE_SETUP: &str = "https://code.claude.com/docs/en/quickstart";
+const CODEX_SETUP: &str = "https://openai.com/codex/get-started/";
 const MODEL_GUIDE: &str =
     "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/pipelines.md";
 const CLIENT_GUIDE: &str =
@@ -38,20 +43,25 @@ const CLIENT_GUIDE: &str =
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
+    Prerequisites,
     Comfy,
     Models,
     Install,
     Connect,
 }
 
-const STEPS: [(Step, &str, &str); 4] = [
-    (Step::Comfy, "01", "ComfyUI"),
-    (Step::Models, "02", "Models"),
-    (Step::Install, "03", "Install"),
-    (Step::Connect, "04", "Connect"),
+const STEPS: [(Step, &str, &str); 5] = [
+    (Step::Prerequisites, "01", "Prerequisites"),
+    (Step::Comfy, "02", "ComfyUI"),
+    (Step::Models, "03", "Models"),
+    (Step::Install, "04", "Install"),
+    (Step::Connect, "05", "Connect"),
 ];
 
 enum Event {
+    PythonChecked(PythonReadiness),
+    #[cfg(windows)]
+    PythonInstallFinished(Result<PythonReadiness, String>),
     Checked(CheckOutcome),
     Discovered(Vec<discovery::Instance>),
     Verified(Option<RunningBridge>, Result<serde_json::Value, String>),
@@ -68,6 +78,15 @@ enum CheckOutcome {
 
 struct Installer {
     step: Step,
+    python: Option<PythonReadiness>,
+    selected_python: Option<PathBuf>,
+    python_check_failed: bool,
+    #[cfg(windows)]
+    python_install_offer: bool,
+    #[cfg(windows)]
+    python_installing: bool,
+    #[cfg(windows)]
+    python_install_error: Option<String>,
     settings: Settings,
     check: Option<CheckOutcome>,
     worker: Option<Receiver<Event>>,
@@ -115,7 +134,16 @@ impl Installer {
             }
         });
         let mut installer = Self {
-            step: Step::Comfy,
+            step: Step::Prerequisites,
+            python: None,
+            selected_python: None,
+            python_check_failed: false,
+            #[cfg(windows)]
+            python_install_offer: false,
+            #[cfg(windows)]
+            python_installing: false,
+            #[cfg(windows)]
+            python_install_error: None,
             settings: setup::default_settings(),
             check: None,
             worker: None,
@@ -137,9 +165,7 @@ impl Installer {
             verify_codex: true,
             codex_profile: String::new(),
         };
-        if setup::existing_install().is_none() {
-            installer.start_discovery(ctx);
-        }
+        installer.check_python(ctx);
         installer
     }
 
@@ -161,6 +187,57 @@ impl Installer {
                     self.check,
                     Some(CheckOutcome::Models(_, false) | CheckOutcome::Offline(_))
                 ))
+    }
+
+    fn python_ready(&self) -> bool {
+        matches!(self.python, Some(PythonReadiness::Ready { .. }))
+    }
+
+    fn check_python(&mut self, ctx: &egui::Context) {
+        let selected = self.selected_python.clone();
+        let ctx = ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.python = None;
+        self.python_check_failed = false;
+        #[cfg(windows)]
+        {
+            self.python_install_error = None;
+        }
+        if thread::Builder::new()
+            .name("check-python".into())
+            .spawn(move || {
+                let status = setup::check_python(selected.as_deref());
+                let _ = sender.send(Event::PythonChecked(status));
+                ctx.request_repaint();
+            })
+            .is_ok()
+        {
+            self.worker = Some(receiver);
+        } else {
+            self.python_check_failed = true;
+        }
+    }
+
+    #[cfg(windows)]
+    fn start_python_install(&mut self, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.python_install_error = None;
+        if thread::Builder::new()
+            .name("install-python-prerequisite".into())
+            .spawn(move || {
+                let result =
+                    python_install::install_latest_python().map(|()| setup::check_python(None));
+                let _ = sender.send(Event::PythonInstallFinished(result));
+                ctx.request_repaint();
+            })
+            .is_ok()
+        {
+            self.worker = Some(receiver);
+            self.python_installing = true;
+        } else {
+            self.python_install_error = Some("Could not open the Windows Python installer. Use the official Python download below.".into());
+        }
     }
 
     fn start_discovery(&mut self, ctx: &egui::Context) {
@@ -318,6 +395,7 @@ impl Installer {
 
     fn start_install(&mut self, ctx: &egui::Context) {
         let settings = self.settings.clone();
+        let selected_python = self.selected_python.clone();
         let ctx = ctx.clone();
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -327,10 +405,15 @@ impl Installer {
         match thread::Builder::new()
             .name("install-render-bridge".into())
             .spawn(move || {
-                let result = setup::install(&settings, &worker_cancel, |message| {
-                    let _ = sender.send(Event::Progress(message.into()));
-                    ctx.request_repaint();
-                });
+                let result = setup::install(
+                    &settings,
+                    selected_python.as_deref(),
+                    &worker_cancel,
+                    |message| {
+                        let _ = sender.send(Event::Progress(message.into()));
+                        ctx.request_repaint();
+                    },
+                );
                 let _ = sender.send(Event::Finished(result));
                 ctx.request_repaint();
             }) {
@@ -345,6 +428,22 @@ impl Installer {
     fn receive_updates(&mut self) {
         while let Some(receiver) = &self.worker {
             match receiver.try_recv() {
+                Ok(Event::PythonChecked(status)) => {
+                    self.python = Some(status);
+                    self.worker = None;
+                }
+                #[cfg(windows)]
+                Ok(Event::PythonInstallFinished(result)) => {
+                    self.worker = None;
+                    self.python_installing = false;
+                    match result {
+                        Ok(readiness) => {
+                            self.selected_python = None;
+                            self.python = Some(readiness);
+                        }
+                        Err(message) => self.python_install_error = Some(message),
+                    }
+                }
                 Ok(Event::Checked(result)) => {
                     self.check = Some(result);
                     self.worker = None;
@@ -398,7 +497,13 @@ impl Installer {
                     self.install_cancel = None;
                     self.searching = false;
                     let message = "Setup stopped unexpectedly. You can try this step again.".into();
-                    if self.step == Step::Install {
+                    if self.step == Step::Prerequisites {
+                        self.python_check_failed = true;
+                        #[cfg(windows)]
+                        {
+                            self.python_installing = false;
+                        }
+                    } else if self.step == Step::Install {
                         self.install_error = Some(message);
                     } else if self.step == Step::Connect {
                         self.verification = Some(Err(message));
@@ -461,6 +566,181 @@ impl Installer {
             });
     }
 
+    fn prerequisites_screen(&mut self, ui: &mut Ui) {
+        header(
+            ui,
+            "Get ready to render",
+            "Set up a clean machine with Python and ComfyUI. Choose an agent when you are ready to connect.",
+        );
+        let idle = self.worker.is_none();
+        let ready = self.python_ready();
+        card(ui, |ui| {
+            field_label(ui, "Python 3.11 or newer");
+            if self.python_check_failed {
+                caption(ui, "Python could not be checked. Try the check again.");
+            } else if !idle {
+                #[cfg(windows)]
+                let installing = self.python_installing;
+                #[cfg(not(windows))]
+                let installing = false;
+                activity(
+                    ui,
+                    if installing {
+                        "Waiting for Windows Python setup to finish…"
+                    } else {
+                        "Checking Python and virtual environment support…"
+                    },
+                );
+            } else if let Some(readiness) = &self.python {
+                match readiness {
+                    PythonReadiness::Ready {
+                        version,
+                        executable,
+                    } => {
+                        ui.label(
+                            RichText::new(format!("Python {version} is ready"))
+                                .strong()
+                                .color(GREEN),
+                        );
+                        code_label(ui, &executable.to_string_lossy());
+                    }
+                    PythonReadiness::TooOld { version } => {
+                        ui.label(
+                            RichText::new(format!("Python {version} is too old"))
+                                .strong()
+                                .color(CAUTION),
+                        );
+                        caption(ui, "Install Python 3.11 or newer, then check again.");
+                    }
+                    PythonReadiness::MissingVenv { version } => {
+                        ui.label(
+                            RichText::new(format!(
+                                "Python {version} needs virtual environment support"
+                            ))
+                            .strong()
+                            .color(CAUTION),
+                        );
+                        caption(ui, python_venv_help());
+                    }
+                    PythonReadiness::Missing => {
+                        ui.label(
+                            RichText::new("Python was not found")
+                                .strong()
+                                .color(CAUTION),
+                        );
+                        caption(ui, "Install Python 3.11 or newer, then check again.");
+                    }
+                    PythonReadiness::InvalidSelection => {
+                        ui.label(
+                            RichText::new("This file could not be verified as Python")
+                                .strong()
+                                .color(CAUTION),
+                        );
+                        caption(
+                            ui,
+                            "Select the Python executable from an installation, or use automatic detection.",
+                        );
+                    }
+                }
+            }
+            if !ready {
+                caption(ui, "Python 3.13 is recommended for a new installation.");
+                #[cfg(windows)]
+                if setup::winget_available()
+                    && secondary(ui, "Install Python with WinGet", idle).clicked()
+                {
+                    self.python_install_offer = true;
+                }
+                let (label, url) = python_install_link();
+                ui.hyperlink_to(label, url);
+                #[cfg(target_os = "linux")]
+                if secondary(ui, "Copy Debian or Ubuntu command", true).clicked() {
+                    ui.ctx().copy_text(
+                        "sudo apt update && sudo apt install python3 python3-venv".into(),
+                    );
+                    self.copied =
+                        Some("Run the copied command in a terminal, then check Python again.");
+                }
+            }
+            #[cfg(windows)]
+            if let Some(message) = &self.python_install_error {
+                caption(ui, message);
+            }
+            ui.horizontal_wrapped(|ui| {
+                if secondary(ui, "Select Python executable", idle).clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title("Select your Python executable")
+                        .pick_file()
+                {
+                    self.selected_python = Some(path);
+                    self.check_python(ui.ctx());
+                }
+                if self.selected_python.is_some()
+                    && secondary(ui, "Use automatic detection", idle).clicked()
+                {
+                    self.selected_python = None;
+                    self.check_python(ui.ctx());
+                } else if ready && secondary(ui, "Check Python again", idle).clicked() {
+                    self.check_python(ui.ctx());
+                }
+            });
+            if let Some(message) = self.copied {
+                caption(ui, message);
+            }
+        });
+        card(ui, |ui| {
+            field_label(ui, "ComfyUI on this computer");
+            caption(
+                ui,
+                "Install Comfy Desktop, finish its setup, and start a local build. The next step checks its API and folders. You can also use a portable or manual installation.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.hyperlink_to("Get Comfy Desktop", COMFY_DOWNLOAD);
+                ui.hyperlink_to("Manual ComfyUI setup", COMFY_GUIDE);
+            });
+        });
+        card(ui, |ui| {
+            field_label(ui, "Agent client");
+            caption(
+                ui,
+                "Install and sign in to a client before you connect it. You can set up the Bridge first.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.hyperlink_to("Set up Claude Code", CLAUDE_SETUP);
+                ui.hyperlink_to("Set up Codex", CODEX_SETUP);
+            });
+        });
+        if let Some(installed) = setup::existing_install()
+            && secondary(ui, "Open existing setup", idle).clicked()
+        {
+            self.installed = Some(installed);
+            self.change_step(Step::Connect);
+        }
+        #[cfg(windows)]
+        if self.python_install_offer {
+            let prompt = egui::Modal::new(egui::Id::new("python-install-approval")).show(ui.ctx(), |ui| {
+                ui.set_width(340.0);
+                ui.heading("Install Python on this PC?");
+                caption(ui, "WinGet will request the latest available Python 3.13 patch for all users on this PC. Windows will ask for administrator approval.");
+                caption(ui, "You can cancel and use the official Python download instead.");
+                let mut approve = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    cancel = secondary(ui, "Cancel", true).clicked();
+                    approve = primary(ui, "Request administrator approval", true).clicked();
+                });
+                (approve, cancel)
+            });
+            let (approve, cancel) = prompt.inner;
+            if approve || cancel || prompt.should_close() {
+                self.python_install_offer = false;
+            }
+            if approve {
+                self.start_python_install(ui.ctx());
+            }
+        }
+    }
+
     fn comfy_screen(&mut self, ui: &mut Ui) {
         header(
             ui,
@@ -472,12 +752,6 @@ impl Installer {
         ui.horizontal_wrapped(|ui| {
             if secondary(ui, "Detect running ComfyUI", idle).clicked() {
                 self.start_discovery(ui.ctx());
-            }
-            if let Some(installed) = setup::existing_install()
-                && secondary(ui, "Open existing setup", idle).clicked()
-            {
-                self.installed = Some(installed);
-                self.change_step(Step::Connect);
             }
         });
         if !self.instances.is_empty() {
@@ -563,7 +837,8 @@ impl Installer {
             if self.can_continue() && secondary(ui, "Check again", idle).clicked() {
                 self.start_check(ui.ctx());
             }
-            ui.hyperlink_to("Install ComfyUI", COMFY_GUIDE);
+            ui.hyperlink_to("Get Comfy Desktop", COMFY_DOWNLOAD);
+            ui.hyperlink_to("Manual ComfyUI setup", COMFY_GUIDE);
             ui.hyperlink_to(
                 "Find your Comfy Desktop port and folders",
                 "https://docs.comfy.org/installation/desktop/usage/instance-management",
@@ -931,19 +1206,29 @@ impl Installer {
                         if self.running.is_none() && secondary(ui, "Change ComfyUI", true).clicked()
                         {
                             self.settings_changed();
-                            self.change_step(Step::Comfy);
+                            if self.python_ready() {
+                                self.change_step(Step::Comfy);
+                            } else {
+                                self.change_step(Step::Prerequisites);
+                                self.check_python(ctx);
+                            }
                         }
                     }
-                    if matches!(self.step, Step::Models | Step::Install)
+                    if matches!(self.step, Step::Comfy | Step::Models | Step::Install)
                         && secondary(ui, "Back", idle).clicked()
                     {
                         self.change_step(match self.step {
                             Step::Install => Step::Models,
-                            _ => Step::Comfy,
+                            Step::Models => Step::Comfy,
+                            _ => Step::Prerequisites,
                         });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (label, ready) = match self.step {
+                            Step::Prerequisites if self.python_ready() => {
+                                ("Continue to ComfyUI", idle)
+                            }
+                            Step::Prerequisites => ("Check Python again", idle),
                             Step::Comfy if self.can_continue() => ("Continue", idle),
                             Step::Comfy => (
                                 "Check ComfyUI",
@@ -960,6 +1245,13 @@ impl Installer {
                         };
                         if primary(ui, label, ready).clicked() {
                             match self.step {
+                                Step::Prerequisites if self.python_ready() => {
+                                    self.change_step(Step::Comfy);
+                                    if self.instances.is_empty() {
+                                        self.start_discovery(ctx);
+                                    }
+                                }
+                                Step::Prerequisites => self.check_python(ctx),
                                 Step::Comfy if self.can_continue() => {
                                     self.change_step(Step::Models)
                                 }
@@ -999,6 +1291,7 @@ impl eframe::App for Installer {
                 let step = self.step;
                 egui::ScrollArea::vertical()
                     .id_salt(match step {
+                        Step::Prerequisites => "prerequisites-page",
                         Step::Comfy => "comfy-page",
                         Step::Models => "models-page",
                         Step::Install => "install-page",
@@ -1006,12 +1299,40 @@ impl eframe::App for Installer {
                     })
                     .auto_shrink([false, false])
                     .show(ui, |ui| match step {
+                        Step::Prerequisites => self.prerequisites_screen(ui),
                         Step::Comfy => self.comfy_screen(ui),
                         Step::Models => self.models_screen(ui),
                         Step::Install => self.install_screen(ui),
                         Step::Connect => self.connect_screen(ui),
                     });
             });
+    }
+}
+
+fn python_install_link() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        (
+            "Get Python for Windows",
+            "https://www.python.org/downloads/windows/",
+        )
+    } else if cfg!(target_os = "macos") {
+        (
+            "Get Python for macOS",
+            "https://www.python.org/downloads/macos/",
+        )
+    } else {
+        (
+            "Python installation help",
+            "https://docs.python.org/3/using/unix.html",
+        )
+    }
+}
+
+fn python_venv_help() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "Install your distribution's virtual environment support for this Python. On Debian or Ubuntu, install python3-venv or the matching versioned package."
+    } else {
+        "Use the full Python installer from python.org, then choose Check Python again."
     }
 }
 

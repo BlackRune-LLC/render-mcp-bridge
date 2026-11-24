@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf, absolute};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +30,65 @@ const RUNTIME_FILES: [(&str, &str); 5] = [
     (REQUIREMENTS, REQUIREMENTS_TEXT),
     ("LICENSE", include_str!("../../LICENSE")),
 ];
-const PYTHON_VERSION_CHECK: &str = "import sys; sys.exit(sys.version_info < (3, 11))";
+const PYTHON_PREREQUISITE_CHECK: &str = r#"
+import json
+import sys
+
+version = list(sys.version_info[:3])
+venv_ready = False
+if tuple(version[:2]) >= (3, 11):
+    try:
+        import ensurepip
+        import venv
+        venv_ready = bool(ensurepip.version()) and callable(venv.EnvBuilder)
+    except Exception:
+        pass
+print(json.dumps({"version": version, "executable": sys.executable, "venv_ready": venv_ready}))
+"#;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PythonReadiness {
+    Ready {
+        version: String,
+        executable: PathBuf,
+    },
+    TooOld {
+        version: String,
+    },
+    MissingVenv {
+        version: String,
+    },
+    Missing,
+    InvalidSelection,
+}
+
+#[derive(Deserialize)]
+struct PythonProbe {
+    version: [u32; 3],
+    executable: PathBuf,
+    venv_ready: bool,
+}
+
+impl PythonProbe {
+    fn readiness(self) -> PythonReadiness {
+        let [major, minor, patch] = self.version;
+        let version = format!("{major}.{minor}.{patch}");
+        if (major, minor) < (3, 11) {
+            return PythonReadiness::TooOld { version };
+        }
+        if !self.venv_ready {
+            return PythonReadiness::MissingVenv { version };
+        }
+        if python_executable(&self.executable) {
+            PythonReadiness::Ready {
+                version,
+                executable: self.executable,
+            }
+        } else {
+            PythonReadiness::InvalidSelection
+        }
+    }
+}
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -403,40 +461,246 @@ pub(crate) fn quiet_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-fn usable_python(program: impl AsRef<OsStr>, arguments: &[&str], cancel: &AtomicBool) -> bool {
+fn python_executable(path: &Path) -> bool {
+    if !path.is_absolute() || !path.is_file() {
+        return false;
+    }
+    // These OS launchers can open an installer or app store on a clean machine.
+    #[cfg(windows)]
+    if path.components().any(|part| {
+        part.as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("WindowsApps"))
+    }) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    if path == Path::new("/usr/bin/python3") {
+        return false;
+    }
+    true
+}
+
+fn executable_on_path(name: &str, allowed: fn(&Path) -> bool) -> Vec<PathBuf> {
+    let Some(path) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    env::split_paths(&path)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .filter(|candidate| allowed(candidate))
+        .collect()
+}
+
+#[cfg(windows)]
+pub fn winget_available() -> bool {
+    environment_path("LOCALAPPDATA")
+        .map(|directory| directory.join("Microsoft/WindowsApps/winget.exe"))
+        .is_some_and(|path| path.is_file())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn versioned_python(
+    directory: &Path,
+    suffix: &str,
+    version: impl Fn(&str) -> Option<u32>,
+) -> Vec<PathBuf> {
+    let mut found: Vec<_> = fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let minor = version(entry.file_name().to_str()?)?;
+            let executable = entry.path().join(suffix);
+            python_executable(&executable).then_some((std::cmp::Reverse(minor), executable))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+fn python_candidates() -> Vec<(PathBuf, &'static [&'static str])> {
+    let mut programs = Vec::new();
+    #[cfg(windows)]
+    {
+        for name in ["python.exe", "python3.exe"] {
+            programs.extend(executable_on_path(name, python_executable));
+        }
+        if let Some(local) = environment_path("LOCALAPPDATA") {
+            programs.extend(versioned_python(
+                &local.join("Programs/Python"),
+                "python.exe",
+                |name| {
+                    name.strip_prefix("Python3")?
+                        .split('-')
+                        .next()?
+                        .parse()
+                        .ok()
+                },
+            ));
+            programs.extend(versioned_python(
+                &local.join("Python"),
+                "python.exe",
+                |name| {
+                    name.strip_prefix("pythoncore-3.")?
+                        .split(['-', '.'])
+                        .next()?
+                        .parse()
+                        .ok()
+                },
+            ));
+        }
+        for variable in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            if let Some(program_files) = environment_path(variable) {
+                programs.extend(versioned_python(&program_files, "python.exe", |name| {
+                    name.strip_prefix("Python")?
+                        .trim_start()
+                        .strip_prefix('3')?
+                        .trim_start_matches('.')
+                        .split('-')
+                        .next()?
+                        .parse()
+                        .ok()
+                }));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    for name in ["python3", "python"] {
+        programs.extend(executable_on_path(name, python_executable));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        programs.extend(
+            [
+                "/opt/homebrew/bin/python3",
+                "/usr/local/bin/python3",
+                "/Library/Developer/CommandLineTools/usr/bin/python3",
+                "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+            ]
+            .map(PathBuf::from),
+        );
+        programs.extend(versioned_python(
+            Path::new("/Library/Frameworks/Python.framework/Versions"),
+            "bin/python3",
+            |name| name.strip_prefix("3.")?.parse().ok(),
+        ));
+    }
+    let mut candidates = Vec::new();
+    for program in programs {
+        if !candidates.iter().any(|(known, _)| known == &program) && python_executable(&program) {
+            candidates.push((program, &[] as &[&str]));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut launchers = executable_on_path("py.exe", python_executable);
+        launchers.extend(environment_path("SystemRoot").map(|path| path.join("py.exe")));
+        launchers.extend(
+            environment_path("LOCALAPPDATA")
+                .map(|path| path.join("Programs/Python/Launcher/py.exe")),
+        );
+        for launcher in launchers {
+            if !candidates.iter().any(|(known, _)| known == &launcher)
+                && python_executable(&launcher)
+            {
+                candidates.push((launcher, &["-3"]));
+            }
+        }
+    }
+    candidates
+}
+
+fn probe_python(
+    program: &Path,
+    arguments: &[&str],
+    cancel: &AtomicBool,
+) -> Option<PythonReadiness> {
+    if !python_executable(program) {
+        return None;
+    }
+    let mut output = tempfile::tempfile().ok()?;
     let mut command = quiet_command(program);
-    command.args(arguments).args(["-c", PYTHON_VERSION_CHECK]);
+    command
+        .args(arguments)
+        .args(["-I", "-S", "-c", PYTHON_PREREQUISITE_CHECK])
+        .stdout(Stdio::from(output.try_clone().ok()?));
     run_install_stage(
         &mut command,
         cancel,
         "Checking Python",
         Duration::from_secs(8),
     )
-    .is_ok()
+    .ok()?;
+    output.rewind().ok()?;
+    let probe: PythonProbe = serde_json::from_reader(output.take(16 * 1024)).ok()?;
+    Some(probe.readiness())
 }
 
-fn python_for_creation(cancel: &AtomicBool) -> Result<Command, String> {
-    if let Some(program) = environment_path("RENDER_BRIDGE_PYTHON") {
-        let usable = usable_python(&program, &[], cancel);
-        check_cancel(cancel)?;
-        return usable.then(|| quiet_command(&program)).ok_or(
-            "RENDER_BRIDGE_PYTHON must name a working Python 3.11 or newer executable.".into(),
-        );
-    }
-    let candidates: &[(&str, &[&str])] = if cfg!(windows) {
-        &[("py", &["-3"]), ("python", &[]), ("python3", &[])]
-    } else {
-        &[("python3", &[]), ("python", &[])]
-    };
-    for &(program, arguments) in candidates {
-        if usable_python(program, arguments, cancel) {
-            let mut command = quiet_command(program);
-            command.args(arguments);
-            return Ok(command);
+fn resolve_python(selected: Option<&Path>, cancel: &AtomicBool) -> PythonReadiness {
+    let configured = environment_path("RENDER_BRIDGE_PYTHON");
+    if let Some(program) = selected.or(configured.as_deref()) {
+        if let Ok(path) = resolve_path(program)
+            && let Some(readiness) = probe_python(&path, &[], cancel)
+        {
+            return readiness;
         }
-        check_cancel(cancel)?;
+        // The environment override previously accepted a command name.
+        if selected.is_none()
+            && program.components().count() == 1
+            && let Some(mut name) = program.to_str().map(str::to_owned)
+        {
+            if cfg!(windows) && program.extension().is_none() {
+                name.push_str(".exe");
+            }
+            for path in executable_on_path(&name, python_executable) {
+                if let Some(readiness) = probe_python(&path, &[], cancel) {
+                    return readiness;
+                }
+            }
+        }
+        return PythonReadiness::InvalidSelection;
     }
-    Err("Python 3.11 or newer was not found. Install Python, reopen setup, or set RENDER_BRIDGE_PYTHON to its executable.".into())
+    let mut best = PythonReadiness::Missing;
+    for (program, arguments) in python_candidates() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match probe_python(&program, arguments, cancel) {
+            Some(ready @ PythonReadiness::Ready { .. }) => return ready,
+            Some(status @ PythonReadiness::MissingVenv { .. }) => best = status,
+            Some(status @ PythonReadiness::TooOld { .. }) if best == PythonReadiness::Missing => {
+                best = status
+            }
+            _ => {}
+        }
+    }
+    best
+}
+
+pub fn check_python(selected: Option<&Path>) -> PythonReadiness {
+    resolve_python(selected, &AtomicBool::new(false))
+}
+
+fn python_for_creation(selected: Option<&Path>, cancel: &AtomicBool) -> Result<Command, String> {
+    let readiness = resolve_python(selected, cancel);
+    check_cancel(cancel)?;
+    let message = match readiness {
+        PythonReadiness::Ready { executable, .. } => return Ok(quiet_command(executable)),
+        PythonReadiness::Missing => "Python 3.11 or newer was not found.",
+        PythonReadiness::TooOld { .. } => {
+            "This Python version is too old. Use Python 3.11 or newer."
+        }
+        PythonReadiness::MissingVenv { .. } => {
+            "Python needs venv and ensurepip. On Debian or Ubuntu, install the matching python3-venv package."
+        }
+        PythonReadiness::InvalidSelection => {
+            "The selected Python executable could not be used. Choose an installed Python executable."
+        }
+    };
+    Err(format!(
+        "{message} Return to Prerequisites to install or select Python."
+    ))
 }
 
 pub(crate) fn venv_python(app_dir: &Path) -> PathBuf {
@@ -667,11 +931,14 @@ fn activate_runtime(
 
 pub fn install(
     settings: &Settings,
+    selected_python: Option<&Path>,
     cancel: &AtomicBool,
     mut progress: impl FnMut(&str),
 ) -> Result<Installed, String> {
     check_cancel(cancel)?;
     let settings = validate_settings(settings)?;
+    progress("Checking Python 3.11 or newer.");
+    let mut command = python_for_creation(selected_python, cancel)?;
     let data_dir = data_dir()?;
     create_private_dir(&data_dir)
         .map_err(|_| "Could not create the Render Bridge data directory.")?;
@@ -697,8 +964,6 @@ pub fn install(
         atomic_write(&installed.app_dir.join(name), content.as_bytes())
             .map_err(|_| format!("Could not stage {name}. Check the app directory permissions."))?;
     }
-    progress("Looking for Python 3.11 or newer.");
-    let mut command = python_for_creation(cancel)?;
     progress("Preparing a fresh Python environment.");
     run_install_stage(
         command
@@ -767,6 +1032,94 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn python_readiness_distinguishes_versions_and_environment_support() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("python");
+        fs::write(&executable, "").unwrap();
+        let probe = |version, venv_ready| PythonProbe {
+            version,
+            executable: executable.clone(),
+            venv_ready,
+        };
+        assert_eq!(
+            probe([3, 10, 9], true).readiness(),
+            PythonReadiness::TooOld {
+                version: "3.10.9".into()
+            },
+        );
+        assert_eq!(
+            probe([3, 13, 2], false).readiness(),
+            PythonReadiness::MissingVenv {
+                version: "3.13.2".into()
+            },
+        );
+        assert_eq!(
+            probe([3, 11, 0], true).readiness(),
+            PythonReadiness::Ready {
+                version: "3.11.0".into(),
+                executable: executable.clone()
+            },
+        );
+        fs::remove_file(&executable).unwrap();
+        assert_eq!(
+            probe([3, 11, 0], true).readiness(),
+            PythonReadiness::InvalidSelection
+        );
+    }
+
+    #[test]
+    fn unavailable_explicit_python_does_not_fall_back_to_a_different_installation() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            check_python(Some(&directory.path().join("missing-python"))),
+            PythonReadiness::InvalidSelection,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn never_runs_an_execution_alias_from_windowsapps() {
+        let directory = tempfile::tempdir().unwrap();
+        let aliases = directory.path().join("Microsoft/wInDoWsApPs");
+        fs::create_dir_all(&aliases).unwrap();
+        let alias = aliases.join("python.exe");
+        fs::write(&alias, "fixture execution alias").unwrap();
+        assert_eq!(
+            check_python(Some(&alias)),
+            PythonReadiness::InvalidSelection
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn both_check_and_install_resolve_the_chosen_absolute_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("python");
+        let output = serde_json::json!({
+            "version": [3, 13, 4],
+            "executable": executable,
+            "venv_ready": true,
+        })
+        .to_string()
+        .replace('\'', "'\"'\"'");
+        fs::write(&executable, format!(
+            "#!/bin/sh\n[ \"$1\" = -I ] && [ \"$2\" = -S ] && [ \"$3\" = -c ] || exit 1\nprintf '%s\\n' '{output}'\n"
+        )).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            check_python(Some(&executable)),
+            PythonReadiness::Ready {
+                version: "3.13.4".into(),
+                executable: executable.clone()
+            },
+        );
+        let command = python_for_creation(Some(&executable), &AtomicBool::new(false)).unwrap();
+        assert_eq!(command.get_program(), executable.as_os_str());
+    }
 
     #[test]
     fn upgrade_activation_keeps_previous_runtime_settings_and_token() {

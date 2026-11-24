@@ -6,40 +6,54 @@ A self-hosted image MCP server that lets your agents do the work in ComfyUI. You
 
 ## Install and run
 
-Docker is optional. The desktop installer and terminal setup run Render Bridge with Python 3.11 or newer. Install and start ComfyUI separately. Building the desktop wizard from source also requires Rust and the native build tools listed below.
+Start here if Python, ComfyUI, and your agent client are all new to this machine. Render Bridge needs a full Python 3.11 or newer installation with virtual environment support, plus a local ComfyUI build on the same computer. Its standard setup runs without Docker. Allow internet access for the installers, Python packages, and any model weights you choose.
 
-1. Install and start [ComfyUI](https://docs.comfy.org/installation/manual_install) on the same host. Confirm its API responds at `http://127.0.0.1:8188/system_stats`. Find the ComfyUI directory that contains its `input` and `output` folders. For a Windows portable install, this is usually the inner `ComfyUI` directory.
-2. Install Python 3.11 or later. Clone this repository or download its source, then open a terminal in that directory.
+### First-time prerequisites
 
-```sh
-git clone https://github.com/BlackRune-LLC/render-mcp-bridge.git
-cd render-mcp-bridge
-```
+#### 1. Install Python for Render Bridge
+
+Comfy Desktop and ComfyUI Portable manage Python for their own builds. Install a full Python distribution for Render Bridge so it can create its own virtual environment.
+
+- **Windows.** If the wizard offers **Install Python with WinGet**, review its request to install Python for all users. Select **Request administrator approval** and follow the Windows prompts. WinGet selects the latest available Python 3.13 package from Microsoft's official feed. To install it yourself, choose **Get Python for Windows** or download the [official Python install manager](https://www.python.org/downloads/windows/). Run its installer, then open PowerShell and run `py install 3.13`. Open a fresh PowerShell window and check `py -3 --version` and `py -3 -c "import venv, ensurepip"`. [Using Python on Windows](https://docs.python.org/3/using/windows.html) · [WinGet install command](https://learn.microsoft.com/en-us/windows/package-manager/winget/install)
+- **macOS.** Run the signed universal2 `.pkg` from the [Python macOS downloads page](https://www.python.org/downloads/macos/). Open a fresh Terminal window and check `python3 --version` and `python3 -c "import venv, ensurepip"`. [Using Python on macOS](https://docs.python.org/3/using/mac.html)
+- **Linux.** Use your distribution's packages for Python and virtual environments. On Debian or Ubuntu, run `sudo apt update` and `sudo apt install python3 python3-venv`. Check `python3 --version` and `python3 -c "import venv, ensurepip"`. If the default Python is older than 3.11, look for a newer version and its matching `venv` package from your distribution, such as `python3.13` and `python3.13-venv`. Install them alongside the default Python and select the newer interpreter in the wizard. [Debian's virtual environment package](https://packages.debian.org/bookworm/python3-venv) · [Using Python on Linux](https://docs.python.org/3/using/unix.html)
+
+#### 2. Install and start ComfyUI
+
+Get [Comfy Desktop from Comfy Org](https://comfy.org/download), complete its first-run setup to install a **local build**, and wait for it to start. Check the hardware and free disk space shown in its setup screen. Comfy Desktop offers Windows x64, Windows ARM64 with NVIDIA, Apple silicon macOS, and Linux x64 installers. [Comfy Desktop setup](https://docs.comfy.org/installation/desktop/overview)
+
+Use [ComfyUI Portable for Windows](https://docs.comfy.org/installation/comfyui_portable_windows) if you prefer a portable installation, or use [ComfyUI's manual setup](https://docs.comfy.org/installation/manual_install) for hardware or platforms that need another path. Follow ComfyUI's upstream instructions for your GPU, drivers, and launch command. Keep the local build running while using Render Bridge.
+
+#### 3. Choose your agent client and first pipeline
+
+Install [Claude Code](https://code.claude.com/docs/en/quickstart) or [Codex](https://learn.chatgpt.com/docs/codex/cli) on the machine where your agent will run. Complete that client's sign-in in its own app or terminal. You can set up the bridge and check its connection before downloading models. Before your first render, choose a [starter pipeline](docs/pipelines.md#recommended-first-pipeline) and download its listed weights. The [accounts guide](docs/pipelines.md#accounts-and-credentials) covers gated models and hosted nodes.
 
 ### Desktop installer
 
-[Download Render Bridge Setup v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe). Open the downloaded executable after installing ComfyUI and Python 3.11 or later. The executable is unsigned. [Release notes, checksum, and third-party notices](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/tag/v0.1.0)
+[Download Render Bridge Setup v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe). The executable is unsigned and uses the Microsoft Visual C++ x64 runtime. If the runtime is missing, install the [x64 Redistributable from Microsoft](https://aka.ms/vc14/vc_redist.x64.exe) before opening setup. [Release notes, checksum, and third-party notices](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/tag/v0.1.0)
 
-The Windows v0.1.0 download uses the original wizard. Build from the current source to use ComfyUI detection, **Start & Verify**, and the shortcut checkbox described below.
+The Windows v0.1.0 download uses the original wizard. Complete the prerequisites above before opening it. The following flow is for a wizard built from the current source.
 
-1. Start ComfyUI, then open the wizard. It checks the selected loopback address, standard ComfyUI addresses, and port hints from current Comfy Desktop builds. Choose your build if several are detected. If its paths cannot be confirmed from its launch settings, copy the actual port from the build's **Overview** and its input and output locations from **Folders**. [Comfy Desktop build settings](https://docs.comfy.org/installation/desktop/usage/instance-management)
+1. Open the wizard. On **Prerequisites**, check Python or follow the official download links. After installing Python, choose **Check Python again**. If it still isn't detected, use **Select Python executable** or reopen the wizard so it sees your updated PATH. Install and start a local ComfyUI build, then continue. On the **ComfyUI** screen, choose your build if several are detected. If its paths cannot be confirmed from its launch settings, copy the port from the build's **Overview** and its input and output locations from **Folders**. [Comfy Desktop build settings](https://docs.comfy.org/installation/desktop/usage/instance-management)
 2. Select **Check ComfyUI**. The wizard compares reported folders and checks starter model files. If the API cannot report absolute paths, as with a typical Windows portable launch, browse to the inner `ComfyUI` folder. Setup checks whether ComfyUI can read a temporary marker in each selected folder and removes the markers afterward. Open **Separate input and output folders** when your build uses different locations. If the wizard still cannot confirm the pairing, verify the paths manually or explicitly continue offline.
 3. Review the starter pipelines. The Models screen groups the files for Z-Image Turbo and NetaYume, shows which are available, and links to each download and its ComfyUI folder. You can add weights later. Select **Install Render Bridge** to set up the server and its Python environment. Setup checks a new runtime in its own directory before activating it. If an update fails or is cancelled, the previous runtime stays usable with the same token. Select **Create a Gaming Mode shortcut** before installing if you want one.
 4. Select **Start & Verify** with **Claude Code**, **Codex**, or both checked. The wizard starts a local Bridge and makes an authenticated `server_status` call without rendering. It also checks the saved user settings for the selected clients. If you run Codex with a named profile, enter its name to check that file too. If an entry is missing, add it using the displayed endpoint and private token file, following [the client instructions](#connect-an-mcp-client). Select **Verify again**, then open a fresh client session to test that client's effective configuration.
 
-Use **Open existing setup** to return to Connect without reinstalling. **Stop Bridge** or closing the wizard stops its Bridge session. To keep the Bridge running after closing setup, use **Shutdown and terminal commands** to copy the start command. Press **Ctrl+C** in that terminal when you want to stop it.
+Use **Open existing setup** on **Prerequisites** to return to Connect with your installed Bridge runtime. **Stop Bridge** or closing the wizard stops its Bridge session. To keep the Bridge running after closing setup, use **Shutdown and terminal commands** to copy the start command. Press **Ctrl+C** in that terminal when you want to stop it.
 
 #### Build the desktop installer
 
-Install a current [Rust toolchain](https://www.rust-lang.org/tools/install) and your platform's native build tools. Start the wizard from your checkout.
+Install a current [Rust toolchain](https://www.rust-lang.org/tools/install) and your platform's native build tools. Download and extract the source archive or use [Git](https://git-scm.com/downloads) to clone the repository. Open a terminal in the extracted folder or checkout and start the wizard.
 
 ```sh
 cargo run --locked --manifest-path installer/Cargo.toml
 ```
 
-To build the standalone setup executable for the current platform, run `cargo build --release --locked --manifest-path installer/Cargo.toml`. The binary is in `installer/target/release/`. The packaged binary includes the bridge source and the pinned requirements. Installing those Python dependencies needs access to your configured package index.
+On Windows x64, use `./installer/build-windows.ps1` from PowerShell to build the standalone release executable at `installer/target/x86_64-pc-windows-msvc/release/render-bridge-setup.exe`. On macOS or Linux, run `cargo build --release --locked --manifest-path installer/Cargo.toml` and find the binary in `installer/target/release/`. The packaged binary includes the bridge source and the pinned requirements. Installing those Python dependencies needs access to your configured package index.
 
 Windows x64 has a downloadable installer. macOS and Linux use the native source build instructions below. See the [release checklist](docs/releases.md) for signing and clean-machine verification.
+
+**Windows source builds.** Install the MSVC C++ build tools and a Windows SDK alongside the x64 MSVC Rust toolchain. [Rust's Windows build prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html)
 
 **macOS.** Build on the target Mac using its native Rust toolchain. Install the Xcode Command Line Tools with `xcode-select --install` if needed. Launch the installer from Terminal so it inherits your Python path. If setup cannot find your Python, set `RENDER_BRIDGE_PYTHON` to the absolute executable path in that terminal before launching. For ComfyUI Desktop, choose the shared directory that contains `input` and `output`, typically `~/ComfyUI-Shared`. [Rust macOS requirements](https://doc.rust-lang.org/rustc/platform-support/apple-darwin.html) · [ComfyUI Desktop on macOS](https://docs.comfy.org/installation/desktop/macos)
 
@@ -47,7 +61,7 @@ Windows x64 has a downloadable installer. macOS and Linux use the native source 
 
 ### Terminal installer
 
-Use the wizard for a bridge and a ComfyUI API running on the same machine. It checks the data directory, the local API, and the starter model filenames. With your confirmation, it creates or updates the bridge's Python virtual environment and saves the ComfyUI path and URL in your user data directory. Use the model guide for any weights or nodes it flags as missing.
+For terminal setup, finish the [first-time prerequisites](#first-time-prerequisites), then download and extract the source archive or clone the repository. Run the commands below in the source folder. The terminal setup checks the data directory, the local API, and the starter model filenames. With your confirmation, it creates or updates the bridge's Python virtual environment and saves the ComfyUI path and URL in your user data directory. Use the model guide for any weights or nodes it flags as missing.
 
 **Windows PowerShell**
 
@@ -159,7 +173,7 @@ Turning gaming mode on pauses new GPU work through the MCP server. If ComfyUI's 
 
 Give the following prompt to an agent with terminal access on the machine where you want to run the server.
 
-> Set up Render Bridge on this machine using the README and pipeline guide at https://github.com/BlackRune-LLC/render-mcp-bridge. Find my ComfyUI installation, check its API, and identify its data directory. If ComfyUI is missing, use its official installation guide. Walk me through the Rust desktop installer if I can use the GUI, the terminal installer if I can use an interactive shell, or manual setup if I need to run the steps separately. Register the server in the user-scope MCP config for the client I actually use. Preserve existing entries and keep tokens in private user settings. Never display tokens, put them on a command line, or ask me to send them in chat. Ask me to complete any required sign-in or gated-model agreement in my browser or terminal. Recommend one pipeline for my hardware, identify its exact model files and nodes, and ask before installing extra nodes, downloading weights, or generating anything. In a fresh client session, verify `server_status`, `list_jobs`, and `list_models`. Show me the launch, gaming-mode, and first-render commands.
+> Set up Render Bridge on this machine using the README and pipeline guide at https://github.com/BlackRune-LLC/render-mcp-bridge. Start with its first-time prerequisites. Check for Python 3.11 or newer with virtual environment support. If it is missing, guide me through the official Python installer or distribution packages for my OS. Ask before starting a machine-wide install and let me approve any operating system prompt myself. Find my local ComfyUI build, check its API, and identify its data directory. If it is missing, help me choose and start a local build using the official ComfyUI instructions. Walk me through the Rust desktop wizard, the terminal installer, or manual setup according to the tools available. Register the server in the user-scope MCP config for the client I use. Preserve existing entries and keep tokens in private user settings. Never display tokens, put them on a command line, or ask me to send them in chat. Ask me to complete any required client sign-in or gated-model agreement in my own app, browser, or terminal. Recommend one pipeline for my hardware, identify its exact model files and nodes, and ask before installing extra nodes, downloading weights, or generating anything. In a fresh client session, verify `server_status`, `list_jobs`, and `list_models`. Show me the launch, gaming-mode, and first-render commands.
 
 ## License
 

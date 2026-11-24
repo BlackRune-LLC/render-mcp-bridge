@@ -2426,6 +2426,7 @@ dependencies = [
 name = "render-bridge-setup"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "eframe",
  "libc",
  "rfd",
