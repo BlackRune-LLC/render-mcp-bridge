@@ -6,7 +6,7 @@ Render Bridge runs locally and sends no telemetry or crash reports to BlackRune.
 
 [Release notes](CHANGELOG.md) · [Support](#support)
 
-[Download v0.1.0 for Windows x64 (unsigned)](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Windows control panel](#windows-control-panel) · [Connect an MCP client](#connect-an-mcp-client) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to set it up](#ask-your-agent-to-set-it-up)
+[Download for Windows x64 (unsigned)](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/latest/download/RenderBridgeSetup.exe) · [Install from source](#install-from-source) · [Ask your agent to set it up](#ask-your-agent-to-set-it-up) · [Windows control panel](#windows-control-panel) · [Connect an MCP client](#connect-an-mcp-client) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline)
 
 ## Install and run
 
@@ -34,9 +34,9 @@ Choose a client with authenticated Streamable HTTP support on the device where y
 
 ### Desktop installer
 
-[Download Render Bridge Setup v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe). The executable is unsigned and uses the Microsoft Visual C++ x64 runtime. If the runtime is missing, install the [x64 Redistributable from Microsoft](https://aka.ms/vc14/vc_redist.x64.exe) before opening setup. [Release notes, checksum, and third-party notices](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/tag/v0.1.0)
+[Download Render Bridge Setup for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/latest/download/RenderBridgeSetup.exe). The executable is unsigned. Verify it against the published SHA-256 before opening setup. [Release notes, checksum, and third-party notices](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/latest)
 
-The Windows v0.1.0 download uses the original wizard. Complete the prerequisites above before opening it. Build the installer from current source for the following setup flow and the compact Windows control panel.
+If you are using v0.1.0, complete the prerequisites before opening its original wizard. If that version reports a missing Visual C++ runtime, install the [x64 Redistributable from Microsoft](https://aka.ms/vc14/vc_redist.x64.exe). The steps below describe the current wizard.
 
 1. Open the wizard. On **Prerequisites**, check Python or follow the official download links. After installing Python, choose **Check Python again**. If it still isn't detected, use **Select Python executable** or reopen the wizard so it sees your updated PATH. Install and start a local ComfyUI build, then continue. On the **ComfyUI** screen, choose your build if several are detected. If its paths cannot be confirmed from its launch settings, copy the port from the build's **Overview** and its input and output locations from **Folders**. [Comfy Desktop build settings](https://docs.comfy.org/installation/desktop/usage/instance-management)
 2. Select **Check ComfyUI**. The wizard compares reported folders and checks starter model files. If the API cannot report absolute paths, as with a typical Windows portable launch, browse to the inner `ComfyUI` folder. Setup checks whether ComfyUI can read a temporary marker in each selected folder and removes the markers afterward. Open **Separate input and output folders** when your build uses different locations. If the wizard still cannot confirm the pairing, verify the paths manually or explicitly continue offline.
@@ -63,7 +63,15 @@ In the installer built from current source, choose **Open Render Bridge** on **C
 - **Hide to tray** keeps Render Bridge in the Windows notification area. Click its icon to reopen the panel. If the icon is in the overflow, open **Show hidden icons** first.
 - Select **Connect** to reopen **Connect an agent**, copy connection details, or rotate the token after stopping the server. [Connect after installation](docs/connections.md#connect-after-installation)
 - In **Settings**, turn on **Start hidden when I sign in** to open Render Bridge in the notification area after you sign in to Windows. Use **Start server** in the panel when you want the Render Bridge MCP server to run.
-- Select **Update** to check the official GitHub repository for a stable Windows build. Choose **Install update** when a newer version is available. A preview with the same version number can use **Install published build** when the official installer differs. Render Bridge verifies the download and its Windows signature, checks the queue and its server session, and keeps your settings, ComfyUI address, and token.
+- Select **Update** to check the official GitHub repository for a stable Windows build. When a build is available, select **Open GitHub download** and follow the manual update steps. The panel also detects a published build that differs from your preview, even if both have the same version number. [Update manually on Windows](#update-manually-on-windows)
+
+#### Update manually on Windows
+
+1. Download `RenderBridgeSetup.exe` and its SHA-256 checksum from the [official GitHub release](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/latest). Windows releases are unsigned. In PowerShell, run `Get-FileHash -Algorithm SHA256 .\RenderBridgeSetup.exe` in your download folder and compare the result with the published checksum before opening setup.
+2. Let active jobs finish, stop the Render Bridge server, and exit the Render Bridge app from its notification-area menu.
+3. Run setup, select the same ComfyUI build and Render Bridge installation folder, and choose **Install Render Bridge**. Reopen the panel and check the new version and agent connection. The update keeps your settings, ComfyUI address, and token.
+
+The optional **Install signed build** action requires a valid Windows signature and checks the download and queue before starting the installer.
 
 #### Storage and configuration
 
@@ -85,7 +93,7 @@ cargo run --locked --manifest-path installer/Cargo.toml
 
 On Windows x64, use `./installer/build-windows.ps1` from PowerShell to build the standalone release executable at `installer/target/x86_64-pc-windows-msvc/release/render-bridge-setup.exe`. On macOS or Linux, run `cargo build --release --locked --manifest-path installer/Cargo.toml` and find the binary in `installer/target/release/`. The packaged binary includes the bridge source and the pinned requirements. Installing those Python dependencies needs access to your configured package index.
 
-Windows x64 has a downloadable installer. macOS and Linux use the native source build instructions below. See the [release checklist](docs/releases.md) for signing and clean-machine verification.
+Windows x64 has a downloadable installer. macOS and Linux use the native source build instructions below. See the [release checklist](docs/releases.md) for checksums and clean-machine verification.
 
 **Windows source builds.** Install the MSVC C++ build tools and a Windows SDK alongside the x64 MSVC Rust toolchain. [Rust's Windows build prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html)
 
@@ -93,31 +101,45 @@ Windows x64 has a downloadable installer. macOS and Linux use the native source 
 
 **Linux.** Use your distro's native build packages. On Debian or Ubuntu, follow the [eframe build prerequisites](https://github.com/emilk/egui/blob/0.33.3/crates/eframe/README.md). On a minimal X11 install, check for `libxcursor1`, `libxi6`, `libxrandr2`, and `libxkbcommon-x11-0`. Install `python3-venv` if you use the distro's Python and need virtual environment support. Run the wizard in an X11 or Wayland desktop session with OpenGL. The Browse button uses the desktop's file chooser portal. Install the portal backend for your desktop session if you need it, or enter the ComfyUI path directly. [Linux native dialogs](https://docs.rs/rfd/0.16.0/rfd/#xdg-desktop-portal-backend)
 
-### Terminal installer
+### Install from source
 
-For terminal setup, finish the [first-time prerequisites](#first-time-prerequisites), then download and extract the source archive or clone the repository. Run the commands below in the source folder. The terminal setup checks the data directory, the local API, and the starter model filenames. With your confirmation, it creates or updates the bridge's Python virtual environment and saves the ComfyUI path and URL in your user data directory. Use the model guide for any weights or nodes it flags as missing.
+Install [Git](https://git-scm.com/downloads), complete the [first-time prerequisites](#first-time-prerequisites), and start a local ComfyUI build. The terminal installer creates its own Python virtual environment with the dependencies from the repository. Rust is needed only to [build the desktop installer](#build-the-desktop-installer).
 
-For a ComfyUI build with separate folders, set `COMFY_INPUT_DIR` and `COMFY_OUTPUT_DIR` to their absolute paths before running `setup_render_bridge.py install` so setup can check and save them.
+In setup, enter the directory that owns the selected ComfyUI build's `input` and `output` folders and its local API address. The usual API address is `http://127.0.0.1:8188`. If the build uses separate folders, set `COMFY_INPUT_DIR` and `COMFY_OUTPUT_DIR` to their absolute paths before running the install command. [Configuration reference](docs/configuration.md#terminal-and-server-options)
 
 **Windows PowerShell**
 
 ```powershell
-py -3 setup_render_bridge.py
-py -3 setup_render_bridge.py start
+git clone https://github.com/BlackRune-LLC/render-mcp-bridge.git
+Set-Location render-mcp-bridge
+py -3 .\setup_render_bridge.py install
+```
+
+After setup finishes, start the server in the same folder.
+
+```powershell
+py -3 .\setup_render_bridge.py start
 ```
 
 **macOS or Linux**
 
 ```sh
-python3 setup_render_bridge.py
+git clone https://github.com/BlackRune-LLC/render-mcp-bridge.git
+cd render-mcp-bridge
+python3 setup_render_bridge.py install
+```
+
+After setup finishes, start the server in the same folder.
+
+```sh
 python3 setup_render_bridge.py start
 ```
 
-The `start` command uses the saved settings and runs the Bridge in your terminal. Setup prints the private token file path. Leave the server running and use the [copy-and-paste connection prompt](docs/connections.md#paste-a-connection-prompt).
+If you already have a checkout, run the install and start commands from it. When using a custom Render Bridge data folder, pass `--data-dir` with the same folder before `install` and `start`. Keep the server terminal open while your agent uses Render Bridge. Use the private token file path printed by setup to [connect your client](docs/connections.md#paste-a-connection-prompt).
 
-### Manual setup
+### Manual setup without the setup script
 
-Follow the [model and node guide](docs/pipelines.md) to install the files for one pipeline. The [accounts section](docs/pipelines.md#accounts-and-credentials) explains when Hugging Face or a provider login is needed. Set `COMFY_ROOT` to the directory that owns the `input` and `output` folders, including for ComfyUI Desktop or a custom data location.
+From the source folder, create a virtual environment and install the Python requirements. Replace the ComfyUI path and API URL with the values for your running local build.
 
 **Windows PowerShell**
 
@@ -125,6 +147,7 @@ Follow the [model and node guide](docs/pipelines.md) to install the files for on
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 $env:COMFY_ROOT = 'C:\path\to\ComfyUI'
+$env:COMFY_URL = 'http://127.0.0.1:8188'
 .\.venv\Scripts\python.exe comfy_mcp_server.py
 ```
 
@@ -134,8 +157,11 @@ $env:COMFY_ROOT = 'C:\path\to\ComfyUI'
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 export COMFY_ROOT="/path/to/ComfyUI"
+export COMFY_URL="http://127.0.0.1:8188"
 .venv/bin/python comfy_mcp_server.py
 ```
+
+Set `COMFY_INPUT_DIR` and `COMFY_OUTPUT_DIR` before starting the server if the selected ComfyUI build uses separate folders. Keep the terminal open and verify the server below. [Configuration reference](docs/configuration.md)
 
 ### Verify the server
 
@@ -186,9 +212,18 @@ Turning gaming mode on pauses new GPU work through the MCP server. If ComfyUI's 
 
 ## Ask your agent to set it up
 
-If Render Bridge is already installed, use the [connection prompt](docs/connections.md#paste-a-connection-prompt). For first-time setup, give this prompt to an agent with terminal access on the render host.
+Paste this into an agent with terminal access on the computer where ComfyUI runs. If Render Bridge is already installed, use the [connection prompt](docs/connections.md#paste-a-connection-prompt).
 
-> Set up Render Bridge and connect my MCP client. Check for Python 3.11 or newer with virtual environment support and a running local ComfyUI build first. Ask me before installing system software, model weights, or nodes. Let me approve administrator prompts and sign in to any required accounts myself. Use the agent instructions to keep my token private and verify with `server_status`, `list_jobs`, and `list_models`. Ask before the first render. [Render Bridge agent instructions](https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/AGENTS.md)
+```text
+Install Render Bridge from source on this computer and connect my MCP client.
+Use https://github.com/BlackRune-LLC/render-mcp-bridge and read its README and AGENTS.md.
+Reuse an existing checkout if appropriate. Otherwise clone the official repository.
+Check for Python 3.11 or newer with venv support and find my running local ComfyUI build.
+Use setup_render_bridge.py install and setup_render_bridge.py start with py -3 on Windows or python3 on macOS and Linux. Reuse the intended Render Bridge data directory and ComfyUI settings if already configured. Preserve my existing files and client settings.
+Configure a user-scoped render_bridge entry with Streamable HTTP using the saved MCP address and private token file. Keep the token out of chat, logs, and command lines.
+Call server_status to verify the MCP connection. If this session cannot reload its settings, tell me to open a fresh session and verify there. Tell me how to start and stop this installation.
+Ask before installing system software, model weights, or nodes, and before submitting a render. Leave administrator prompts and account sign-ins to me.
+```
 
 ## Support
 

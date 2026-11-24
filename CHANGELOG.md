@@ -7,7 +7,7 @@
 - Windows setup starts the server through the installed panel and can close while the server keeps running. The Connect tab can verify a signed first PNG from the user's agent and rotate a stopped server's token.
 - The Models page checks disk space, resumes interrupted downloads, verifies installed catalog files, and offers repairs that back up the originals.
 - Setup stages a verified runtime before activating it. On Windows, the setup wizard can repair an installation in place or uninstall its registered app files and shortcuts while retaining user data.
-- Windows builds display product, publisher, and version information. Windows updates check the official download's integrity and signature before installing.
+- Windows builds display product and version information. **Update** checks GitHub and opens the official release download for manual installation. Automatic installation requires a valid Windows signature.
 - Render Bridge documents local data and explicit network requests, disables server tracing export, and keeps sanitized crash reports locally.
 
 ## 0.1.0

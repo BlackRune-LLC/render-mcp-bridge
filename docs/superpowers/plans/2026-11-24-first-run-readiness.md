@@ -16,8 +16,8 @@ Use the installed panel as the Windows server owner from the first setup start. 
     - **PNG, Z-Image Turbo.** Opened at 512 × 512 and passed the installer's first-render receipt verifier.
     - **MP4, Wan Animate 2 distilled.** A signed upload supplied the driving clip. All 13 distinct H.264 frames decoded successfully at 320 × 320.
     - **GLB, Hunyuan 3D 2.1.** Headless Blender imported the untextured mesh with 1,923 faces.
-  - [ ] **Sign and test the exact release asset last.** Sign and timestamp the executable, verify Authenticode, and calculate its SHA-256. Use that same file on clean Windows x64 to check Python installation, Comfy Desktop and Portable separately, model download and recovery, agent connection after setup closes, and upgrade, repair, and uninstall. Record the signed file digest and results in the release notes or PR evidence. [Release checklist](../../releases.md)
+  - [ ] **Test the unsigned release installer on a clean Windows PC.** Share the release executable and SHA-256 with the tester. Check Python installation, Comfy Desktop and Portable separately, model download and recovery, agent connection after setup closes, and manual upgrade, repair, and uninstall. Record the tested file's digest and results in the release notes or PR evidence. [Release checklist](../../releases.md#test-on-a-clean-windows-pc)
 
 ## Release dependencies
 
-The final release check needs an authorized code-signing identity and a clean Windows x64 environment.
+The final release check needs the tester's Windows x64 PC and their install and upgrade results.

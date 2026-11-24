@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 const REPOSITORY: &str = "BlackRune-LLC/render-mcp-bridge";
+pub const RELEASES_URL: &str = "https://github.com/BlackRune-LLC/render-mcp-bridge/releases";
 const USER_AGENT: &str = "RenderBridge";
 const INSTALLED_VERSION: &str = env!("CARGO_PKG_VERSION");
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -114,10 +115,7 @@ fn applicable_release(
         .into_iter()
         .filter(|asset| asset.name == ASSET_NAME);
     let asset = installers.next().ok_or(ASSET_ERROR)?;
-    let expected_url = format!(
-        "https://github.com/{REPOSITORY}/releases/download/{}/{ASSET_NAME}",
-        metadata.tag_name
-    );
+    let expected_url = format!("{RELEASES_URL}/download/{}/{ASSET_NAME}", metadata.tag_name);
     if installers.next().is_some()
         || asset.state != "uploaded"
         || !(1..=MAX_ASSET_BYTES).contains(&asset.size)
@@ -140,10 +138,7 @@ fn applicable_release(
     }
     Ok(Some(Release {
         version: version.into(),
-        url: format!(
-            "https://github.com/{REPOSITORY}/releases/tag/{}",
-            metadata.tag_name
-        ),
+        url: format!("{RELEASES_URL}/tag/{}", metadata.tag_name),
         installer,
     }))
 }

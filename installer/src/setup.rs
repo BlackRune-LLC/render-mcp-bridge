@@ -1014,6 +1014,7 @@ fn run_install_stage(
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn activate_runtime(
     directory: &Path,
     staging: tempfile::TempDir,
@@ -1188,24 +1189,35 @@ pub fn install(
     check_cancel(cancel)?;
     progress("Activating the verified Render Bridge runtime.");
     save_mcp_port(&data_dir, port)?;
+    #[cfg(windows)]
+    activate_windows_runtime(&data_dir, staging, &settings, || {
+        crate::update_handoff::replace_monitor(&installed)
+    })?;
+    #[cfg(not(windows))]
     activate_runtime(&data_dir, staging, &settings)
         .map_err(|_| "Could not activate the verified runtime. Retry setup.")?;
     Ok(installed)
 }
 
 #[cfg(windows)]
-fn activate_upgrade(
+fn activate_windows_runtime(
     data_dir: &Path,
     staging: tempfile::TempDir,
     settings: &Settings,
-    previous_marker: Option<&[u8]>,
     update_monitor: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    let previous_marker = match fs::read(data_dir.join(ACTIVE_RUNTIME)) {
+        Ok(marker) => Some(marker),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => {
+            return Err("Could not read the previous Render Bridge runtime selection.".into());
+        }
+    };
     publish_runtime(data_dir, staging.path(), settings)
         .map_err(|_| "Could not activate the verified runtime. Retry the update.")?;
     if let Err(error) = update_monitor() {
         let marker = data_dir.join(ACTIVE_RUNTIME);
-        let rollback = match previous_marker {
+        let rollback = match previous_marker.as_deref() {
             Some(previous) => atomic_write(&marker, previous),
             None => fs::remove_file(marker),
         };
@@ -1246,14 +1258,6 @@ pub fn upgrade_existing(
         .ok_or("Bridge setup settings are missing. Run setup again.")?;
     let settings = validate_settings(&settings)?;
     crate::uninstall::mark_install(data_dir)?;
-    let previous_marker = match fs::read(data_dir.join(ACTIVE_RUNTIME)) {
-        Ok(marker) => Some(marker),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(_) => {
-            return Err("Could not read the previous Render Bridge runtime selection.".into());
-        }
-    };
-
     progress("Checking the existing Python installation.");
     let interpreter = venv_python(&current);
     let command = python_for_creation(Some(&interpreter), cancel)
@@ -1262,13 +1266,7 @@ pub fn upgrade_existing(
     check_cancel(cancel)?;
     progress("Activating the verified Render Bridge runtime.");
     save_mcp_port(data_dir, port)?;
-    activate_upgrade(
-        data_dir,
-        staging,
-        &settings,
-        previous_marker.as_deref(),
-        || update_monitor(&installed),
-    )?;
+    activate_windows_runtime(data_dir, staging, &settings, || update_monitor(&installed))?;
     Ok(installed)
 }
 
@@ -1455,17 +1453,11 @@ mod tests {
             let marker = data.path().join(ACTIVE_RUNTIME);
             let previous_marker = fs::read(&marker).ok();
 
-            let error = activate_upgrade(
-                data.path(),
-                staged,
-                &settings,
-                previous_marker.as_deref(),
-                || {
-                    assert_eq!(active_runtime(data.path()).unwrap(), updated);
-                    assert!(read_settings(&updated).is_some_and(|stored| stored == settings));
-                    Err("The monitor is still running.".into())
-                },
-            );
+            let error = activate_windows_runtime(data.path(), staged, &settings, || {
+                assert_eq!(active_runtime(data.path()).unwrap(), updated);
+                assert!(read_settings(&updated).is_some_and(|stored| stored == settings));
+                Err("The monitor is still running.".into())
+            });
 
             assert_eq!(error, Err("The monitor is still running.".into()));
             assert_eq!(active_runtime(data.path()).unwrap(), old_runtime);

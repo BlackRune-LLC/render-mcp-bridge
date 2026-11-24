@@ -136,16 +136,23 @@ impl UpdateDialog {
                                 } else {
                                     ui.label(format!("Version {} is available.", release.version));
                                 }
+                                caption(
+                                    ui,
+                                    "For an unsigned build, download the installer from GitHub. Finish any jobs and exit Render Bridge from the tray. Run setup, choose the same folder on the Install page, and select Install Render Bridge.",
+                                );
                                 if let Some(reason) = blocked {
                                     caption(ui, reason);
                                 } else {
                                     caption(
                                         ui,
-                                        "The update keeps your settings and reopens Render Bridge.",
+                                        "A signed build can also be installed here.",
                                     );
                                 }
                             }
-                            Some(Err(error)) => status(ui, "Update unavailable", error, CAUTION),
+                            Some(Err(error)) => {
+                                status(ui, "Update unavailable", error, CAUTION);
+                                ui.hyperlink_to("Open GitHub downloads", updates::RELEASES_URL);
+                            }
                         }
                     }
                 });
@@ -156,12 +163,10 @@ impl UpdateDialog {
                 if !self.downloading
                     && let Some(Ok(Some(release))) = &self.result
                 {
-                    let label = if release.is_installed_version() {
-                        "Install published build"
-                    } else {
-                        "Install update"
-                    };
-                    install = primary(ui, label, blocked.is_none()).clicked();
+                    if primary(ui, "Open GitHub download", true).clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(&release.url));
+                    }
+                    install = secondary(ui, "Install signed build", blocked.is_none()).clicked();
                 } else if matches!(self.result, Some(Err(_))) {
                     retry = primary(ui, "Check again", true).clicked();
                 }
