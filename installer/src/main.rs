@@ -45,6 +45,7 @@ const MUTED: Color32 = Color32::from_rgb(91, 79, 105);
 const VIOLET: Color32 = Color32::from_rgb(83, 53, 133);
 const GREEN: Color32 = Color32::from_rgb(39, 99, 61);
 const LIME: Color32 = Color32::from_rgb(201, 245, 109);
+const MARK_SHADE: Color32 = Color32::from_rgb(180, 151, 237);
 const CAUTION: Color32 = Color32::from_rgb(118, 72, 25);
 const ERROR: Color32 = Color32::from_rgb(133, 46, 40);
 
@@ -947,7 +948,7 @@ impl Installer {
                     let foreground = if selected {
                         theme::color(ctx, INK)
                     } else {
-                        RAIL_TEXT
+                        theme::color(ctx, RAIL_TEXT)
                     };
                     Frame::new()
                         .fill(background)
@@ -2170,9 +2171,9 @@ fn header(ui: &mut Ui, title: &str, description: &str) {
 fn bridge_mark(ui: &mut Ui) {
     let (bounds, _) = ui.allocate_exact_size(egui::vec2(47.0, 44.0), egui::Sense::hover());
     for (x, y, color) in [
-        (2.0, 23.0, Color32::from_rgb(180, 151, 237)),
-        (13.0, 13.0, RAIL_ACTIVE),
-        (24.0, 3.0, LIME),
+        (2.0, 23.0, theme::color(ui.ctx(), MARK_SHADE)),
+        (13.0, 13.0, theme::color(ui.ctx(), RAIL_ACTIVE)),
+        (24.0, 3.0, theme::color(ui.ctx(), LIME)),
     ] {
         ui.painter().rect_filled(
             egui::Rect::from_min_size(bounds.min + egui::vec2(x, y), egui::vec2(19.0, 19.0)),
@@ -2268,10 +2269,15 @@ fn activity(ui: &mut Ui, message: &str) {
 fn primary(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(title).size(15.0).strong().color(INK))
-            .fill(LIME)
-            .min_size(egui::vec2(143.0, 44.0))
-            .corner_radius(12),
+        egui::Button::new(
+            RichText::new(title)
+                .size(15.0)
+                .strong()
+                .color(theme::color(ui.ctx(), INK)),
+        )
+        .fill(theme::color(ui.ctx(), LIME))
+        .min_size(egui::vec2(143.0, 44.0))
+        .corner_radius(12),
     )
 }
 
@@ -2288,14 +2294,13 @@ fn monitor_button(ui: &mut Ui, title: &str, enabled: bool, fill: Color32) -> egu
     let ctx = ui.ctx();
     let text = match fill {
         ERROR => CREAM,
-        LIME => INK,
         LINE => theme::color(ctx, MUTED),
         _ => theme::color(ctx, INK),
     };
-    let fill = if fill == ERROR && ctx.theme() == egui::Theme::Dark {
-        Color32::from_rgb(148, 53, 67)
-    } else {
-        theme::color(ctx, fill)
+    let fill = match (ctx.theme(), fill) {
+        (egui::Theme::Dark, ERROR) => Color32::from_rgb(148, 53, 67),
+        (egui::Theme::Dark, LINE) => Color32::from_rgb(28, 51, 49),
+        _ => theme::color(ctx, fill),
     };
     ui.add_enabled(
         enabled,
