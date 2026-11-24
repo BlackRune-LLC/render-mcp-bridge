@@ -23,7 +23,7 @@ enum UpdateEvent {
 #[derive(Default)]
 pub struct UpdateDialog {
     open: bool,
-    downloading: bool,
+    cancel_download: Option<Arc<AtomicBool>>,
     result: Option<Result<Option<Release>, String>>,
     worker: Option<Receiver<UpdateEvent>>,
 }
@@ -57,12 +57,66 @@ impl UpdateDialog {
     }
 
     fn fail(&mut self, message: String) {
-        self.downloading = false;
+        self.cancel_download = None;
         self.result = Some(Err(message));
     }
 
     pub fn blocks_controls(&self) -> bool {
-        self.downloading
+        self.cancel_download.is_some()
+    }
+
+    fn cancelling(&self) -> bool {
+        self.cancel_download
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    fn dismiss(&mut self) {
+        if let Some(cancel) = &self.cancel_download {
+            cancel.store(true, Ordering::Relaxed);
+        } else {
+            self.open = false;
+            self.worker = None;
+        }
+    }
+
+    fn poll(&mut self, installed: Option<&Installed>, blocked: Option<&str>) -> bool {
+        let Some(worker) = &self.worker else {
+            return false;
+        };
+        let event = worker.try_recv();
+        if matches!(event, Err(TryRecvError::Empty)) {
+            return false;
+        }
+        self.worker = None;
+        let cancelled = self.cancelling();
+        self.cancel_download = None;
+        if cancelled {
+            // Discard any late installer. Its temporary directory is cleaned on drop.
+            self.open = false;
+            return false;
+        }
+        match event {
+            Ok(UpdateEvent::Checked(result)) => self.result = Some(result),
+            Ok(UpdateEvent::Downloaded(result)) => match result.and_then(|(release, staging)| {
+                installed
+                    .filter(|installed| {
+                        blocked.is_none()
+                            && update_handoff::is_installed_monitor(&installed.data_dir)
+                    })
+                    .ok_or_else(|| {
+                        blocked
+                            .unwrap_or("Open the installed panel before updating.")
+                            .to_owned()
+                    })
+                    .and_then(|installed| start_installer(&installed.data_dir, &release, staging))
+            }) {
+                Ok(()) => return true,
+                Err(error) => self.fail(error),
+            },
+            Err(_) => self.fail("The update worker did not finish. Try again.".into()),
+        }
+        false
     }
 
     pub fn show(
@@ -74,50 +128,15 @@ impl UpdateDialog {
         if !self.open {
             return false;
         }
-        if let Some(worker) = &self.worker {
-            match worker.try_recv() {
-                Ok(UpdateEvent::Checked(result)) => {
-                    self.worker = None;
-                    self.result = Some(result);
-                }
-                Ok(UpdateEvent::Downloaded(result)) => {
-                    self.worker = None;
-                    self.downloading = false;
-                    match result {
-                        Ok((release, staging)) => {
-                            let launched = installed
-                                .filter(|installed| {
-                                    blocked.is_none()
-                                        && update_handoff::is_installed_monitor(&installed.data_dir)
-                                })
-                                .ok_or_else(|| {
-                                    blocked
-                                        .unwrap_or("Open the installed panel before updating.")
-                                        .to_owned()
-                                })
-                                .and_then(|installed| {
-                                    start_installer(&installed.data_dir, &release, staging)
-                                });
-                            match launched {
-                                Ok(()) => return true,
-                                Err(error) => self.fail(error),
-                            }
-                        }
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.worker = None;
-                    self.fail("The update check did not finish. Try again.".into());
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
+        let downloading = self.blocks_controls();
+        let cancelling = self.cancelling();
         let response = panel_modal(ctx, "render-bridge-update").show(ctx, |ui| {
             let viewport = ctx.content_rect();
             ui.set_width((viewport.width() - 48.0).clamp(120.0, 394.0));
-            let detail = if self.downloading {
-                "Verifying the installer".to_owned()
+            let detail = if cancelling {
+                "Cancelling the download".to_owned()
+            } else if downloading {
+                "Preparing the installer".to_owned()
             } else {
                 match &self.result {
                     Some(Ok(Some(release))) if release.is_installed_version() => {
@@ -132,7 +151,9 @@ impl UpdateDialog {
             utility_ui::heading(ui, UtilityIcon::Download, "Render Bridge Update", Some(&detail));
             utility_ui::scroll_body(ui, "update-dialog-body", |ui| {
                     caption(ui, concat!("Installed version ", env!("CARGO_PKG_VERSION")));
-                    if self.downloading {
+                    if cancelling {
+                        activity(ui, "Waiting for the transfer to stop…");
+                    } else if downloading {
                         activity(ui, "Downloading and verifying the installer…");
                     } else {
                         match &self.result {
@@ -161,7 +182,7 @@ impl UpdateDialog {
             let mut retry = false;
             let mut close = false;
             ui.horizontal_wrapped(|ui| {
-                if !self.downloading
+                if !downloading
                     && let Some(Ok(Some(release))) = &self.result
                 {
                     if primary(ui, "Open GitHub download", true).clicked() {
@@ -171,16 +192,14 @@ impl UpdateDialog {
                 } else if matches!(self.result, Some(Err(_))) {
                     retry = primary(ui, "Check again", true).clicked();
                 }
-                close = secondary(ui, if self.downloading { "Cancel" } else { "Close" }, true)
+                close = secondary(ui, if downloading { "Cancel" } else { "Close" }, !cancelling)
                     .clicked();
             });
             (install, retry, close)
         });
         let (install, retry, close) = response.inner;
-        if close || (!self.downloading && response.should_close()) {
-            self.open = false;
-            self.worker = None;
-            self.downloading = false;
+        if close || (!downloading && response.should_close()) {
+            self.dismiss();
         } else if retry {
             self.start_check(ctx);
         } else if install
@@ -188,18 +207,21 @@ impl UpdateDialog {
             && let Some(installed) = installed
         {
             let url = setup::installed_comfy_url(installed);
-            self.downloading = true;
+            let cancelled = Arc::new(AtomicBool::new(false));
+            self.cancel_download = Some(Arc::clone(&cancelled));
             self.run(ctx, move || {
                 let result = (|| {
                     ensure_queue_idle(url.as_deref())?;
-                    let staged = updates::download(&release)?;
-                    ensure_queue_idle(url.as_deref())?;
+                    let staged = updates::download(&release, &cancelled)?;
+                    if !cancelled.load(Ordering::Relaxed) {
+                        ensure_queue_idle(url.as_deref())?;
+                    }
                     Ok((release, staged))
                 })();
                 UpdateEvent::Downloaded(result)
             });
         }
-        false
+        self.poll(installed, blocked)
     }
 }
 
@@ -406,4 +428,33 @@ pub fn apply(request: Result<UpdateRequest, String>) -> eframe::Result {
         },
         Box::new(move |creation| Ok(Box::new(ApplyWindow::new(&creation.egui_ctx, request)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_download_keeps_controls_blocked_until_worker_finishes() {
+        let (send, receive) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut dialog = UpdateDialog {
+            open: true,
+            cancel_download: Some(Arc::clone(&cancelled)),
+            worker: Some(receive),
+            ..Default::default()
+        };
+
+        dialog.dismiss();
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!dialog.poll(None, None));
+        assert!(dialog.open && dialog.blocks_controls());
+
+        send.send(UpdateEvent::Downloaded(Err("late result".into())))
+            .ok()
+            .unwrap();
+        assert!(!dialog.poll(None, None));
+        assert!(!dialog.open && !dialog.blocks_controls());
+        assert!(dialog.result.is_none());
+    }
 }

@@ -184,6 +184,7 @@ mod windows_download {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
     use ring::digest::{Context, SHA256};
@@ -203,11 +204,18 @@ mod windows_download {
     const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
     const MAX_REDIRECTS: usize = 4;
 
+    fn check_cancel(cancelled: &AtomicBool) -> Result<(), &'static str> {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("Update download cancelled.");
+        }
+        Ok(())
+    }
+
     pub(super) fn installed_matches(asset: &ReleaseAsset) -> Result<bool, String> {
         let error = "Could not compare the installed Render Bridge executable.".to_owned();
         let path = std::env::current_exe().map_err(|_| error.clone())?;
         let file = File::open(path).map_err(|_| error)?;
-        Ok(copy_verified(file, std::io::sink(), asset).is_ok())
+        Ok(copy_verified(file, std::io::sink(), asset, &AtomicBool::default()).is_ok())
     }
 
     pub struct StagedInstaller {
@@ -218,7 +226,7 @@ mod windows_download {
         pub path: PathBuf,
     }
 
-    pub fn download(release: &Release) -> Result<StagedInstaller, String> {
+    pub fn download(release: &Release, cancelled: &AtomicBool) -> Result<StagedInstaller, String> {
         let asset = &release.installer;
         let mut url = Url::parse(&asset.url).map_err(|_| DOWNLOAD_ERROR)?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -229,6 +237,7 @@ mod windows_download {
             .into();
         let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
         for redirect in 0..=MAX_REDIRECTS {
+            check_cancel(cancelled)?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -242,6 +251,7 @@ mod windows_download {
                 .build()
                 .call()
                 .map_err(|_| DOWNLOAD_ERROR)?;
+            check_cancel(cancelled)?;
             match response.status().as_u16() {
                 200 => {
                     let reader = response
@@ -249,7 +259,7 @@ mod windows_download {
                         .with_config()
                         .limit(asset.size + 1)
                         .reader();
-                    return stage(reader, asset);
+                    return stage(reader, asset, cancelled);
                 }
                 301 | 302 | 303 | 307 | 308 if redirect < MAX_REDIRECTS => {
                     let location = response
@@ -281,7 +291,12 @@ mod windows_download {
         .then_some(next)
     }
 
-    fn stage(reader: impl Read, asset: &ReleaseAsset) -> Result<StagedInstaller, String> {
+    fn stage(
+        reader: impl Read,
+        asset: &ReleaseAsset,
+        cancelled: &AtomicBool,
+    ) -> Result<StagedInstaller, String> {
+        check_cancel(cancelled)?;
         let staging_error = "Could not stage the Render Bridge installer.";
         let directory = tempfile::Builder::new()
             .prefix("render-bridge-update-")
@@ -293,7 +308,8 @@ mod windows_download {
             .write(true)
             .open(&path)
             .map_err(|_| staging_error)?;
-        copy_verified(reader, &mut file, asset)?;
+        copy_verified(reader, &mut file, asset, cancelled)?;
+        check_cancel(cancelled)?;
         file.sync_all().map_err(|_| staging_error)?;
         drop(file);
         let mut verified = OpenOptions::new()
@@ -306,9 +322,11 @@ mod windows_download {
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
             return Err(staging_error.into());
         }
-        copy_verified(&mut verified, std::io::sink(), asset)?;
+        copy_verified(&mut verified, std::io::sink(), asset, cancelled)?;
         verified.rewind().map_err(|_| staging_error)?;
+        check_cancel(cancelled)?;
         authenticode(&path, &verified)?;
+        check_cancel(cancelled)?;
         Ok(StagedInstaller {
             _verified: verified,
             directory,
@@ -320,12 +338,15 @@ mod windows_download {
         mut reader: impl Read,
         mut writer: impl Write,
         asset: &ReleaseAsset,
+        cancelled: &AtomicBool,
     ) -> Result<(), String> {
         let mut hash = Context::new(&SHA256);
         let mut written = 0_u64;
         let mut buffer = [0; 64 * 1024];
         loop {
+            check_cancel(cancelled)?;
             let count = reader.read(&mut buffer).map_err(|_| DOWNLOAD_ERROR)?;
+            check_cancel(cancelled)?;
             if count == 0 {
                 break;
             }
@@ -423,15 +444,59 @@ mod windows_download {
                 sha256: sha256.as_ref().try_into().unwrap(),
             };
             let mut output = Vec::new();
-            assert!(copy_verified(&expected[..], &mut output, &metadata).is_ok());
+            assert!(
+                copy_verified(
+                    &expected[..],
+                    &mut output,
+                    &metadata,
+                    &AtomicBool::default()
+                )
+                .is_ok()
+            );
             assert_eq!(output, expected);
             for invalid in [
                 b"release".as_slice(),
                 b"other payload",
                 b"release asset with extra bytes",
             ] {
-                assert!(copy_verified(invalid, Vec::new(), &metadata).is_err());
+                assert!(
+                    copy_verified(invalid, Vec::new(), &metadata, &AtomicBool::default()).is_err()
+                );
             }
+        }
+
+        #[test]
+        fn stops_writing_when_cancelled_during_a_read() {
+            struct CancelOnSecondRead<'a> {
+                source: &'a [u8],
+                cancelled: &'a AtomicBool,
+            }
+
+            impl Read for CancelOnSecondRead<'_> {
+                fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                    if self.source.len() == 3 {
+                        self.cancelled.store(true, Ordering::Relaxed);
+                    }
+                    self.source.read(&mut buffer[..3])
+                }
+            }
+
+            let payload = b"abcdef";
+            let digest = ring::digest::digest(&SHA256, payload);
+            let asset = ReleaseAsset {
+                url: String::new(),
+                size: payload.len() as u64,
+                sha256: digest.as_ref().try_into().unwrap(),
+            };
+            let cancelled = AtomicBool::new(false);
+            let reader = CancelOnSecondRead {
+                source: payload,
+                cancelled: &cancelled,
+            };
+            let mut output = Vec::new();
+            let result = copy_verified(reader, &mut output, &asset, &cancelled);
+            assert_eq!(result, Err("Update download cancelled.".into()));
+            assert_eq!(output, b"abc");
         }
 
         #[test]
@@ -444,7 +509,8 @@ mod windows_download {
                 sha256: sha256.as_ref().try_into().unwrap(),
             };
             assert!(
-                stage(&payload[..], &metadata).is_err_and(|error| error.contains("Authenticode"))
+                stage(&payload[..], &metadata, &AtomicBool::default())
+                    .is_err_and(|error| error.contains("Authenticode"))
             );
         }
     }

@@ -1411,14 +1411,19 @@ impl Installer {
         }
     }
 
-    fn setup_config_picker(&mut self, ui: &mut Ui, idle: bool) {
-        if secondary(ui, "Load setup config", idle).clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("Render Bridge settings", &["json"])
-                .pick_file()
-        {
-            self.import_setup_config(&path);
-        }
+    fn setup_config_picker(&mut self, ui: &mut Ui, idle: bool, show_privacy: bool) {
+        ui.horizontal_wrapped(|ui| {
+            if secondary(ui, "Load setup config", idle).clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Render Bridge settings", &["json"])
+                    .pick_file()
+            {
+                self.import_setup_config(&path);
+            }
+            if show_privacy {
+                ui.hyperlink_to("Privacy and network use", PRIVACY_GUIDE);
+            }
+        });
         if let Some(error) = &self.setup_config_error {
             status(ui, "Setup config unavailable", error, CAUTION);
             if secondary(ui, "Continue without imported config", idle).clicked() {
@@ -2251,11 +2256,21 @@ impl Installer {
             },
             |ui| {
                 if needs_python {
-                    if matches!(self.python, Some(PythonReadiness::MissingVenv { .. })) {
-                        caption(ui, python_venv_help());
+                    let missing_venv =
+                        matches!(self.python, Some(PythonReadiness::MissingVenv { .. }));
+                    let install_help = if missing_venv {
+                        python_venv_help()
                     } else {
-                        caption(ui, "Install Python 3.11 or newer, then check again.");
-                    }
+                        "Install Python 3.11 or newer."
+                    };
+                    let recheck_same = self.selected_python.is_none()
+                        || (missing_venv && cfg!(target_os = "linux"));
+                    let next = if recheck_same {
+                        "Then select Check Python again."
+                    } else {
+                        "Then select Detect installed Python."
+                    };
+                    caption(ui, &format!("{install_help} {next}"));
                     ui.horizontal_wrapped(|ui| {
                         #[cfg(windows)]
                         if setup::winget_available()
@@ -2265,6 +2280,12 @@ impl Installer {
                         }
                         let (label, url) = python_install_link();
                         ui.hyperlink_to(label, url);
+                        if self.selected_python.is_some()
+                            && secondary(ui, "Detect installed Python", idle).clicked()
+                        {
+                            self.selected_python = None;
+                            self.check_python(ui.ctx());
+                        }
                         #[cfg(target_os = "linux")]
                         if secondary(ui, "Copy Debian or Ubuntu command", true).clicked() {
                             ui.ctx().copy_text(
@@ -2294,6 +2315,7 @@ impl Installer {
                             self.check_python(ui.ctx());
                         }
                         if self.selected_python.is_some()
+                            && !needs_python
                             && secondary(ui, "Use automatic detection", idle).clicked()
                         {
                             self.selected_python = None;
@@ -2344,9 +2366,13 @@ impl Installer {
                 ui.hyperlink_to("Set up Codex", CODEX_SETUP);
             });
         });
-        ui.hyperlink_to("Privacy and network use", PRIVACY_GUIDE);
-        self.setup_config_picker(ui, idle);
+        self.setup_config_picker(ui, idle, true);
         ui.collapsing("Existing installations", |ui| {
+            #[cfg(windows)]
+            caption(
+                ui,
+                "To repair Render Bridge, exit the tray app, stop its server, and run setup with the same ComfyUI build and installation folder.",
+            );
             ui.horizontal_wrapped(|ui| {
                 if let Some(installed) = self
                     .setup_directory()
@@ -2370,7 +2396,7 @@ impl Installer {
                     }
                 }
                 #[cfg(windows)]
-                if secondary(ui, "Repair or uninstall", idle).clicked() {
+                if secondary(ui, "Uninstall Render Bridge", idle).clicked() {
                     self.uninstall.choose();
                 }
             })
@@ -2476,7 +2502,7 @@ impl Installer {
                 self.show_jobs(QueueAction::Inspect);
             }
         });
-        self.setup_config_picker(ui, idle);
+        self.setup_config_picker(ui, idle, false);
         egui::CollapsingHeader::new("ComfyUI address and folders")
             .default_open(self.instances.is_empty())
             .show(ui, |ui| {
@@ -3002,6 +3028,9 @@ impl Installer {
             status(ui, "Model folder choice was not saved", error, CAUTION);
         }
         let server_verified = self.server_ready_for_render();
+        let receipt_verified = self
+            .first_render
+            .update_receipt(ui.ctx(), self.installed.as_ref());
         header(
             ui,
             if server_verified {
@@ -3009,7 +3038,9 @@ impl Installer {
             } else {
                 "Connect your agent"
             },
-            if server_verified {
+            if server_verified && receipt_verified {
+                "Your first render is verified."
+            } else if server_verified {
                 "Render Bridge and its ComfyUI folders are verified. Try a first render from your agent."
             } else {
                 "Start Render Bridge and check the agent you want to connect."
@@ -3019,7 +3050,7 @@ impl Installer {
             return;
         };
         if server_verified {
-            self.first_render.show(ui, &installed, true);
+            self.first_render.show_current(ui, &installed, true);
         }
         let mut copied = None;
         let idle = self.worker.is_none();
@@ -3083,7 +3114,7 @@ impl Installer {
             ui.hyperlink_to("Connect from another device", REMOTE_GUIDE);
         });
         if !server_verified {
-            self.first_render.show(ui, &installed, false);
+            self.first_render.show_current(ui, &installed, false);
         }
         if self.worker.is_some() {
             activity(ui, &self.progress);
@@ -3303,7 +3334,7 @@ impl Installer {
             });
             self.compact_window_size = previous;
             let available = monitor.map_or(egui::vec2(1000.0, 680.0), |size| {
-                (size - egui::vec2(64.0, 96.0)).max(egui::vec2(408.0, 330.0))
+                (size - egui::vec2(64.0, 96.0)).max(MONITOR_MIN_SIZE)
             });
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
                 egui::vec2(1000.0, 680.0).min(available),
@@ -3311,7 +3342,9 @@ impl Installer {
         } else if tab == WorkspaceTab::Jobs
             && let Some(previous) = self.compact_window_size.take()
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(previous));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                previous.max(MONITOR_MIN_SIZE),
+            ));
         }
         if tab == WorkspaceTab::Connect {
             self.copied = None;
@@ -3370,17 +3403,21 @@ impl Installer {
                     .controls
                     .as_ref()
                     .is_some_and(|controls| controls.bridge_online);
-            let compact = ui.available_width() < 620.0;
-            if ui.available_width() >= 445.0 {
-                ui.horizontal(|ui| {
-                    self.job_server_actions(ui, online, owned, idle, compact);
+            let width = ui.available_width();
+            let compact = width < 620.0;
+            let dense = width < COMPACT_MONITOR_WIDTH;
+            ui.horizontal_wrapped(|ui| {
+                if dense {
+                    compact_monitor_spacing(ui);
+                }
+                self.job_server_actions(ui, online, owned, idle, compact);
+                if !dense {
                     ui.separator();
-                    self.job_gaming_action(ui, idle);
-                });
-                return;
-            }
-            ui.horizontal_wrapped(|ui| self.job_server_actions(ui, online, owned, idle, compact));
+                }
+                self.job_gaming_action(ui, idle);
+            });
         }
+        #[cfg(not(windows))]
         ui.horizontal_wrapped(|ui| self.job_gaming_action(ui, idle));
     }
 
@@ -3394,7 +3431,9 @@ impl Installer {
         compact: bool,
     ) {
         server_state(ui, online, owned, compact);
-        ui.add_space(3.0);
+        if !compact {
+            ui.add_space(3.0);
+        }
         let start_fill = if online { LINE } else { SURFACE };
         if job_action_button(
             ui,
@@ -3462,36 +3501,33 @@ impl Installer {
                     .inner_margin(egui::Margin::symmetric(14, 6)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    monitor_mark(ui);
-                    ui.label(
-                        theme::strong("Render Bridge", 19.0)
-                            .color(theme::on_fill(theme::color(ctx, RAIL))),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (close_label, hint) = if self.panel_is_tray() {
-                            ("Hide", "Hide Render Bridge to the tray")
-                        } else {
-                            ("Close", "Close Render Bridge")
-                        };
-                        if monitor_button(ui, close_label, true, RAIL)
-                            .on_hover_text(hint)
-                            .clicked()
-                        {
-                            self.hide_or_close_controls(ctx);
-                        }
-                        #[cfg(windows)]
-                        if let Some(setting) = &mut self.startup_setting
-                            && monitor_button(ui, "Settings", true, RAIL).clicked()
-                        {
-                            setting.open(ctx, self.installed.as_ref());
-                        }
-                        #[cfg(windows)]
-                        self.monitor_update_action(ui);
-                    });
+                monitor_header(ui, |ui| {
+                    let (close_label, hint) = if self.panel_is_tray() {
+                        ("Hide", "Hide Render Bridge to the tray")
+                    } else {
+                        ("Close", "Close Render Bridge")
+                    };
+                    if monitor_button(ui, close_label, true, RAIL)
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        self.hide_or_close_controls(ctx);
+                    }
+                    #[cfg(windows)]
+                    if let Some(setting) = &mut self.startup_setting
+                        && monitor_button(ui, "Settings", true, RAIL).clicked()
+                    {
+                        setting.open(ctx, self.installed.as_ref());
+                    }
+                    #[cfg(windows)]
+                    self.monitor_update_action(ui);
                 });
                 ui.add_space(3.0);
+                let compact = ui.available_width() < COMPACT_MONITOR_WIDTH;
                 ui.horizontal_wrapped(|ui| {
+                    if compact {
+                        compact_monitor_spacing(ui);
+                    }
                     let has_installation = self
                         .controls
                         .as_ref()
@@ -3914,7 +3950,7 @@ fn python_venv_help() -> &'static str {
     if cfg!(target_os = "linux") {
         "Install your distribution's virtual environment support for this Python. On Debian or Ubuntu, install python3-venv or the matching versioned package."
     } else {
-        "Use the full Python installer from python.org, then choose Check Python again."
+        "Use the full Python installer from python.org."
     }
 }
 
@@ -4410,6 +4446,31 @@ fn job_action_button(
     response
 }
 
+const MONITOR_MIN_SIZE: Vec2 = Vec2::new(408.0, 360.0);
+const COMPACT_MONITOR_WIDTH: f32 = 430.0;
+
+fn compact_monitor_spacing(ui: &mut Ui) {
+    ui.spacing_mut().item_spacing.x = 5.0;
+    ui.spacing_mut().button_padding.x = 8.0;
+}
+
+fn monitor_header<R>(ui: &mut Ui, actions: impl FnOnce(&mut Ui) -> R) -> R {
+    let compact = ui.available_width() < COMPACT_MONITOR_WIDTH;
+    ui.horizontal(|ui| {
+        if compact {
+            compact_monitor_spacing(ui);
+        }
+        monitor_mark(ui);
+        ui.label(
+            theme::strong("Render Bridge", if compact { 17.0 } else { 19.0 })
+                .color(theme::on_fill(theme::color(ui.ctx(), RAIL))),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions)
+            .inner
+    })
+    .inner
+}
+
 fn monitor_mark(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 27.0), egui::Sense::hover());
     for (x, y, tone) in [
@@ -4727,6 +4788,58 @@ mod launch_tests {
 
     #[cfg(windows)]
     #[test]
+    fn jobs_header_actions_fit_the_minimum_window_width() {
+        let ctx = egui::Context::default();
+        theme::configure_for(&ctx, egui::ThemePreference::Dark, None);
+        for (width, close) in [
+            (MONITOR_MIN_SIZE.x, "Close"),
+            (MONITOR_MIN_SIZE.x, "Hide"),
+            (480.0, "Hide"),
+        ] {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, MONITOR_MIN_SIZE.y),
+                )),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(1.25);
+            let _ = ctx.run(input, |ctx| {
+                egui::TopBottomPanel::top("test-controls-banner")
+                    .frame(Frame::new().inner_margin(egui::Margin::symmetric(14, 6)))
+                    .show(ctx, |ui| {
+                        let available = ui.available_rect_before_wrap();
+                        let (left, buttons) = monitor_header(ui, |ui| {
+                            let left = ui.max_rect().left();
+                            let close = monitor_button(ui, close, true, RAIL);
+                            let settings = monitor_button(ui, "Settings", true, RAIL);
+                            let update = job_action_button(
+                                ui,
+                                "Update",
+                                true,
+                                SURFACE,
+                                JobActionGlyph::Update,
+                            );
+                            (left, [update.rect, settings.rect, close.rect])
+                        });
+                        for button in buttons {
+                            assert!(
+                                button.left() >= left - 0.5,
+                                "{button:?} crosses the title edge {left}"
+                            );
+                            assert!(button.right() <= available.right() + 0.5);
+                        }
+                    });
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn settings_window_prefers_roomy_view_and_fits_smaller_logical_displays() {
         assert_eq!(settings_window_size(None), egui::vec2(660.0, 560.0));
         assert_eq!(
@@ -4977,7 +5090,7 @@ fn open_app() -> eframe::Result {
         LaunchMode::Controls { start_hidden, .. } => (
             "Render Bridge",
             Vec2::new(480.0, 365.0),
-            Vec2::new(408.0, 330.0),
+            MONITOR_MIN_SIZE,
             cfg!(windows) && *start_hidden,
         ),
     };

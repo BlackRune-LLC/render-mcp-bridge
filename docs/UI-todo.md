@@ -44,6 +44,12 @@ The second visual pass uses larger headings, black workspaces, dark teal panels,
 
 The Windows release build passed 137 Rust tests. Dark and Light native captures at 125% Windows scaling used an isolated installation and local fixture data. At the default window sizes, the Jobs controls and two queued items fit, pipeline labels stay within their nodes, Setup displays the model license and download action, and the Nodes list and source details are legible. The Workflow test action is visible in its toolbar.
 
+## Review corrections
+
+The Jobs header remains usable at the minimum window width and labels progress for the current node. Models shows the license and resolved folders before downloading. Pipeline revision actions stay above the graph, and input wires reach Animate without crossing the motion model. Setup distinguishes a verified first render from a pending one, exposes Python detection after a manual install, and labels uninstall separately from its repair instructions. Cancelling an update stops the download worker and discards its staged installer.
+
+Repeated native checks at 125% Windows scaling covered Dark and Light on an isolated desktop with fixture data. The 408 × 360 Jobs minimum fits its controls and both queued rows, while 480 × 365 remains the default. The checks also covered exact selectable model destinations, the setup prerequisite and receipt states, the Pipeline toolbar and connections, and the updater cancellation dialog.
+
 ## Verification boundaries
 
 Confirm missing and unknown resources separately when the backend is offline or returns incomplete data. Display current state after a backend switch and discard results from an earlier backend. Invalid theme files leave the previous appearance active. Keep theme files and saved revisions independent of the server token and user settings. Verify agent-facing pipeline arguments against the shipped tool schema.

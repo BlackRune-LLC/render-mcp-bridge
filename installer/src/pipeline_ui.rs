@@ -104,7 +104,10 @@ impl PipelinePanel {
         }
         ui.add_space(4.0);
         caption(ui, "Pipelines / Motion transfer");
-        theme::heading(ui, "Wan Animate 2", 32.0);
+        ui.horizontal_wrapped(|ui| {
+            theme::heading(ui, "Wan Animate 2", 32.0);
+            self.show_revision_actions(ui);
+        });
         ui.add_space(5.0);
         let available = ui.available_width();
         if available >= 830.0 {
@@ -117,14 +120,14 @@ impl PipelinePanel {
                 });
                 pipeline_column(ui, inspector, |ui| {
                     self.swap_panel(ui);
-                    self.show_revision_actions(ui);
+                    self.show_revision_status(ui);
                 });
             });
         } else {
             self.graph(ui);
             self.swap_panel(ui);
             self.show_validation(ui);
-            self.show_revision_actions(ui);
+            self.show_revision_status(ui);
         }
     }
 
@@ -218,27 +221,37 @@ impl PipelinePanel {
                             (Node::Output, output),
                         ];
                         let paths = [
-                            (image, animate, -15.0),
-                            (clip, animate, 15.0),
-                            (model, animate, 0.0),
-                            (animate, decode, 0.0),
-                            (decode, output, 0.0),
+                            (image.right_center(), animate.center_top(), -38.0),
+                            (clip.right_center(), animate.center_bottom(), 38.0),
+                            (model.right_center(), animate.left_center(), 0.0),
+                            (animate.right_center(), decode.left_center(), 0.0),
+                            (decode.right_center(), output.left_center(), 0.0),
                         ];
-                        let wire = theme::color(ui.ctx(), GREEN);
-                        for (from, to, offset) in paths {
-                            let start = from.right_center();
-                            let end = to.left_center() + egui::vec2(0.0, offset);
-                            let bend = (start.x + end.x) / 2.0;
+                        let normal_wire = theme::color(ui.ctx(), GREEN);
+                        let motion_wire = if self.node == Node::MotionModel {
+                            theme::color(ui.ctx(), VIOLET)
+                        } else {
+                            normal_wire
+                        };
+                        let wire = |start| {
+                            if start == model.right_center() {
+                                motion_wire
+                            } else {
+                                normal_wire
+                            }
+                        };
+                        for (start, end, vertical_bend) in paths {
+                            let reach = (end.x - start.x) * 0.5;
+                            let approach = if vertical_bend == 0.0 {
+                                egui::vec2(-reach, 0.0)
+                            } else {
+                                egui::vec2(0.0, vertical_bend)
+                            };
                             painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-                                [
-                                    start,
-                                    egui::pos2(bend, start.y),
-                                    egui::pos2(bend, end.y),
-                                    end,
-                                ],
+                                [start, start + egui::vec2(reach, 0.0), end + approach, end],
                                 false,
                                 Color32::TRANSPARENT,
-                                Stroke::new(1.8_f32, wire),
+                                Stroke::new(1.8_f32, wire(start)),
                             ));
                         }
                         for (node, rect) in nodes {
@@ -294,15 +307,8 @@ impl PipelinePanel {
                             );
                             response.on_hover_text(node.description());
                         }
-                        for (from, to, offset) in paths {
-                            let start = from.right_center();
-                            let end = to.left_center() + egui::vec2(0.0, offset);
-                            let selected = self.node == Node::MotionModel && from == model;
-                            let color = if selected {
-                                theme::color(ui.ctx(), VIOLET)
-                            } else {
-                                wire
-                            };
+                        for (start, end, _) in paths {
+                            let color = wire(start);
                             painter.circle_filled(start, 3.4, color);
                             painter.circle_filled(end, 3.4, color);
                         }
@@ -435,7 +441,7 @@ impl PipelinePanel {
         }
     }
 
-    fn show_revision_actions(&mut self, ui: &mut Ui) {
+    fn show_revision_status(&self, ui: &mut Ui) {
         caption(
             ui,
             "Save a local revision. Copy agent options to use this variant in a new render.",
@@ -453,6 +459,15 @@ impl PipelinePanel {
         if let Some(error) = &self.history_error {
             status(ui, "Pipeline revision unavailable", error, CAUTION);
         }
+        if self.copied {
+            caption(
+                ui,
+                "Copied options for animate_from_clip. Your agent also needs the image, driving clip, and prompt.",
+            );
+        }
+    }
+
+    fn show_revision_actions(&mut self, ui: &mut Ui) {
         let ready = self
             .validation
             .as_ref()
@@ -460,45 +475,37 @@ impl PipelinePanel {
         let saved = self
             .latest
             .is_some_and(|revision| revision.variant == self.draft);
-        ui.horizontal_wrapped(|ui| {
-            if secondary(
-                ui,
-                "Validate",
-                self.backend.is_some() && self.worker.is_none(),
-            )
-            .clicked()
-            {
-                self.start_validation(ui.ctx());
-            }
-            if primary(
-                ui,
-                "Save new revision",
-                ready && !saved && self.data_dir.is_some(),
-            )
-            .clicked()
-                && let Some(data) = &self.data_dir
-            {
-                match pipeline::append(data, self.draft) {
-                    Ok(number) => {
-                        self.latest = Some(Revision {
-                            number,
-                            variant: self.draft,
-                        });
-                        self.history_error = None;
-                    }
-                    Err(error) => self.history_error = Some(error),
+        if secondary(
+            ui,
+            "Validate",
+            self.backend.is_some() && self.worker.is_none(),
+        )
+        .clicked()
+        {
+            self.start_validation(ui.ctx());
+        }
+        if primary(
+            ui,
+            "Save new revision",
+            ready && !saved && self.data_dir.is_some(),
+        )
+        .clicked()
+            && let Some(data) = &self.data_dir
+        {
+            match pipeline::append(data, self.draft) {
+                Ok(number) => {
+                    self.latest = Some(Revision {
+                        number,
+                        variant: self.draft,
+                    });
+                    self.history_error = None;
                 }
+                Err(error) => self.history_error = Some(error),
             }
-            if secondary(ui, "Copy agent options", ready).clicked() {
-                ui.ctx().copy_text(self.draft.agent_args().to_owned());
-                self.copied = true;
-            }
-        });
-        if self.copied {
-            caption(
-                ui,
-                "Copied options for animate_from_clip. Your agent also needs the image, driving clip, and prompt.",
-            );
+        }
+        if secondary(ui, "Copy agent options", ready).clicked() {
+            ui.ctx().copy_text(self.draft.agent_args().to_owned());
+            self.copied = true;
         }
     }
 

@@ -408,6 +408,16 @@ impl ModelManager {
 
     fn show_setup_catalog(&mut self, ui: &mut Ui) {
         let picker = |this: &mut Self, ui: &mut Ui| {
+            let fallback = if this.library.as_ref().is_some_and(Library::paths_reported) {
+                "Folders registered with ComfyUI".into()
+            } else {
+                this.connection.as_ref().map_or_else(
+                    || "Automatic".into(),
+                    |connection| connection.default_root.to_string_lossy().into_owned(),
+                )
+            };
+            this.edit_model_storage(ui, &fallback, true);
+            ui.add_space(3.0);
             for (index, pack) in DOWNLOAD_PIPELINES.iter().enumerate() {
                 let (label, _) = pack_status(this.library.as_ref(), pack);
                 let label = theme::strong(format!("{}\n{}", pack.name, label), 13.0);
@@ -423,7 +433,10 @@ impl ModelManager {
                     this.confirm_repair = false;
                 }
             }
-            this.show_model_storage(ui, true);
+            ui.collapsing("Hugging Face and model paths", |ui| {
+                this.copy_model_paths(ui);
+                hugging_face_help(ui);
+            });
         };
         if ui.available_width() >= 570.0 {
             ui.columns(2, |columns| {
@@ -871,7 +884,11 @@ impl ModelManager {
                     "Uses the folders registered by the active ComfyUI build.",
                 );
             }
-            self.show_model_storage(ui, false);
+            ui.collapsing("Change model folder and Hugging Face", |ui| {
+                self.edit_model_storage(ui, "Use folders registered with ComfyUI.", false);
+                self.copy_model_paths(ui);
+                hugging_face_help(ui);
+            });
         });
         if let Some(index) = pack_index {
             self.show_pack_files(ui, index);
@@ -901,7 +918,6 @@ impl ModelManager {
                     .show(ui, |ui| crate::code_label(ui, file.filename));
                 }
                 caption(ui, pack.description);
-                caption(ui, pack.license);
             });
     }
 
@@ -970,41 +986,39 @@ impl ModelManager {
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
 
-    fn show_model_storage(&mut self, ui: &mut Ui, expanded: bool) {
-        let downloading = self.downloading();
-        if let Some(connection) = &self.connection {
-            egui::CollapsingHeader::new("Model storage and Hugging Face").default_open(expanded).show(ui, |ui| {
-                ui.add_enabled_ui(!downloading, |ui| {
-                    let changed = asset_ui::folder_option(
-                        ui,
-                        "Model storage folder",
-                        &mut self.selected,
-                        "Automatic. Use folders registered by the active ComfyUI build.",
-                    );
-                    self.destination_changed |= changed;
-                    if changed {
-                        self.verification = None;
-                        self.confirm_repair = false;
-                        self.paused = None;
-                    }
-                    if changed && let Some(data_dir) = &connection.data_dir
-                        && let Err(error) = model_library::save_destination(data_dir, self.selected.as_deref())
-                    {
-                        self.notice = Some((error, false));
-                    }
-                    if let Some(folder) = &self.selected
-                        && secondary(ui, "Copy model paths", true).clicked()
-                    {
-                        ui.ctx().copy_text(crate::model_paths(folder));
-                    }
-                });
-                caption(ui, if std::env::var_os("HF_TOKEN").is_some_and(|value| !value.is_empty()) {
-                    "Optional HF_TOKEN is available to this app."
-                } else {
-                    "Public downloads need no sign-in. For gated access, accept the model terms on Hugging Face and provide an optional read token through HF_TOKEN."
-                });
-                ui.hyperlink_to("Hugging Face token setup", "https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hftoken");
-            });
+    fn edit_model_storage(&mut self, ui: &mut Ui, fallback: &str, compact: bool) {
+        let picker = if compact {
+            asset_ui::compact_folder_option
+        } else {
+            asset_ui::folder_option
+        };
+        let changed = ui
+            .add_enabled_ui(!self.downloading(), |ui| {
+                picker(ui, "Preferred model folder", &mut self.selected, fallback)
+            })
+            .inner;
+        if !changed {
+            return;
+        }
+        self.destination_changed = true;
+        self.verification = None;
+        self.confirm_repair = false;
+        self.paused = None;
+        if let Some(data_dir) = self
+            .connection
+            .as_ref()
+            .and_then(|connection| connection.data_dir.as_deref())
+            && let Err(error) = model_library::save_destination(data_dir, self.selected.as_deref())
+        {
+            self.notice = Some((error, false));
+        }
+    }
+
+    fn copy_model_paths(&self, ui: &mut Ui) {
+        if let Some(folder) = &self.selected
+            && secondary(ui, "Copy model paths", !self.downloading()).clicked()
+        {
+            ui.ctx().copy_text(crate::model_paths(folder));
         }
     }
 
@@ -1049,10 +1063,11 @@ impl ModelManager {
                     crate::artwork::pack_image(
                         ui,
                         pipeline.name,
-                        egui::vec2(width, (width * 0.52).clamp(100.0, 160.0)),
+                        egui::vec2(width, (width * 0.46).clamp(100.0, 138.0)),
                     );
                     let (label, color) = pack_status(library, pipeline);
                     ui.label(theme::strong(label, 13.0).color(theme::color(ui.ctx(), color)));
+                    pack_license(ui, pipeline.license);
                     if pipeline.name == "Wan Animate 2"
                         && primary(ui, "Use in pipeline", true).clicked()
                     {
@@ -1066,14 +1081,7 @@ impl ModelManager {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             theme::heading(ui, pipeline.name, 18.0);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(pipeline.license)
-                                        .size(12.0)
-                                        .color(theme::color(ui.ctx(), MUTED)),
-                                )
-                                .wrap(),
-                            );
+                            pack_license(ui, pipeline.license);
                         });
                     });
                 }
@@ -1086,40 +1094,46 @@ impl ModelManager {
                         .iter()
                         .filter_map(|target| target.path.parent())
                         .collect::<BTreeSet<_>>();
-                    caption(
-                        ui,
-                        &format!(
-                            "{} · {} destination folder{}",
-                            file_size(missing_bytes),
-                            directories.len(),
-                            if directories.len() == 1 { "" } else { "s" }
-                        ),
+                    let location = format!(
+                        "{} · {}",
+                        file_size(missing_bytes),
+                        download_location(&directories),
                     );
-                    let show_destinations = |ui: &mut Ui| {
-                        ui.collapsing("Show download destinations", |ui| {
-                            for folder in &directories {
-                                crate::code_label(ui, &folder.to_string_lossy());
-                            }
+                    ui.horizontal(|ui| {
+                        let menu = ui.menu_button("Folders", |ui| {
+                            ui.set_max_width(420.0);
+                            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                                for folder in &directories {
+                                    crate::code_label(ui, &folder.to_string_lossy());
+                                }
+                            });
                         });
-                    };
-                    if workspace {
-                        show_destinations(ui);
-                    }
+                        menu.response.on_hover_text("Show download destinations");
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&location)
+                                    .size(13.0)
+                                    .color(theme::color(ui.ctx(), MUTED)),
+                            )
+                            .truncate()
+                            .selectable(false),
+                        )
+                        .on_hover_ui(|ui| {
+                            ui.add(egui::Label::new(&location).selectable(false));
+                        });
+                    });
                     if library.is_some_and(|library| !library.paths_reported()) {
                         caption(
                             ui,
                             if workspace {
                                 "Confirm this is the model folder used by the active ComfyUI build."
                             } else {
-                                "Review the selected model folders below."
+                                "Confirm these folders match ComfyUI."
                             },
                         );
                     }
                     if primary(ui, "Download missing files", idle).clicked() {
                         selection = Some((pipeline.name, targets.clone()));
-                    }
-                    if !workspace {
-                        show_destinations(ui);
                     }
                 } else if let Err(error) = &targets {
                     caption(ui, error);
@@ -1202,6 +1216,49 @@ impl ModelManager {
         }
         ui.hyperlink_to("Model and pipeline guide", MODEL_GUIDE);
     }
+}
+
+fn pack_license(ui: &mut Ui, license: &str) {
+    ui.add(
+        egui::Label::new(
+            RichText::new(license)
+                .size(12.0)
+                .color(theme::color(ui.ctx(), MUTED)),
+        )
+        .wrap(),
+    );
+}
+
+fn download_location(directories: &BTreeSet<&Path>) -> String {
+    if let Some(directory) = directories.first() {
+        if directories.len() == 1 {
+            return asset_ui::readable_path(directory).into_owned();
+        }
+        if let Some(parent) = directory.parent()
+            && directories
+                .iter()
+                .all(|directory| directory.parent() == Some(parent))
+        {
+            return format!(
+                "{} folders under {}",
+                directories.len(),
+                asset_ui::readable_path(parent)
+            );
+        }
+    }
+    format!("{} model folders", directories.len())
+}
+
+fn hugging_face_help(ui: &mut Ui) {
+    caption(
+        ui,
+        if std::env::var_os("HF_TOKEN").is_some_and(|value| !value.is_empty()) {
+            "Optional HF_TOKEN is available to this app."
+        } else {
+            "Public downloads need no sign-in. For gated access, accept the model terms on Hugging Face and provide an optional read token through HF_TOKEN."
+        },
+    );
+    ui.hyperlink_to("Hugging Face token setup", "https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hftoken");
 }
 
 const FILE_ROW_HEIGHT: f32 = 54.0;

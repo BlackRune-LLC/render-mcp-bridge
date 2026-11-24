@@ -13,7 +13,7 @@ use crate::{CAUTION, CREAM, GREEN, LINE, MUTED, SURFACE, VIOLET, caption, monito
 #[cfg(windows)]
 use crate::RAIL_ACTIVE;
 #[cfg(windows)]
-use crate::job_progress::Observer;
+use crate::job_progress::{Observer, Progress};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const FRESH_FOR: Duration = Duration::from_secs(3);
@@ -199,12 +199,27 @@ impl QueueView {
                             self.show_refresh(ui);
                         });
                     });
-                    if queue.running > 0 {
-                        self.show_progress(ui, queue);
-                    }
+                    let active_job = if queue.running > 0 {
+                        self.show_progress(ui, queue).or_else(|| {
+                            queue
+                                .running_ids
+                                .first()
+                                .filter(|_| queue.running == 1)
+                                .map(String::as_str)
+                        })
+                    } else {
+                        None
+                    };
                     ui.horizontal_wrapped(|ui| {
                         queue_count(ui, queue.running, "running", tone);
                         queue_count(ui, queue.queued, "queued", VIOLET);
+                        if dashboard
+                            && let Some(id) = active_job
+                            && let Some(short) = short_job_id(id)
+                        {
+                            ui.label(theme::strong(format!("Job {short}"), 13.0))
+                                .on_hover_text(id);
+                        }
                     });
                 });
             });
@@ -244,43 +259,20 @@ impl QueueView {
         }
     }
 
-    fn show_progress(&self, ui: &mut Ui, _queue: &QueueStatus) {
+    fn show_progress<'a>(&self, ui: &mut Ui, _queue: &'a QueueStatus) -> Option<&'a str> {
         #[cfg(windows)]
-        if let Some(progress) = self.progress.as_ref().and_then(|observer| {
-            _queue
-                .running_ids
-                .iter()
-                .find_map(|id| observer.latest_for(id))
+        if let Some((id, progress)) = self.progress.as_ref().and_then(|observer| {
+            _queue.running_ids.iter().find_map(|id| {
+                observer
+                    .latest_for(id)
+                    .map(|progress| (id.as_str(), progress))
+            })
         }) {
-            let fraction = (progress.value / progress.max).clamp(0.0, 1.0);
-            let percent = if progress.value < progress.max {
-                (fraction * 100.0).round().min(99.0)
-            } else {
-                100.0
-            };
-            ui.horizontal_wrapped(|ui| {
-                caption(
-                    ui,
-                    &format!("Current stage {:.0} of {:.0}", progress.value, progress.max),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        theme::strong(format!("{percent:.0}%"), 17.0)
-                            .color(theme::color(ui.ctx(), INK)),
-                    );
-                });
-            });
-            ui.scope(|ui| {
-                ui.visuals_mut().extreme_bg_color = theme::color(ui.ctx(), RAIL_ACTIVE);
-                ui.add(
-                    egui::ProgressBar::new(fraction as f32)
-                        .desired_height(10.0)
-                        .fill(theme::color(ui.ctx(), GREEN)),
-                );
-            });
-            return;
+            show_node_progress(ui, progress);
+            return Some(id);
         }
-        caption(ui, "Waiting for stage progress.");
+        caption(ui, "Waiting for node progress.");
+        None
     }
 
     pub fn stop_confirmation(
@@ -306,6 +298,45 @@ impl QueueView {
             }
         })
     }
+}
+
+#[cfg(windows)]
+fn show_node_progress(ui: &mut Ui, progress: Progress) {
+    let fraction = (progress.value / progress.max).clamp(0.0, 1.0);
+    let percent = if progress.value < progress.max {
+        (fraction * 100.0).round().min(99.0)
+    } else {
+        100.0
+    };
+    ui.horizontal_wrapped(|ui| {
+        caption(
+            ui,
+            &format!("Node steps {:.0} of {:.0}", progress.value, progress.max),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                theme::strong(format!("{percent:.0}% of node"), 17.0)
+                    .color(theme::color(ui.ctx(), INK)),
+            );
+        });
+    });
+    ui.scope(|ui| {
+        ui.visuals_mut().extreme_bg_color = theme::color(ui.ctx(), RAIL_ACTIVE);
+        ui.add(
+            egui::ProgressBar::new(fraction as f32)
+                .desired_height(10.0)
+                .fill(theme::color(ui.ctx(), GREEN)),
+        );
+    });
+}
+
+fn short_job_id(id: &str) -> Option<&str> {
+    (!id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then(|| &id[..id.len().min(10)])
 }
 
 fn queue_frame(ui: &mut Ui, margin: i8, content: impl FnOnce(&mut Ui)) {
@@ -389,6 +420,37 @@ fn queue_glyph(ui: &mut Ui, shape: QueueGlyph, tone: egui::Color32, size: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn completed_node_still_labels_the_percentage_as_node_progress() {
+        let ctx = egui::Context::default();
+        theme::configure_for(&ctx, egui::ThemePreference::Dark, None);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_node_progress(
+                    ui,
+                    Progress {
+                        value: 20.0,
+                        max: 20.0,
+                    },
+                );
+            });
+        });
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "100% of node")
+        }));
+    }
+
+    #[test]
+    fn active_job_identity_only_uses_bounded_ascii_ids() {
+        assert_eq!(short_job_id("abc123-def456"), Some("abc123-def"));
+        assert_eq!(short_job_id("job01"), Some("job01"));
+        assert_eq!(short_job_id("prompt text"), None);
+        assert_eq!(short_job_id("éx"), None);
+        assert_eq!(short_job_id(&"a".repeat(129)), None);
+        assert_eq!(short_job_id(""), None);
+    }
 
     #[test]
     fn only_an_observed_idle_queue_gets_the_ordinary_stop_label() {

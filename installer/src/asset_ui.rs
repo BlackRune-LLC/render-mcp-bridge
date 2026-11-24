@@ -1,8 +1,9 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use eframe::egui::Ui;
+use eframe::egui::{FontId, Label, RichText, Ui};
 
 use crate::asset_folders::{self, AssetFolders};
 use crate::{caption, field_label, secondary};
@@ -28,8 +29,16 @@ fn folder_picker(
     compact: bool,
 ) -> bool {
     let value = |ui: &mut Ui, path: &Option<PathBuf>| {
-        if let Some(path) = path {
-            caption(ui, &path.to_string_lossy());
+        let fallback_path = Path::new(fallback);
+        if let Some(path) = path
+            .as_deref()
+            .or_else(|| fallback_path.is_absolute().then_some(fallback_path))
+        {
+            if compact {
+                compact_path_label(ui, &readable_path(path));
+            } else {
+                caption(ui, &path.to_string_lossy());
+            }
         } else {
             caption(ui, fallback);
         }
@@ -81,6 +90,105 @@ fn folder_picker(
     let changed = ui.horizontal_wrapped(|ui| actions(ui, path)).inner;
     value(ui, path);
     changed
+}
+
+pub(crate) fn readable_path(path: &Path) -> Cow<'_, str> {
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        match prefix.kind() {
+            std::path::Prefix::VerbatimDisk(_) => {
+                if let Some(drive_path) = text.strip_prefix(r"\\?\") {
+                    return Cow::Owned(drive_path.to_owned());
+                }
+            }
+            std::path::Prefix::VerbatimUNC(..) => {
+                if let Some(network_path) = text.strip_prefix(r"\\?\UNC\") {
+                    return Cow::Owned(format!(r"\\{network_path}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+fn compact_path_label(ui: &mut Ui, full_path: &str) {
+    let color = crate::theme::color(ui.ctx(), crate::MUTED);
+    let width = ui.available_width();
+    let displayed = middle_elide(full_path, |value| {
+        ui.painter()
+            .layout_no_wrap(value.to_owned(), FontId::proportional(14.0), color)
+            .size()
+            .x
+            <= width
+    });
+    ui.add(
+        Label::new(RichText::new(displayed.as_ref()).size(14.0).color(color))
+            .truncate()
+            .selectable(false),
+    )
+    .on_hover_ui(|ui| {
+        ui.add(Label::new(full_path).selectable(false));
+    });
+}
+
+fn middle_elide(text: &str, fits: impl Fn(&str) -> bool) -> Cow<'_, str> {
+    if fits(text) {
+        return Cow::Borrowed(text);
+    }
+    let boundaries: Vec<_> = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let count = boundaries.len() - 1;
+    let mut low = 0;
+    let mut high = count;
+    let mut best = "…".to_owned();
+    while low < high {
+        let keep = (low + high) / 2;
+        let start = keep.div_ceil(3);
+        let tail = keep - start;
+        let candidate = format!(
+            "{}…{}",
+            &text[..boundaries[start]],
+            &text[boundaries[count - tail]..]
+        );
+        if fits(&candidate) {
+            best = candidate;
+            low = keep + 1;
+        } else {
+            high = keep;
+        }
+    }
+    Cow::Owned(best)
+}
+
+#[cfg(test)]
+mod path_label_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_the_drive_and_destination_visible_in_an_elided_path() {
+        let source = r"C:\Projects\部品\RenderBridge\Models";
+        let display = middle_elide(source, |value| value.chars().count() <= 18);
+        assert!(display.starts_with(r"C:\"));
+        assert!(display.ends_with("Models"));
+        assert!(display.contains('…'));
+        assert!(display.chars().count() <= 18);
+        assert_eq!(middle_elide(source, |_| true), source);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn formats_extended_windows_paths_for_display_only() {
+        let disk = Path::new(r"\\?\C:\Render Bridge\models");
+        let unc = Path::new(r"\\?\UNC\machine\share\models");
+        assert_eq!(readable_path(disk), r"C:\Render Bridge\models");
+        assert_eq!(readable_path(unc), r"\\machine\share\models");
+        assert_eq!(disk.as_os_str(), r"\\?\C:\Render Bridge\models");
+    }
 }
 
 #[derive(Default)]

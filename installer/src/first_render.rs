@@ -28,16 +28,40 @@ pub(crate) struct FirstRender {
 }
 
 impl FirstRender {
-    pub(crate) fn show(&mut self, ui: &mut Ui, installed: &Installed, server_verified: bool) {
-        let installation = (installed.app_dir.clone(), installed.mcp_url.clone());
-        if self.installation.as_ref() != Some(&installation) {
+    pub(crate) fn update_receipt(
+        &mut self,
+        ctx: &egui::Context,
+        installed: Option<&Installed>,
+    ) -> bool {
+        let same_installation = match (self.installation.as_ref(), installed) {
+            (Some((app_dir, mcp_url)), Some(installed)) => {
+                app_dir == &installed.app_dir && mcp_url == &installed.mcp_url
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_installation {
             *self = Self {
-                installation: Some(installation),
+                installation: installed
+                    .map(|installed| (installed.app_dir.clone(), installed.mcp_url.clone())),
                 ..Self::default()
             };
         }
-        self.poll(ui.ctx());
+        self.poll(ctx);
+        matches!(self.result, Some(Ok(())))
+    }
 
+    pub(crate) fn show(&mut self, ui: &mut Ui, installed: &Installed, server_verified: bool) {
+        self.update_receipt(ui.ctx(), Some(installed));
+        self.show_current(ui, installed, server_verified);
+    }
+
+    pub(crate) fn show_current(
+        &mut self,
+        ui: &mut Ui,
+        installed: &Installed,
+        server_verified: bool,
+    ) {
         card(ui, |ui| {
             theme::heading(ui, "First render", 19.0);
             if matches!(self.result, Some(Ok(()))) {
@@ -251,6 +275,43 @@ fn receipt_preview(preview: Option<&str>) -> Option<egui::ColorImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_render_receipt_is_current_only_for_its_installation() {
+        let ctx = egui::Context::default();
+        let mut installed = Installed {
+            data_dir: PathBuf::from("bridge"),
+            app_dir: PathBuf::from("bridge/app"),
+            token_path: PathBuf::from("bridge/token"),
+            mcp_url: "http://127.0.0.1:8190/mcp".into(),
+            start_command: String::new(),
+        };
+        let mut receipt = FirstRender::default();
+        assert!(!receipt.update_receipt(&ctx, Some(&installed)));
+
+        let (sender, receiver) = mpsc::channel();
+        receipt.worker = Some(receiver);
+        assert!(!receipt.update_receipt(&ctx, Some(&installed)));
+        sender.send(Ok(None)).expect("receipt worker is available");
+        assert!(receipt.update_receipt(&ctx, Some(&installed)));
+        assert!(receipt.update_receipt(&ctx, Some(&installed)));
+
+        installed.mcp_url = "http://127.0.0.1:8191/mcp".into();
+        assert!(!receipt.update_receipt(&ctx, Some(&installed)));
+        assert!(receipt.result.is_none());
+
+        let (sender, receiver) = mpsc::channel();
+        receipt.worker = Some(receiver);
+        sender.send(Ok(None)).expect("receipt worker is available");
+        installed.app_dir = PathBuf::from("other-bridge/app");
+        assert!(!receipt.update_receipt(&ctx, Some(&installed)));
+        assert!(receipt.worker.is_none());
+        assert!(receipt.result.is_none());
+
+        receipt.result = Some(Ok(()));
+        assert!(!receipt.update_receipt(&ctx, None));
+        assert!(!receipt.update_receipt(&ctx, Some(&installed)));
+    }
 
     #[test]
     fn receipt_preview_accepts_only_exact_bounded_pixel_data() {
