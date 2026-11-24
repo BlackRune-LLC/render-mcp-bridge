@@ -92,8 +92,8 @@ impl PythonProbe {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     #[serde(rename = "COMFY_ROOT")]
     pub comfy_root: String,
@@ -163,7 +163,111 @@ pub(crate) fn default_data_dir() -> Result<PathBuf, String> {
 }
 
 fn read_settings(directory: &Path) -> Option<Settings> {
-    serde_json::from_slice(&fs::read(directory.join("settings.json")).ok()?).ok()
+    read_setup_config(&directory.join("settings.json"))
+        .ok()
+        .flatten()
+        .filter(|settings| {
+            !settings.comfy_root.trim().is_empty() && !settings.comfy_url.trim().is_empty()
+        })
+}
+
+fn read_setup_config(path: &Path) -> Result<Option<Settings>, String> {
+    const LIMIT: u64 = 64 * 1024;
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Could not read the Render Bridge setup config.".into()),
+    };
+    if !metadata.is_file() || metadata.len() > LIMIT {
+        return Err("Choose a regular Render Bridge settings JSON file up to 64 KiB.".into());
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(LIMIT + 1).read_to_end(&mut bytes))
+        .map_err(|_| "Could not read the Render Bridge setup config.")?;
+    if bytes.len() as u64 > LIMIT {
+        return Err("The Render Bridge setup config is too large.".into());
+    }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+    if bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'{')
+    {
+        return Err("The Render Bridge setup config must be a JSON object.".into());
+    }
+    serde_json::from_slice(bytes).map(Some).map_err(|_| {
+        "Use a settings JSON object with only COMFY_ROOT, COMFY_URL, COMFY_INPUT_DIR, and COMFY_OUTPUT_DIR as strings.".into()
+    })
+}
+
+pub(crate) fn fill_missing(mut settings: Settings, defaults: &Settings) -> Settings {
+    if settings.comfy_root.trim().is_empty() {
+        settings.comfy_root.clone_from(&defaults.comfy_root);
+    }
+    if settings.comfy_url.trim().is_empty() {
+        settings.comfy_url.clone_from(&defaults.comfy_url);
+    }
+    for (saved, fallback) in [
+        (&mut settings.comfy_input, &defaults.comfy_input),
+        (&mut settings.comfy_output, &defaults.comfy_output),
+    ] {
+        if saved.trim().is_empty() {
+            saved.clone_from(fallback);
+        }
+    }
+    settings
+}
+
+pub(crate) fn import_setup_config(path: &Path, defaults: &Settings) -> Result<Settings, String> {
+    let settings = read_setup_config(path)?.ok_or("The setup config could not be found.")?;
+    for folder in [
+        &settings.comfy_root,
+        &settings.comfy_input,
+        &settings.comfy_output,
+    ] {
+        let folder = folder.trim();
+        let path = Path::new(folder);
+        if !folder.is_empty() && !path.is_absolute() && path.strip_prefix("~").is_err() {
+            return Err(
+                "Use absolute folder paths or paths starting with ~/ in the setup config.".into(),
+            );
+        }
+    }
+    if !settings.comfy_url.trim().is_empty() {
+        validate_comfy_url(&settings.comfy_url)?;
+    }
+    Ok(fill_missing(settings, defaults))
+}
+
+pub(crate) fn existing_setup_config(data: &Path) -> Result<Option<Settings>, String> {
+    setup_snapshot(data).map(|(_, settings)| settings)
+}
+
+fn setup_snapshot(data: &Path) -> Result<(PathBuf, Option<Settings>), String> {
+    let runtime = active_runtime(data)
+        .map_err(|_| "Could not read the current Render Bridge runtime selection.")?;
+    let saved = read_setup_config(&settings_directory(data, &runtime).join("settings.json"))?;
+    if saved.is_none() && (runtime != data.join("app") || runtime.is_dir()) {
+        return Err(
+            "The current Render Bridge config is missing. Restore it before reinstalling.".into(),
+        );
+    }
+    Ok((runtime, saved))
+}
+
+pub(crate) fn settings_for_setup(data: &Path, defaults: &Settings) -> Result<Settings, String> {
+    Ok(existing_setup_config(data)?
+        .map_or_else(|| defaults.clone(), |saved| fill_missing(saved, defaults)))
+}
+
+pub(crate) fn confirm_setup_settings(data: &Path, reviewed: &Settings) -> Result<Settings, String> {
+    let effective = validate_settings(&settings_for_setup(data, reviewed)?)?;
+    if effective != validate_settings(reviewed)? {
+        return Err("The saved ComfyUI settings changed. Go back and check ComfyUI again before installing.".into());
+    }
+    Ok(effective)
 }
 
 fn active_runtime(directory: &Path) -> io::Result<PathBuf> {
@@ -206,15 +310,8 @@ fn settings_for_runtime(data: &Path, runtime: &Path) -> Option<Settings> {
 }
 
 pub fn default_settings() -> Settings {
-    let saved = data_dir().ok().and_then(|data| {
-        let runtime = active_runtime(&data).ok()?;
-        settings_for_runtime(&data, &runtime)
-    });
-    let root_override = environment_path("COMFY_ROOT");
-    let comfy_root = root_override
-        .as_ref()
+    let comfy_root = environment_path("COMFY_ROOT")
         .map(|path| path.to_string_lossy().into_owned())
-        .or_else(|| saved.as_ref().map(|settings| settings.comfy_root.clone()))
         .unwrap_or_else(|| {
             home_dir()
                 .unwrap_or_default()
@@ -225,25 +322,12 @@ pub fn default_settings() -> Settings {
     let comfy_url = env::var("COMFY_URL")
         .ok()
         .and_then(|value| validate_comfy_url(&value).ok())
-        .or_else(|| {
-            saved
-                .as_ref()
-                .and_then(|settings| validate_comfy_url(&settings.comfy_url).ok())
-        })
         .unwrap_or_else(|| DEFAULT_COMFY_URL.into());
     Settings {
         comfy_root,
         comfy_url,
-        comfy_input: saved
-            .as_ref()
-            .filter(|_| root_override.is_none())
-            .map(|s| s.comfy_input.clone())
-            .unwrap_or_default(),
-        comfy_output: saved
-            .as_ref()
-            .filter(|_| root_override.is_none())
-            .map(|s| s.comfy_output.clone())
-            .unwrap_or_default(),
+        comfy_input: String::new(),
+        comfy_output: String::new(),
     }
 }
 
@@ -858,11 +942,6 @@ fn installation(data_dir: &Path, app_dir: PathBuf, port: u16) -> Result<Installe
     })
 }
 
-pub fn existing_install() -> Option<Installed> {
-    let data = data_dir().ok()?;
-    existing_install_at(&data)
-}
-
 pub fn existing_install_at(data: &Path) -> Option<Installed> {
     if !data.is_absolute() {
         return None;
@@ -909,6 +988,16 @@ pub(crate) fn saved_install_settings(installed: &Installed) -> Result<Settings, 
 #[cfg(windows)]
 pub(crate) fn config_file(installed: &Installed) -> PathBuf {
     settings_directory(&installed.data_dir, &installed.app_dir).join("settings.json")
+}
+
+#[cfg(windows)]
+pub(crate) fn export_setup_config(installed: &Installed, path: &Path) -> Result<(), String> {
+    let settings = saved_install_settings(installed)?;
+    let mut bytes =
+        serde_json::to_vec_pretty(&settings).map_err(|_| "Could not encode the setup config.")?;
+    bytes.push(b'\n');
+    atomic_write(path, &bytes)
+        .map_err(|_| "Could not save the setup config in the selected folder.".into())
 }
 
 pub(crate) fn rotate_token(installed: &Installed) -> Result<(), String> {
@@ -1150,7 +1239,6 @@ pub fn install(
     mut progress: impl FnMut(&str),
 ) -> Result<Installed, String> {
     check_cancel(cancel)?;
-    let settings = validate_settings(settings)?;
     progress("Checking Python 3.11 or newer.");
     let command = python_for_creation(selected_python, cancel)?;
     let data_dir = match selected_data_dir {
@@ -1158,22 +1246,38 @@ pub fn install(
             if !path.is_absolute() {
                 return Err("Choose an absolute path for the Render Bridge installation.".into());
             }
-            let entries = fs::read_dir(path)
-                .map_err(|_| "Choose a writable directory for the Render Bridge installation.")?;
-            #[cfg(windows)]
-            let retained_installation =
-                crate::uninstall::is_owned(path) || existing_legacy_install_for_repair(path);
-            #[cfg(not(windows))]
-            let retained_installation = false;
-            if entries
-                .into_iter()
-                .any(|entry| entry.map_or(true, |entry| entry.file_name() != "install.lock"))
-                && existing_install_at(path).is_none()
-                && !retained_installation
-            {
-                return Err(
-                    "Choose an empty folder or an existing Render Bridge installation.".into(),
-                );
+            match crate::asset_folders::check_directory(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(
+                        "Choose a regular directory for the Render Bridge installation.".into(),
+                    );
+                }
+                Ok(()) => {
+                    let entries = fs::read_dir(path).map_err(
+                        |_| "Choose a writable directory for the Render Bridge installation.",
+                    )?;
+                    #[cfg(windows)]
+                    let retained_installation = crate::uninstall::is_owned(path)
+                        || existing_legacy_install_for_repair(path);
+                    #[cfg(not(windows))]
+                    let retained_installation = false;
+                    if entries.into_iter().any(|entry| {
+                        entry.map_or(true, |entry| {
+                            !matches!(
+                                entry.file_name().to_str(),
+                                Some("install.lock" | "settings.json")
+                            )
+                        })
+                    }) && existing_install_at(path).is_none()
+                        && !retained_installation
+                    {
+                        return Err(
+                            "Choose an empty folder or an existing Render Bridge installation."
+                                .into(),
+                        );
+                    }
+                }
             }
             path.to_path_buf()
         }
@@ -1182,12 +1286,20 @@ pub fn install(
     create_private_dir(&data_dir)
         .map_err(|_| "Could not create the Render Bridge data directory.")?;
     let _lock = lock_install(&data_dir)?;
+    let snapshot = setup_snapshot(&data_dir)?;
+    let settings = confirm_setup_settings(&data_dir, settings)?;
     let port = mcp_port(&data_dir)?;
     #[cfg(windows)]
     crate::uninstall::mark_install(&data_dir)?;
     let (staging, installed) = stage_runtime(&data_dir, port, command, cancel, &mut progress)?;
     check_cancel(cancel)?;
     progress("Activating the verified Render Bridge runtime.");
+    if setup_snapshot(&data_dir)? != snapshot {
+        return Err(
+            "The saved setup changed while preparing the runtime. Check ComfyUI again and retry."
+                .into(),
+        );
+    }
     save_mcp_port(&data_dir, port)?;
     #[cfg(windows)]
     activate_windows_runtime(&data_dir, staging, &settings, || {
@@ -1251,20 +1363,24 @@ pub fn upgrade_existing(
     }
     let _lock = lock_install(data_dir)?;
     let port = mcp_port(data_dir)?;
-    let current = active_runtime(data_dir)
-        .map_err(|_| "The existing Render Bridge installation could not be read.")?;
+    let snapshot = setup_snapshot(data_dir)?;
     // The previous version may predate some files bundled in this updater.
-    let settings = settings_for_runtime(data_dir, &current)
+    let settings = snapshot
+        .1
+        .as_ref()
         .ok_or("Bridge setup settings are missing. Run setup again.")?;
-    let settings = validate_settings(&settings)?;
+    let settings = validate_settings(settings)?;
     crate::uninstall::mark_install(data_dir)?;
     progress("Checking the existing Python installation.");
-    let interpreter = venv_python(&current);
+    let interpreter = venv_python(&snapshot.0);
     let command = python_for_creation(Some(&interpreter), cancel)
         .or_else(|_| python_for_creation(None, cancel))?;
     let (staging, installed) = stage_runtime(data_dir, port, command, cancel, &mut progress)?;
     check_cancel(cancel)?;
     progress("Activating the verified Render Bridge runtime.");
+    if setup_snapshot(data_dir)? != snapshot {
+        return Err("The saved setup changed while preparing the update. Review the configuration and retry.".into());
+    }
     save_mcp_port(data_dir, port)?;
     activate_windows_runtime(data_dir, staging, &settings, || update_monitor(&installed))?;
     Ok(installed)
@@ -1276,6 +1392,95 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn setup_config_only_fills_missing_fields_and_preserves_an_invalid_original() {
+        let data = tempfile::tempdir().unwrap();
+        let default = Settings {
+            comfy_root: data.path().join("ComfyUI").to_string_lossy().into_owned(),
+            comfy_url: DEFAULT_COMFY_URL.into(),
+            comfy_input: String::new(),
+            comfy_output: String::new(),
+        };
+        let path = data.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"COMFY_URL":"http://127.0.0.1:8288","COMFY_INPUT_DIR":" "}"#,
+        )
+        .unwrap();
+        let merged = settings_for_setup(data.path(), &default).unwrap();
+        assert_eq!(merged.comfy_url, "http://127.0.0.1:8288");
+        assert_eq!(merged.comfy_root, default.comfy_root);
+        assert!(merged.comfy_input.is_empty());
+        assert!(fs::read_to_string(&path).unwrap().contains("8288"));
+        let supplied_input = data.path().join("supplied-input").display().to_string();
+        let saved_root = data.path().join("existing-comfy").display().to_string();
+        save_settings(
+            data.path(),
+            &Settings {
+                comfy_root: saved_root.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let merged = settings_for_setup(
+            data.path(),
+            &Settings {
+                comfy_input: supplied_input.clone(),
+                ..default.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(merged.comfy_root, saved_root);
+        assert_eq!(merged.comfy_input, supplied_input);
+
+        fs::write(
+            &path,
+            r#"{"COMFY_URL":"http://127.0.0.1:8288","MCP_TOKEN":"hidden"}"#,
+        )
+        .unwrap();
+        assert!(settings_for_setup(data.path(), &default).is_err());
+        assert!(fs::read_to_string(&path).unwrap().contains("MCP_TOKEN"));
+    }
+
+    #[test]
+    fn setup_refuses_to_activate_settings_different_from_the_reviewed_backend() {
+        let data = tempfile::tempdir().unwrap();
+        fs::create_dir(data.path().join("input")).unwrap();
+        fs::create_dir(data.path().join("output")).unwrap();
+        let reviewed = Settings {
+            comfy_root: data.path().display().to_string(),
+            comfy_url: DEFAULT_COMFY_URL.into(),
+            ..Default::default()
+        };
+        assert!(confirm_setup_settings(data.path(), &reviewed).is_ok());
+        save_settings(
+            data.path(),
+            &Settings {
+                comfy_url: "http://127.0.0.1:8288".into(),
+                ..reviewed.clone()
+            },
+        )
+        .unwrap();
+        assert!(confirm_setup_settings(data.path(), &reviewed).is_err());
+    }
+
+    #[test]
+    fn explicit_configs_reject_credentials_and_shell_relative_paths() {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("settings.json");
+        let defaults = default_settings();
+        fs::write(&path, r#"{"COMFY_ROOT":"relative/ComfyUI"}"#).unwrap();
+        assert!(import_setup_config(&path, &defaults).is_err());
+        fs::write(
+            &path,
+            r#"{"COMFY_URL":"http://user:secret@127.0.0.1:8188"}"#,
+        )
+        .unwrap();
+        assert!(import_setup_config(&path, &defaults).is_err());
+        fs::write(&path, r#"{"COMFY_ROOT":"~/ComfyUI"}"#).unwrap();
+        assert!(import_setup_config(&path, &defaults).is_ok());
+    }
 
     #[test]
     fn python_readiness_distinguishes_versions_and_environment_support() {

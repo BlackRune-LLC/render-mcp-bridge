@@ -59,7 +59,7 @@ In the installer built from current source, choose **Open Render Bridge** on **C
 
 - **Jobs** shows running and queued jobs for the local ComfyUI address selected in setup. When ComfyUI sends progress for a running stage, the panel shows its step count and percentage.
 - **Models** has **Installed**, **Packs**, and **Downloads**. Search the installed library or choose a pack and review its size and destination. Render Bridge refreshes the list after a download. [Download models](docs/pipelines.md#download-models-in-render-bridge)
-- **Pipelines** previews model swaps for Wan Animate 2. Validate the requirements, save a local revision, and copy the run option for your agent. **Nodes** shows what the selected ComfyUI build reports as installed. [Review pipelines and nodes](docs/pipelines.md#review-pipelines-and-nodes)
+- **Pipelines** compares Wan Animate 2 variants and edits imported ComfyUI API workflows. Check models and ports, export an edited copy, or queue a local test. **Nodes** shows what the selected build reports and lets you review and manage custom node packs for a supported local installation. [Edit workflows and manage nodes](docs/pipelines.md#review-pipelines-and-nodes)
 - **Start server** starts Render Bridge using your saved installation. When the server is running, the muted button remains clickable to confirm its status. The red **Stop server** button stops the session started by this panel after you review the queue and confirm. Manage ComfyUI in its own app or through its launch command.
 - **Hide to tray** keeps Render Bridge in the Windows notification area. Click its icon to reopen the panel. If the icon is in the overflow, open **Show hidden icons** first.
 - Select **Connect** to reopen **Connect an agent**, copy connection details, or rotate the token after stopping the server. [Connect after installation](docs/connections.md#connect-after-installation)
@@ -169,6 +169,8 @@ Set `COMFY_INPUT_DIR` and `COMFY_OUTPUT_DIR` before starting the server if the s
 Leave both processes running and check `http://127.0.0.1:8189/health`. Both `mcp` and `comfyui` should report `ok`. On first run, Render Bridge creates a bearer token. Its default path is `%LOCALAPPDATA%\comfy-mcp\token.txt` on Windows or `${XDG_DATA_HOME:-$HOME/.local/share}/comfy-mcp/token.txt` on macOS and Linux. Keep the token in the server's private token file and your MCP client's user-scope config.
 
 For custom ComfyUI folders, a different local port, or signed links for other devices, see the [configuration reference](docs/configuration.md).
+
+If ComfyUI is already set up on the destination computer, reuse a `settings.json` file to prefill setup or fill missing values during a reinstall. [Reuse a setup config](docs/configuration.md#reuse-a-setup-config-on-another-computer)
 
 ## Connect an MCP client
 

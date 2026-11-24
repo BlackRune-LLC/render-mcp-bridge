@@ -21,11 +21,15 @@ The first implementation passed the Windows release build, 115 Rust tests, and 6
 
 ## Remaining app windows
 
-- [ ] **Workflow editing and node management.** Import and export ComfyUI API workflows. Map loaded model slots and graph ports, validate compatible alternatives, show dependency changes and required downloads, and add undo and a user-initiated test run. Let users inspect custom node sources and versions before approving an install. Keep existing saved workflows and submitted jobs stable.
+- [x] **Workflow editing and node management.** Import and export ComfyUI API workflows. Map loaded model slots and graph ports, validate compatible alternatives, show dependency changes and required downloads, and add undo and a user-initiated test run. Let users inspect custom node sources and versions before approving an install. Keep existing saved workflows and submitted jobs stable.
 - [ ] **Jobs and Connect.** Apply the new navigation and compact queue presentation to the existing panel. Verify live stage progress, start and stop controls, Gaming Mode, agent setup, token rotation, and a signed first-render receipt.
 - [ ] **Settings and utilities.** Give Appearance, Storage, Advanced, and Diagnostics clear navigation. Apply the same styles to the tray menu, update and repair paths, uninstall, and confirmation dialogs. Keep file pickers and captions usable at small window sizes and high display scaling.
 - [ ] **Installer.** Carry the same palette and navigation through Prerequisites, ComfyUI, Models, Install, and Connect. Verify fresh install and in-place upgrade with the optional model downloads, tray handoff, and agent connection.
 - [ ] **Acceptance.** Run the Windows Rust and Python suites. Capture Dark and Light views of each screen at normal and high scaling. Exercise theme import and reset, downloads, node inventory, a pipeline revision, and restart persistence from a disposable installation.
+
+The Windows workflow and node milestone passed 131 Rust tests and 72 Python tests. Native Dark and Light captures at 125% covered Models, built-in pipelines, the workflow editor, node inventory, and pack management with local fixture data. Workflow submission and pack management tests used isolated fixtures.
+
+Desktop and terminal setup now accept a reusable settings JSON file. Existing saved values take precedence per field. Setup aborts before activation if the selected saved configuration changes while preparing the runtime.
 
 ## Verification boundaries
 

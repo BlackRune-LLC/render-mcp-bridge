@@ -79,11 +79,27 @@ pub struct PipelinePanel {
     worker: Option<(CheckTarget, Receiver<CheckResult>)>,
     generation: u64,
     copied: bool,
+    edit_workflow: bool,
+    workflow: crate::workflow_ui::WorkflowPanel,
 }
 
 impl PipelinePanel {
-    pub fn show(&mut self, ui: &mut Ui, backend: Option<&str>, data_dir: Option<&Path>) {
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        backend: Option<&str>,
+        data_dir: Option<&Path>,
+        installed: Option<&crate::setup::Installed>,
+    ) {
         self.refresh(data_dir, backend);
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.edit_workflow, false, "Built-in pipelines");
+            ui.selectable_value(&mut self.edit_workflow, true, "Workflow editor");
+        });
+        if self.edit_workflow {
+            self.workflow.show(ui, backend, installed);
+            return;
+        }
         ui.heading("Wan Animate 2");
         caption(ui, "Motion transfer");
         self.graph(ui);
@@ -165,7 +181,7 @@ impl PipelinePanel {
                             {
                                 if i > 0 {
                                     ui.label(
-                                        RichText::new("→").color(theme::color(ui.ctx(), MUTED)),
+                                        RichText::new(">").color(theme::color(ui.ctx(), MUTED)),
                                     );
                                 }
                                 let selected = self.node == node;
@@ -227,7 +243,7 @@ impl PipelinePanel {
             caption(
                 ui,
                 &format!(
-                    "Motion model: {} → {}",
+                    "Motion model: {} to {}",
                     baseline.label(),
                     self.draft.label()
                 ),
@@ -235,7 +251,7 @@ impl PipelinePanel {
             caption(
                 ui,
                 &format!(
-                    "Sampler: {} → {} LCM steps",
+                    "Sampler: {} to {} LCM steps",
                     baseline.steps(),
                     self.draft.steps()
                 ),

@@ -69,11 +69,24 @@ Open **Pipelines**, or choose **Use in pipeline** on the Wan Animate 2 pack. Sel
 
 Open **Nodes** to search the selected build by name, ID, or category. Filter by built-in, custom, or unreported origin. If the backend reports a source or version, the selected node shows it. Follow the next section to manage custom nodes.
 
+### Edit a ComfyUI workflow
+
+1. Export the graph from ComfyUI in **API Format**. Open **Pipelines → Workflow editor → Import API JSON** in Render Bridge.
+2. Select **Check dependencies**. Pick a node and an input to see the current value or connection. Choose a model from the files the selected build reports, apply a value, or connect a compatible output in the graph.
+3. Review missing nodes, unsupported inputs, and model changes. Find curated packs under **Models**, or follow the workflow author's instructions for other files. Check dependencies again after adding resources.
+4. Use **Undo** to back out an edit, or **Export copy** to save a new API JSON file. Keep your original file. Ask your connected agent to pass the edited graph to `run_workflow` as a new job.
+
+**Test run** explicitly queues a new job on the selected local ComfyUI instance. The app checks the graph again at submission. Gaming Mode must be off. The test accepts built-in local ComfyUI nodes and requires you to confirm before it runs. Watch queue activity in **Jobs**. Copy the prompt ID to look up this test in ComfyUI. Custom and hosted workflows should be tested in ComfyUI first. Editing or exporting a draft leaves queued and running jobs alone.
+
 ## Check and install nodes
 
 Standard generation, Qwen image tools, and BiRefNet cutouts use nodes supplied with current ComfyUI. The named Wan and 3D pipelines also use newer core nodes. Start by updating ComfyUI if a core node is missing. Examples include `RemoveBackground`, `WanAnimate2ToVideo`, `WanFirstLastFrameToVideo`, `LoadMoGeModel`, and `Save3DAdvanced`.
 
-For a workflow that explicitly calls for a third-party node pack, open it in ComfyUI and use [ComfyUI Manager's missing-node flow](https://docs.comfy.org/installation/install_custom_node) or follow the node author's instructions. Install only packs you trust into the ComfyUI environment, restart ComfyUI, and run the graph in its UI before using Render Bridge. A node's API class can also be checked via `GET /object_info/<class_type>` on the local ComfyUI API. [ComfyUI API routes](https://docs.comfy.org/development/comfyui-server/comms_routes)
+In **Nodes**, inspect the selected build's built-in and custom node inventory. In **Manage packs**, enter the public GitHub repository and its full commit SHA. Review the pinned source and dependency files before approving installation into the displayed local ComfyUI directory. Render Bridge stages and copies the selected archive. It leaves Python dependency installation and server restart to you. On restart, ComfyUI imports enabled custom nodes as Python code, so review the source and follow the author's installation instructions first.
+
+Disable or re-enable packs installed through Render Bridge from the same tab. Disabling requires a verified idle queue and moves its files out of the active `custom_nodes` directory and takes effect the next time ComfyUI loads nodes. Packages already installed through another tool stay under that tool's management.
+
+For another source or a workflow that needs ComfyUI Manager, open it in ComfyUI and use [ComfyUI Manager's missing-node flow](https://docs.comfy.org/installation/install_custom_node) or follow the node author's instructions. Install only packs you trust into the ComfyUI environment, restart ComfyUI, and run the graph in its UI before using Render Bridge. A node's API class can also be checked via `GET /object_info/<class_type>` on the local ComfyUI API. [ComfyUI API routes](https://docs.comfy.org/development/comfyui-server/comms_routes)
 
 ## What each pipeline does
 

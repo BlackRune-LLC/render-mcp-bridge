@@ -2,6 +2,27 @@
 
 In the Windows control panel, open **Settings** to change appearance, sign-in behavior, or storage. In **Advanced configuration**, **Open configuration file** opens the active Render Bridge JSON settings. Stop the server before editing, keep a copy of the original, then start it again to verify the updated ComfyUI connection.
 
+## Reuse a setup config on another computer
+
+In Render Bridge for Windows, open **Settings → Advanced configuration → Export setup config**. You can also prepare `settings.json` by hand for a computer that already runs ComfyUI. Fill in the paths and address for that computer, then place the file there. Use absolute paths or `~/` paths relative to that computer's user home.
+
+```json
+{
+  "COMFY_ROOT": "C:\\AI\\ComfyUI",
+  "COMFY_URL": "http://127.0.0.1:8188",
+  "COMFY_INPUT_DIR": "D:\\RenderInputs",
+  "COMFY_OUTPUT_DIR": "D:\\RenderOutputs"
+}
+```
+
+Omit the optional input and output fields to use the `input` and `output` directories below `COMFY_ROOT`. The URL must point to ComfyUI on the computer running setup. Folder paths must refer to that same computer.
+
+- In the desktop installer, choose **Load setup config**, or launch `RenderBridgeSetup.exe --config "C:\path\to\settings.json"`. Add `--data-dir "C:\path\to\Render Bridge"` to select an existing or new absolute installation folder.
+- From source, run `python setup_render_bridge.py install --config "C:\path\to\settings.json"`. Pass `--data-dir` before `install` to choose the installation folder.
+- Review the effective paths, then confirm setup. Setup preserves filled values in the selected installation and uses the supplied file to fill gaps. On a fresh installation, it uses the supplied values before falling back to defaults. To change an existing value intentionally, use **Open configuration file** in Settings and restart Render Bridge after saving.
+
+The portable config carries the ComfyUI address and folders. Tokens, MCP listener settings, model files, generated outputs, appearance, and asset library and backup preferences are stored separately. Set up the destination's MCP client separately using its own token. Leave secrets out of the copied file.
+
 ## Theme plugins
 
 On Windows, open **Settings → Custom theme** to edit a color and select **Apply theme**. Edit Dark and Light palettes separately. **System** uses the palette that matches Windows appearance. **Export theme** saves a shareable JSON file and **Import theme** applies an existing file to this installation. **Reset to defaults** restores the built-in colors.

@@ -28,6 +28,7 @@ CLIENT_GUIDE = "https://github.com/BlackRune-LLC/render-mcp-bridge#connect-an-mc
 COMFY_INSTALL = "https://docs.comfy.org/installation/manual_install"
 SETTINGS_KEYS = {"COMFY_ROOT", "COMFY_URL"}
 OPTIONAL_SETTINGS = {"COMFY_INPUT_DIR", "COMFY_OUTPUT_DIR"}
+SETTINGS_LIMIT = 64 * 1024
 ACTIVE_RUNTIME = "active-runtime"
 MCP_PORT_FILE = "mcp-port"
 DEFAULT_MCP_PORT = 8189
@@ -71,17 +72,41 @@ def data_dir() -> Path:
     return (Path(override).expanduser() if override else default_data_dir()).resolve()
 
 
-def load_settings(path: Path) -> dict[str, str]:
+def unique_json_object(pairs):
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError("Duplicate setup setting.")
+    return obj
+
+
+def load_settings(path: Path, *, partial: bool = False, missing_ok: bool = True) -> dict[str, str]:
+    invalid = "Invalid setup settings."
     try:
-        settings = json.loads(path.read_text(encoding="utf-8"))
+        metadata = path.stat()
     except FileNotFoundError:
-        return {}
+        if missing_ok and not path.is_symlink():
+            return {}
+        raise
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > SETTINGS_LIMIT:
+        raise ValueError(invalid)
+    with path.open("rb") as stream:
+        raw = stream.read(SETTINGS_LIMIT + 1)
+    if len(raw) > SETTINGS_LIMIT:
+        raise ValueError(invalid)
+    try:
+        settings = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=unique_json_object)
+    except (ValueError, RecursionError):
+        raise ValueError(invalid) from None
     if (
         not isinstance(settings, dict)
-        or not SETTINGS_KEYS <= settings.keys() <= SETTINGS_KEYS | OPTIONAL_SETTINGS
-        or any(not isinstance(value, str) or not value for value in settings.values())
+        or not settings.keys() <= SETTINGS_KEYS | OPTIONAL_SETTINGS
+        or any(not isinstance(value, str) for value in settings.values())
     ):
-        raise ValueError("Invalid setup settings.")
+        raise ValueError(invalid)
+    if partial:
+        return {key: value.strip() for key, value in settings.items() if value.strip()}
+    if not SETTINGS_KEYS <= settings.keys() or any(not value.strip() for value in settings.values()):
+        raise ValueError(invalid)
     return settings
 
 
@@ -168,6 +193,11 @@ def runtime_settings(legacy_settings: Path, runtime: Path | None) -> Path:
     return runtime / "settings.json" if runtime else legacy_settings
 
 
+def installed_settings(settings_path: Path) -> tuple[Path | None, dict[str, str]]:
+    runtime = active_runtime(settings_path.parent)
+    return runtime, load_settings(runtime_settings(settings_path, runtime), partial=True, missing_ok=runtime is None)
+
+
 def configured_mcp_port(directory: Path) -> int:
     invalid = "The saved Render Bridge MCP port is invalid."
     try:
@@ -215,23 +245,27 @@ def backend_url(value: str) -> str:
     return f"{address.scheme}://{authority}"
 
 
-def comfy_root(
-    value: str, previous: dict[str, str] | None = None, overrides: dict[str, str] | None = None,
-) -> Path:
+def portable_settings(path: Path) -> dict[str, str]:
+    settings = load_settings(path.expanduser(), partial=True, missing_ok=False)
+    home_prefixes = ("~/", "~\\") if os.name == "nt" else ("~/",)
+    for key, value in settings.items():
+        if key == "COMFY_URL":
+            backend_url(value)
+        elif not (Path(value).is_absolute() or value == "~" or value.startswith(home_prefixes)):
+            raise ValueError(f"{key} in the supplied config must be an absolute path or use ~/.")
+    return settings
+
+
+def comfy_root(value: str, overrides: dict[str, str]) -> Path:
     path = Path(value.strip().strip('"').strip("'")).expanduser().resolve()
-    retained = {**matching_folder_overrides(path, previous or {}), **(overrides or {})}
+    if not path.is_dir():
+        raise ValueError("Could not find the ComfyUI root directory. Check the folder and retry.")
     for folder in ("input", "output"):
-        override = retained.get(f"COMFY_{folder.upper()}_DIR")
-        if not (Path(override).expanduser() if override else path / folder).is_dir():
+        override = overrides.get(f"COMFY_{folder.upper()}_DIR")
+        if not (Path(override) if override else path / folder).is_dir():
             hint = f"COMFY_{folder.upper()}_DIR" if override else f"the {folder} subfolder"
             raise ValueError(f"Could not find {hint} for ComfyUI. Check the folder and retry.")
     return path
-
-
-def matching_folder_overrides(root: Path, previous: dict[str, str]) -> dict[str, str]:
-    if "COMFY_ROOT" not in previous or Path(previous["COMFY_ROOT"]).expanduser().resolve() != root:
-        return {}
-    return {key: previous[key] for key in OPTIONAL_SETTINGS if key in previous}
 
 
 def fetch_json(url: str, endpoint: str):
@@ -351,12 +385,29 @@ def install_lock(directory: Path):
         yield
 
 
-def install_runtime(directory: Path, settings: dict[str, str]) -> None:
+def require_settings_unchanged(directory: Path, expected: tuple[Path | None, dict[str, str]] | None) -> None:
+    if expected is None:
+        return
+    error = "The saved settings changed during setup. Run setup again to review them."
+    try:
+        current = installed_settings(directory / "settings.json")
+    except (OSError, ValueError):
+        raise InstallFailure(error) from None
+    if current != expected:
+        raise InstallFailure(error)
+
+
+def install_runtime(
+    directory: Path, settings: dict[str, str], *, expected: tuple[Path | None, dict[str, str]] | None = None,
+) -> None:
     with install_lock(directory):
-        stage_runtime(directory, settings)
+        require_settings_unchanged(directory, expected)
+        stage_runtime(directory, settings, expected=expected)
 
 
-def stage_runtime(directory: Path, settings: dict[str, str]) -> None:
+def stage_runtime(
+    directory: Path, settings: dict[str, str], *, expected: tuple[Path | None, dict[str, str]] | None,
+) -> None:
     port = configured_mcp_port(directory)
     staging = Path(tempfile.mkdtemp(prefix=RUNTIME_PREFIX, dir=directory))
     activated = False
@@ -387,6 +438,7 @@ def stage_runtime(directory: Path, settings: dict[str, str]) -> None:
                 {**os.environ, "COMFY_MCP_DATA_DIR": smoke, "MCP_PORT": str(port),
                  "MCP_TOKEN_FILE": str(Path(smoke) / "token.txt")},
             )
+        require_settings_unchanged(directory, expected)
         save_settings(staging / "settings.json", settings)
         if port != DEFAULT_MCP_PORT:
             atomic_text(directory / MCP_PORT_FILE, f"{port}\n")
@@ -403,32 +455,54 @@ def stage_runtime(directory: Path, settings: dict[str, str]) -> None:
                 shutil.rmtree(staging, ignore_errors=True)
 
 
-def install(settings_path: Path) -> int:
+def install(settings_path: Path, config_path: Path | None = None) -> int:
     try:
-        runtime = active_runtime(settings_path.parent)
-        previous = load_settings(runtime_settings(settings_path, runtime))
+        baseline = installed_settings(settings_path)
     except (OSError, ValueError):
-        print("Previous installer settings could not be read. Enter your ComfyUI settings again.")
-        previous = {}
-    default_root = os.environ.get("COMFY_ROOT") or previous.get("COMFY_ROOT") or str(Path.home() / "ComfyUI")
-    default_url = os.environ.get("COMFY_URL") or previous.get("COMFY_URL") or DEFAULT_URL
+        print("The saved settings could not be read. Check the active installation before retrying setup.")
+        return 1
     try:
-        default_url = backend_url(default_url)
-    except ValueError:
-        print("The configured ComfyUI address is not a valid loopback URL. Enter a new address.")
-        default_url = DEFAULT_URL
+        supplied = portable_settings(config_path) if config_path is not None else {}
+    except (OSError, ValueError, RuntimeError) as error:
+        message = str(error) if isinstance(error, ValueError) else "The supplied config could not be read."
+        print(message)
+        return 1
+    _, previous = baseline
+    settings = {**supplied, **previous}
     print("Render Bridge setup")
     print(f"Install ComfyUI first if you need it. {COMFY_INSTALL}")
-    overrides = {
-        key: str(Path(os.environ[key]).expanduser().resolve())
-        for key in OPTIONAL_SETTINGS if os.environ.get(key, "").strip()
-    }
-    for key, path in overrides.items():
-        if not Path(path).is_dir():
-            print(f"{key} must point to an existing directory. Set it again and retry setup.")
-            return 1
-    root = prompt_for("ComfyUI directory", default_root, lambda value: comfy_root(value, previous, overrides))
-    url = prompt_for("ComfyUI API URL", default_url, backend_url)
+    overrides = {}
+    try:
+        for key in sorted(OPTIONAL_SETTINGS):
+            if value := settings.get(key) or os.environ.get(key, "").strip():
+                folder = Path(value).expanduser().resolve()
+                if not folder.is_dir():
+                    raise ValueError(f"{key} must point to an existing directory. Check the setting and retry.")
+                overrides[key] = str(folder)
+        if "COMFY_ROOT" in settings:
+            root = comfy_root(settings["COMFY_ROOT"], overrides)
+        else:
+            default_root = os.environ.get("COMFY_ROOT") or str(Path.home() / "ComfyUI")
+            root = prompt_for("ComfyUI directory", default_root, lambda value: comfy_root(value, overrides))
+        if "COMFY_URL" in settings:
+            url = backend_url(settings["COMFY_URL"])
+        else:
+            try:
+                default_url = backend_url(os.environ.get("COMFY_URL") or DEFAULT_URL)
+            except ValueError:
+                print("The configured ComfyUI address is not a valid loopback URL. Enter a new address.")
+                default_url = DEFAULT_URL
+            url = prompt_for("ComfyUI API URL", default_url, backend_url)
+    except (OSError, ValueError, RuntimeError) as error:
+        print(str(error) if isinstance(error, ValueError) else "A configured ComfyUI directory could not be read.")
+        return 1
+
+    print(f"Render Bridge installation: {settings_path.parent}")
+    print(f"ComfyUI directory: {root}")
+    print(f"ComfyUI API URL: {url}")
+    for kind in ("input", "output"):
+        folder = overrides.get(f"COMFY_{kind.upper()}_DIR") or root / kind
+        print(f"ComfyUI {kind} folder: {folder}")
     while True:
         print("Checking the local ComfyUI API and its model loaders.")
         models = probe_backend(url)
@@ -448,8 +522,8 @@ def install(settings_path: Path) -> int:
         return 0
 
     install_runtime(settings_path.parent, {
-        "COMFY_ROOT": str(root), "COMFY_URL": url, **matching_folder_overrides(root, previous), **overrides,
-    })
+        "COMFY_ROOT": str(root), "COMFY_URL": url, **overrides,
+    }, expected=baseline)
     token = Path(os.environ.get("MCP_TOKEN_FILE") or settings_path.parent / "token.txt").expanduser()
     if not token.is_absolute():
         token = PROJECT_ROOT / token
@@ -514,7 +588,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install, start, or control a local Render Bridge server.")
     parser.add_argument("--data-dir", type=Path, help="Use the selected Render Bridge installation data directory.")
     commands = parser.add_subparsers(dest="command")
-    commands.add_parser("install", help="Run guided setup (the default).")
+    installer = commands.add_parser("install", help="Run guided setup (the default).")
+    installer.add_argument("--config", type=Path, help="Fill missing ComfyUI settings from a local JSON file.")
     commands.add_parser("start", help="Run the configured server in the foreground.")
     rotate = commands.add_parser("rotate-token", help="Rotate the token after stopping the server.")
     rotate.add_argument("--confirm", action="store_true", help="Confirm that all clients must reconnect.")
@@ -528,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings_path = (args.data_dir.expanduser().resolve() if args.data_dir else data_dir()) / "settings.json"
         if args.command in {None, "install"}:
-            return install(settings_path)
+            return install(settings_path, getattr(args, "config", None))
         if args.command == "rotate-token":
             if not args.confirm:
                 print("Stop Render Bridge, then run rotate-token --confirm. Existing clients must reconnect.")

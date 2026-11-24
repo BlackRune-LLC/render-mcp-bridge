@@ -124,31 +124,120 @@ class InstallRuntimeTest(unittest.TestCase):
                 setup.install_runtime(self.data, self.settings)
             self.assertEqual((self.data / "mcp-port").read_text(encoding="utf-8").strip(), "19189")
 
-    def test_unchanged_root_keeps_custom_input_and_output_folders(self):
+    def test_setup_accepts_input_and_output_folders_outside_the_comfy_root(self):
         inputs = self.data / "custom-input"
         outputs = self.data / "custom-output"
-        inputs.mkdir()
-        outputs.mkdir()
-        saved = {**self.settings, "COMFY_INPUT_DIR": str(inputs), "COMFY_OUTPUT_DIR": str(outputs)}
-        root = setup.comfy_root(saved["COMFY_ROOT"], saved)
-        self.assertEqual(setup.matching_folder_overrides(root, saved),
-                         {"COMFY_INPUT_DIR": str(inputs), "COMFY_OUTPUT_DIR": str(outputs)})
-        self.assertEqual(setup.matching_folder_overrides(self.data / "new-root", saved), {})
+        root = Path(self.settings["COMFY_ROOT"])
+        for folder in (root, inputs, outputs):
+            folder.mkdir()
+        overrides = {"COMFY_INPUT_DIR": str(inputs), "COMFY_OUTPUT_DIR": str(outputs)}
+        self.assertEqual(setup.comfy_root(str(root), overrides), root)
 
     def test_fresh_terminal_install_saves_split_comfy_folders(self):
+        (self.data / setup.ACTIVE_RUNTIME).unlink()
         paths = {key: self.data / key.lower() for key in setup.OPTIONAL_SETTINGS}
         for folder in [*paths.values(), self.data / "comfy"]:
             folder.mkdir()
         overrides = {key: str(path) for key, path in paths.items()}
         with (
-            patch.dict(os.environ, {**self.settings, **overrides}),
+            patch.dict(os.environ, {**self.settings, **overrides}, clear=True),
             patch("builtins.input", side_effect=["", "", "y"]),
             patch.object(setup, "probe_backend", return_value={}),
             patch.object(setup, "install_runtime") as install,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(setup.install(self.data / "settings.json"), 0)
-        install.assert_called_once_with(self.data, {**self.settings, **overrides})
+        self.assertEqual(install.call_args.args, (self.data, {**self.settings, **overrides}))
+
+    def test_terminal_config_skips_configured_prompts_and_previews_before_confirmation(self):
+        (self.data / setup.ACTIVE_RUNTIME).unlink()
+        root = Path(self.settings["COMFY_ROOT"])
+        for kind in ("input", "output"):
+            (root / kind).mkdir(parents=True)
+        reusable = self.data / "reusable.json"
+        setup.save_settings(reusable, self.settings)
+        with (
+            patch.dict(os.environ, {"COMFY_ROOT": "unused", "COMFY_URL": "unused"}, clear=True),
+            patch("builtins.input", return_value="y") as answer,
+            patch.object(setup, "probe_backend", return_value={}),
+            patch.object(setup, "install_runtime") as install,
+            contextlib.redirect_stdout(io.StringIO()) as preview,
+        ):
+            self.assertEqual(setup.main(["--data-dir", str(self.data), "install", "--config", str(reusable)]), 0)
+        answer.assert_called_once_with("Prepare and activate a verified Render Bridge runtime? [y/N] ")
+        self.assertEqual(install.call_args.args, (self.data, self.settings))
+        for value in (root, root / "input", root / "output", self.settings["COMFY_URL"], self.data):
+            self.assertIn(str(value), preview.getvalue())
+
+    def test_upgrade_keeps_filled_settings_and_fills_blanks_from_the_config(self):
+        root = Path(self.settings["COMFY_ROOT"])
+        (root / "input").mkdir(parents=True)
+        output = self.data / "custom-output"
+        output.mkdir()
+        existing = self.previous / "settings.json"
+        setup.save_settings(existing, {**self.settings, "COMFY_OUTPUT_DIR": "  "})
+        original = existing.read_bytes()
+        reusable = self.data / "reusable.json"
+        setup.save_settings(reusable, {
+            "COMFY_ROOT": str(self.data / "different root"),
+            "COMFY_URL": "http://localhost:9288",
+            "COMFY_OUTPUT_DIR": str(output),
+        })
+        with (
+            patch.dict(os.environ, {"COMFY_OUTPUT_DIR": "unused"}, clear=True),
+            patch("builtins.input", return_value="y") as answer,
+            patch.object(setup, "probe_backend", return_value={}),
+            patch.object(setup, "install_runtime") as install,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup.install(self.data / "settings.json", reusable), 0)
+        self.assertEqual(answer.call_count, 1)
+        self.assertEqual(install.call_args.args, (self.data, {**self.settings, "COMFY_OUTPUT_DIR": str(output)}))
+        self.assertEqual(existing.read_bytes(), original)
+
+    def test_invalid_active_configuration_does_not_fall_back_to_the_supplied_file(self):
+        reusable = self.data / "reusable.json"
+        setup.save_settings(reusable, self.settings)
+        existing = self.previous / "settings.json"
+        existing.write_text('{"MCP_TOKEN": "fixture-secret"}', encoding="utf-8")
+        original = existing.read_bytes()
+        with (
+            patch("builtins.input") as answer,
+            patch.object(setup, "probe_backend") as probe,
+            patch.object(setup, "install_runtime") as install,
+            contextlib.redirect_stdout(io.StringIO()) as preview,
+        ):
+            self.assertEqual(setup.install(self.data / "settings.json", reusable), 1)
+        answer.assert_not_called()
+        probe.assert_not_called()
+        install.assert_not_called()
+        self.assertIn("saved settings", preview.getvalue())
+        self.assertNotIn("fixture-secret", preview.getvalue())
+        self.assertEqual(existing.read_bytes(), original)
+
+    def test_terminal_rejects_invalid_reusable_settings_before_activation(self):
+        (self.data / setup.ACTIVE_RUNTIME).unlink()
+        reusable = self.data / "reusable.json"
+        for value in (
+            '{"MCP_TOKEN_FILE": "private"}',
+            '{"COMFY_URL": true}',
+            '{"COMFY_URL": "", "COMFY_URL": ""}',
+            '{"COMFY_ROOT": "relative/folder"}',
+            '{"COMFY_URL": "https://example.org:8188"}',
+            ' ' * (64 * 1024 + 1),
+        ):
+            with self.subTest(value=value[:100]):
+                reusable.write_text(value, encoding="utf-8")
+                with (
+                    patch("builtins.input") as answer,
+                    patch.object(setup, "probe_backend") as probe,
+                    patch.object(setup, "install_runtime") as install,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(setup.install(self.data / "settings.json", reusable), 1)
+                answer.assert_not_called()
+                probe.assert_not_called()
+                install.assert_not_called()
 
     def test_another_install_cannot_start_while_the_runtime_is_locked(self):
         with setup.install_lock(self.data), patch.object(setup, "stage_runtime") as stage:
@@ -156,3 +245,33 @@ class InstallRuntimeTest(unittest.TestCase):
                 setup.install_runtime(self.data, self.settings)
         stage.assert_not_called()
         self.assertEqual(setup.active_runtime(self.data), self.previous)
+
+    def test_activation_preserves_settings_changed_after_the_preview(self):
+        baseline = setup.installed_settings(self.data / "settings.json")
+        updated = {**self.settings, "COMFY_URL": "http://localhost:9288"}
+        setup.save_settings(self.previous / "settings.json", updated)
+        with patch.object(setup, "stage_runtime") as stage:
+            with self.assertRaisesRegex(setup.InstallFailure, "saved settings changed"):
+                setup.install_runtime(self.data, self.settings, expected=baseline)
+        stage.assert_not_called()
+        self.assertEqual(setup.load_settings(self.previous / "settings.json"), updated)
+
+    def test_activation_preserves_settings_changed_while_the_new_runtime_is_staging(self):
+        baseline = setup.installed_settings(self.data / "settings.json")
+        active_settings = self.previous / "settings.json"
+        updated = {**self.settings, "COMFY_URL": "http://localhost:9288"}
+
+        def update_during_startup_check(_command, _directory, phase, _timeout, _env=None):
+            if phase == "Render Bridge startup check":
+                setup.save_settings(active_settings, updated)
+
+        with (
+            patch.object(setup, "run_install_stage", side_effect=update_during_startup_check),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaisesRegex(setup.InstallFailure, "saved settings changed"):
+                setup.install_runtime(self.data, self.settings, expected=baseline)
+        self.assertEqual(setup.active_runtime(self.data), self.previous)
+        self.assertEqual(list(self.data.glob("app-*")), [self.previous])
+        self.assertEqual(setup.load_settings(active_settings), updated)
+        self.assertEqual((self.data / "token.txt").read_text(encoding="utf-8"), "fixture-token")

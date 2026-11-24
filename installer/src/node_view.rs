@@ -5,8 +5,9 @@ use std::time::Duration;
 use eframe::egui::{self, Ui};
 use serde_json::Value;
 
-use crate::setup::{loopback_agent, validate_comfy_url};
-use crate::{CAUTION, activity, caption, card, secondary, status};
+use crate::node_packages::{ManagedPack, Source, StagedPack, Target};
+use crate::setup::{Installed, loopback_agent, validate_comfy_url};
+use crate::{CAUTION, LIME, activity, caption, card, primary, secondary, status};
 
 const MAX_NODES: usize = 8192;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -118,6 +119,8 @@ pub struct NodePanel {
     query: String,
     origin: Option<Origin>,
     selected: Option<usize>,
+    manage_open: bool,
+    management: ManagementPanel,
 }
 
 impl NodePanel {
@@ -141,7 +144,44 @@ impl NodePanel {
         }
     }
 
-    pub fn show(&mut self, ui: &mut Ui, backend: Option<&str>) {
+    pub fn show(&mut self, ui: &mut Ui, backend: Option<&str>, installed: Option<&Installed>) {
+        let target = backend
+            .zip(installed)
+            .map(|(backend, installed)| Target::from_installation(backend, installed));
+        let reason = target
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .cloned();
+        if reason.is_none() {
+            self.show_with_target(ui, backend, target.and_then(Result::ok));
+        } else {
+            self.show_panel(ui, backend, None, reason.as_deref());
+        }
+    }
+
+    pub(crate) fn show_with_target(
+        &mut self,
+        ui: &mut Ui,
+        backend: Option<&str>,
+        target: Option<Target>,
+    ) {
+        self.show_panel(ui, backend, target, None);
+    }
+
+    fn show_panel(
+        &mut self,
+        ui: &mut Ui,
+        backend: Option<&str>,
+        target: Option<Target>,
+        reason: Option<&str>,
+    ) {
+        let target = target.filter(|target| {
+            backend
+                .and_then(|url| validate_comfy_url(url).ok())
+                .as_deref()
+                == Some(target.origin.as_str())
+        });
+        self.management.set_target(target);
         if self.backend.as_deref() != backend {
             self.backend = backend.map(str::to_owned);
             self.worker = None;
@@ -172,6 +212,14 @@ impl NodePanel {
         }
 
         ui.heading("Nodes");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.manage_open, false, "Inventory");
+            ui.selectable_value(&mut self.manage_open, true, "Manage packs");
+        });
+        if self.manage_open {
+            self.management.show(ui, reason);
+            return;
+        }
         if self.backend.is_none() {
             caption(ui, "Connect a local ComfyUI build to view its nodes.");
             return;
@@ -285,6 +333,338 @@ impl NodePanel {
                         "The selected backend did not report a reviewable source link.",
                     );
                 }
+            }
+        });
+    }
+}
+
+#[derive(Default)]
+struct ManagementPanel {
+    target: Option<Target>,
+    packs: Vec<ManagedPack>,
+    loaded: bool,
+    repository: String,
+    commit: String,
+    staged: Option<StagedPack>,
+    confirm_move: Option<ManagedPack>,
+    trusted: bool,
+    worker: Option<Receiver<Result<ManagementResult, String>>>,
+    activity: &'static str,
+    message: Option<(bool, String)>,
+}
+
+enum ManagementResult {
+    Inventory(Vec<ManagedPack>),
+    Reviewed(StagedPack),
+    Changed(&'static str),
+}
+
+impl ManagementPanel {
+    fn set_target(&mut self, target: Option<Target>) {
+        if self.target != target {
+            *self = Self {
+                target,
+                ..Self::default()
+            };
+        }
+    }
+
+    fn start(
+        &mut self,
+        ctx: &egui::Context,
+        activity: &'static str,
+        work: impl FnOnce() -> Result<ManagementResult, String> + Send + 'static,
+    ) {
+        let ctx = ctx.clone();
+        let (sender, worker) = mpsc::channel();
+        self.activity = activity;
+        self.message = None;
+        match thread::Builder::new()
+            .name("render-bridge-node-packs".into())
+            .spawn(move || {
+                let _ = sender.send(work());
+                ctx.request_repaint();
+            }) {
+            Ok(_) => self.worker = Some(worker),
+            Err(_) => {
+                self.message = Some((false, "The node pack operation could not start.".into()))
+            }
+        }
+    }
+
+    fn refresh(&mut self, ctx: &egui::Context, target: Target) {
+        self.loaded = true;
+        self.start(ctx, "Reading managed packs…", move || {
+            target.inventory().map(ManagementResult::Inventory)
+        });
+    }
+
+    fn poll(&mut self, ctx: &egui::Context) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let result = match worker.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Err("The node pack operation did not finish.".into())
+            }
+        };
+        self.worker = None;
+        match result {
+            Ok(ManagementResult::Inventory(packs)) => self.packs = packs,
+            Ok(ManagementResult::Reviewed(staged)) => {
+                self.trusted = false;
+                self.staged = Some(staged);
+            }
+            Ok(ManagementResult::Changed(message)) => {
+                if let Some(target) = self.target.clone() {
+                    self.refresh(ctx, target);
+                }
+                self.message = Some((true, message.into()));
+            }
+            Err(error) => self.message = Some((false, error)),
+        }
+    }
+
+    fn show(&mut self, ui: &mut Ui, unavailable: Option<&str>) {
+        let Some(target) = self.target.clone() else {
+            caption(
+                ui,
+                unavailable.unwrap_or(
+                    "Node packs can be managed from an installed local Render Bridge setup.",
+                ),
+            );
+            return;
+        };
+        self.poll(ui.ctx());
+        if !self.loaded && self.worker.is_none() {
+            self.refresh(ui.ctx(), target.clone());
+        }
+        if self.worker.is_some() {
+            activity(ui, self.activity);
+        }
+        if let Some((success, message)) = &self.message {
+            if *success {
+                status(ui, "Pack folder changed", message, LIME);
+            } else {
+                status(ui, "Node pack operation unavailable", message, CAUTION);
+            }
+        }
+
+        if ui.available_width() >= 760.0 {
+            ui.columns(2, |columns| {
+                self.review_panel(&mut columns[0], &target);
+                self.packs_panel(&mut columns[1], &target);
+            });
+        } else {
+            self.review_panel(ui, &target);
+            self.packs_panel(ui, &target);
+        }
+    }
+
+    fn review_panel(&mut self, ui: &mut Ui, target: &Target) {
+        card(ui, |ui| {
+            ui.heading(if self.staged.is_some() {
+                "Review staged pack"
+            } else {
+                "Add node pack"
+            });
+            caption(ui, &format!("Selected backend · {}", target.origin));
+            caption(ui, &target.root.display().to_string());
+            if self.staged.is_some() {
+                self.review_staged(ui, target);
+                return;
+            }
+            let can_stage = self.worker.is_none() && self.confirm_move.is_none();
+            ui.label("Public GitHub repository");
+            ui.add_enabled(
+                can_stage,
+                egui::TextEdit::singleline(&mut self.repository)
+                    .hint_text("https://github.com/owner/repository")
+                    .char_limit(220)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.label("Full commit SHA");
+            ui.add_enabled(
+                can_stage,
+                egui::TextEdit::singleline(&mut self.commit)
+                    .hint_text("40 hexadecimal characters")
+                    .char_limit(50)
+                    .desired_width(f32::INFINITY),
+            );
+            let source = Source::parse(&self.repository, &self.commit);
+            if let Ok(source) = &source {
+                ui.hyperlink_to("Review pinned source", source.tree());
+            } else if !self.repository.trim().is_empty() && !self.commit.trim().is_empty() {
+                caption(
+                    ui,
+                    "Enter a public GitHub repository URL and a full commit SHA.",
+                );
+            }
+            caption(
+                ui,
+                "Staging downloads the selected revision for review before it enters the node load folder.",
+            );
+            if primary(ui, "Stage for review", can_stage && source.is_ok()).clicked()
+                && let Ok(source) = source
+            {
+                let target = target.clone();
+                self.start(ui.ctx(), "Staging the pinned archive…", move || {
+                    target.stage(source).map(ManagementResult::Reviewed)
+                });
+            }
+        });
+    }
+
+    fn review_staged(&mut self, ui: &mut Ui, target: &Target) {
+        let Some(staged) = &self.staged else {
+            return;
+        };
+        ui.hyperlink_to(staged.source.repository(), staged.source.tree());
+        ui.monospace(&staged.source.commit);
+        caption(
+            ui,
+            &format!(
+                "{} files · {}",
+                staged.review.files,
+                target.destination(&staged.source).display()
+            ),
+        );
+        for (title, names) in [
+            (
+                "Dependency and installer files",
+                &staged.review.dependencies,
+            ),
+            ("Startup hooks", &staged.review.startup_hooks),
+        ] {
+            if names.is_empty() {
+                continue;
+            }
+            ui.label(title);
+            ui.horizontal_wrapped(|ui| {
+                for name in names.iter().take(12) {
+                    if let Some(url) = staged.source.file(name) {
+                        ui.hyperlink_to(name, url.as_str());
+                    }
+                }
+                if names.len() > 12 {
+                    caption(ui, "See the pinned source for the remaining files.");
+                }
+            });
+        }
+        caption(
+            ui,
+            "Review upstream instructions for any dependencies. Render Bridge stages source files only.",
+        );
+        status(
+            ui,
+            "Runs on ComfyUI startup",
+            "Custom nodes can access files and network resources available to your account. Restart ComfyUI after current jobs finish.",
+            CAUTION,
+        );
+        ui.checkbox(&mut self.trusted, "I trust this pinned revision.");
+        let mut cancel = false;
+        let mut install = false;
+        ui.horizontal_wrapped(|ui| {
+            install = primary(ui, "Install pack", self.trusted && self.worker.is_none()).clicked();
+            cancel = secondary(ui, "Discard staged pack", self.worker.is_none()).clicked();
+        });
+        if cancel {
+            self.staged = None;
+            self.trusted = false;
+        }
+        if install && let Some(staged) = self.staged.take() {
+            self.trusted = false;
+            let target = target.clone();
+            self.start(ui.ctx(), "Installing reviewed files…", move || {
+                target.install(staged).map(|()| {
+                    ManagementResult::Changed(
+                        "Pack installed. Restart ComfyUI after jobs finish, then recheck Nodes.",
+                    )
+                })
+            });
+        }
+    }
+
+    fn packs_panel(&mut self, ui: &mut Ui, target: &Target) {
+        card(ui, |ui| {
+            ui.heading("Managed packs");
+            caption(
+                ui,
+                "Install, enable, or disable packs here. Nodes from other installers stay in the inventory.",
+            );
+            if secondary(ui, "Refresh packs", self.worker.is_none()).clicked() {
+                self.refresh(ui.ctx(), target.clone());
+            }
+            if self.packs.is_empty() {
+                caption(ui, "No packs installed through Render Bridge.");
+            }
+            let can_change =
+                self.worker.is_none() && self.staged.is_none() && self.confirm_move.is_none();
+            for pack in &self.packs {
+                ui.separator();
+                ui.hyperlink_to(pack.source.repository(), pack.source.tree());
+                ui.horizontal_wrapped(|ui| {
+                    caption(
+                        ui,
+                        if pack.enabled {
+                            "Enabled on startup"
+                        } else {
+                            "Disabled on startup"
+                        },
+                    );
+                    ui.monospace(&pack.source.commit[..8]);
+                    if secondary(
+                        ui,
+                        if pack.enabled {
+                            "Disable…"
+                        } else {
+                            "Enable…"
+                        },
+                        can_change,
+                    )
+                    .clicked()
+                    {
+                        self.confirm_move = Some(pack.clone());
+                    }
+                });
+            }
+            if let Some(pack) = self.confirm_move.clone() {
+                ui.separator();
+                let enable = !pack.enabled;
+                caption(
+                    ui,
+                    &format!(
+                        "{} {}?",
+                        if enable { "Enable" } else { "Disable" },
+                        pack.source.repository()
+                    ),
+                );
+                if !enable {
+                    caption(
+                        ui,
+                        "ComfyUI must be running with no active or queued jobs. Render Bridge checks the queue before moving the pack.",
+                    );
+                }
+                caption(
+                    ui,
+                    "Restart ComfyUI after jobs finish for this change to take effect.",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if primary(ui, if enable { "Enable pack" } else { "Disable pack" }, self.worker.is_none()).clicked() {
+                        self.confirm_move = None;
+                        let target = target.clone();
+                        self.start(ui.ctx(), "Moving the managed pack…", move || {
+                            target.toggle(&pack.source, enable).map(|()| {
+                                ManagementResult::Changed("Pack moved. Restart ComfyUI after jobs finish, then recheck Nodes.")
+                            })
+                        });
+                    }
+                    if secondary(ui, "Cancel", true).clicked() {
+                        self.confirm_move = None;
+                    }
+                });
             }
         });
     }

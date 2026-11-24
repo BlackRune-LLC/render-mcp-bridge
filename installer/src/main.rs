@@ -15,6 +15,7 @@ mod model_download;
 mod model_library;
 mod model_ui;
 mod models;
+mod node_packages;
 mod node_view;
 mod pipeline;
 mod pipeline_ui;
@@ -39,6 +40,8 @@ mod update_handoff;
 mod update_ui;
 #[cfg(windows)]
 mod updates;
+mod workflow_editor;
+mod workflow_ui;
 
 use connection::{Client, RunningBridge};
 use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui, Vec2};
@@ -138,8 +141,15 @@ enum MonitorTarget {
     Missing,
 }
 
+#[derive(Default)]
+struct SetupLaunch {
+    config: Option<PathBuf>,
+    directory: Option<PathBuf>,
+    invalid: bool,
+}
+
 enum LaunchMode {
-    Setup,
+    Setup(SetupLaunch),
     Controls {
         target: MonitorTarget,
         start_hidden: bool,
@@ -351,6 +361,14 @@ impl StartupSetting {
                     self.error = Some("Could not open the configuration file.".into());
                 }
             }
+            if secondary(ui, "Export setup config", true).clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Render Bridge settings", &["json"])
+                    .set_file_name("settings.json")
+                    .save_file()
+            {
+                self.error = setup::export_setup_config(installed, &path).err();
+            }
             ui.hyperlink_to("Server and model settings", SETTINGS_GUIDE);
         }
     }
@@ -501,6 +519,9 @@ struct Installer {
     #[cfg(windows)]
     python_install_error: Option<String>,
     settings: Settings,
+    setup_profile: Option<Settings>,
+    using_saved_setup: bool,
+    setup_config_error: Option<String>,
     check: Option<CheckOutcome>,
     worker: Option<Receiver<Event>>,
     progress: String,
@@ -575,6 +596,9 @@ impl Installer {
             #[cfg(windows)]
             python_install_error: None,
             settings: setup::default_settings(),
+            setup_profile: None,
+            using_saved_setup: false,
+            setup_config_error: None,
             check: None,
             worker: None,
             progress: String::new(),
@@ -618,9 +642,24 @@ impl Installer {
             update: update_ui::UpdateDialog::default(),
         };
         match mode {
-            LaunchMode::Setup => {
-                if let Ok(data) = setup::data_dir() {
+            LaunchMode::Setup(launch) => {
+                installer.installation_dir = launch.directory;
+                if launch.invalid {
+                    installer.setup_config_error = Some(
+                        "Use --config FILE and optionally --data-dir DIRECTORY to prefill setup."
+                            .into(),
+                    );
+                }
+                if let Ok(data) = installer.setup_directory() {
                     installer.install_assets.load(&data);
+                    if !launch.invalid {
+                        installer.use_setup_destination(&data);
+                    }
+                }
+                if !launch.invalid
+                    && let Some(path) = launch.config
+                {
+                    installer.import_setup_config(&path);
                 }
                 installer.check_python(ctx);
             }
@@ -661,6 +700,72 @@ impl Installer {
     fn change_step(&mut self, step: Step) {
         self.step = step;
         self.copied = None;
+    }
+
+    fn setup_directory(&self) -> Result<PathBuf, String> {
+        self.installation_dir
+            .clone()
+            .map_or_else(setup::data_dir, Ok)
+    }
+
+    fn use_setup_destination(&mut self, data: &Path) {
+        let fallback = self.setup_profile.clone().unwrap_or_else(|| {
+            if self.using_saved_setup {
+                setup::default_settings()
+            } else {
+                self.settings.clone()
+            }
+        });
+        let result = setup::existing_setup_config(data).and_then(|saved| {
+            let using_saved = saved.is_some();
+            let settings = saved.map_or_else(
+                || fallback.clone(),
+                |saved| setup::fill_missing(saved, &fallback),
+            );
+            Ok((settings, using_saved))
+        });
+        match result {
+            Ok((settings, using_saved)) => {
+                self.setup_config_error = None;
+                self.using_saved_setup = using_saved;
+                if settings != self.settings {
+                    self.settings = settings;
+                    self.settings_changed();
+                    if self.step == Step::Install {
+                        self.change_step(Step::Comfy);
+                    }
+                }
+            }
+            Err(error) => self.setup_config_error = Some(error),
+        }
+    }
+
+    fn import_setup_config(&mut self, path: &Path) {
+        let load = setup::import_setup_config(path, &setup::default_settings())
+            .and_then(|profile| Ok((self.setup_directory()?, profile)));
+        match load {
+            Ok((data, profile)) => {
+                self.setup_profile = Some(profile);
+                self.use_setup_destination(&data);
+            }
+            Err(error) => self.setup_config_error = Some(error),
+        }
+    }
+
+    fn setup_config_picker(&mut self, ui: &mut Ui, idle: bool) {
+        if secondary(ui, "Load setup config", idle).clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("Render Bridge settings", &["json"])
+                .pick_file()
+        {
+            self.import_setup_config(&path);
+        }
+        if let Some(error) = &self.setup_config_error {
+            status(ui, "Setup config unavailable", error, CAUTION);
+            if secondary(ui, "Continue without imported config", idle).clicked() {
+                self.setup_config_error = None;
+            }
+        }
     }
 
     fn open_existing(&mut self, installed: Installed) {
@@ -916,7 +1021,18 @@ impl Installer {
     }
 
     fn start_check(&mut self, ctx: &egui::Context) {
-        let settings = self.settings.clone();
+        let effective = self
+            .setup_directory()
+            .and_then(|data| setup::settings_for_setup(&data, &self.settings));
+        let settings = match effective {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.check = Some(CheckOutcome::Failed(error));
+                self.manual_confirmed = false;
+                return;
+            }
+        };
+        self.settings = settings.clone();
         let ctx = ctx.clone();
         let (sender, receiver) = mpsc::channel();
         self.check = None;
@@ -1159,6 +1275,9 @@ impl Installer {
             .spawn(move || {
                 let result = (|| {
                     let data = selected_data_dir.clone().map_or_else(setup::data_dir, Ok)?;
+                    let settings = setup::confirm_setup_settings(&data, &settings)?;
+                    // Stop setup if saved storage preferences cannot be read.
+                    asset_folders::load(&data)?;
                     asset_folders::validate(
                         &setup::folder(&settings, "output"),
                         &setup::folder(&settings, "input"),
@@ -1508,7 +1627,11 @@ impl Installer {
             });
         });
         ui.horizontal_wrapped(|ui| {
-            if let Some(installed) = setup::existing_install()
+            self.setup_config_picker(ui, idle);
+            if let Some(installed) = self
+                .setup_directory()
+                .ok()
+                .and_then(|data| setup::existing_install_at(&data))
                 && secondary(ui, "Open existing setup", idle).clicked()
             {
                 self.open_existing(installed);
@@ -1530,6 +1653,14 @@ impl Installer {
                 self.uninstall.choose();
             }
         });
+        if self.setup_config_error.is_none()
+            && (self.using_saved_setup || self.setup_profile.is_some())
+        {
+            caption(
+                ui,
+                "Setup will use the saved ComfyUI settings. Existing values take precedence.",
+            );
+        }
         if let Some(error) = &self.install_error {
             caption(ui, error);
         }
@@ -1565,6 +1696,7 @@ impl Installer {
         let idle = self.worker.is_none();
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
+            self.setup_config_picker(ui, idle);
             if secondary(ui, "Detect running ComfyUI", idle).clicked() {
                 self.start_discovery(ui.ctx());
             }
@@ -1789,20 +1921,21 @@ impl Installer {
             "Install Render Bridge",
             "Install the bridge for your user account with a dedicated Python environment.",
         );
+        let effective = self
+            .setup_directory()
+            .and_then(|data| setup::settings_for_setup(&data, &self.settings));
+        if let Err(error) = &effective {
+            status(ui, "Existing setup needs attention", error, CAUTION);
+        }
+        let effective = effective.unwrap_or_else(|_| self.settings.clone());
         card(ui, |ui| {
             field_label(ui, "Local API address");
-            code_label(ui, &self.settings.comfy_url);
+            code_label(ui, &effective.comfy_url);
             ui.separator();
             field_label(ui, "ComfyUI input folder");
-            code_label(
-                ui,
-                &setup::folder(&self.settings, "input").to_string_lossy(),
-            );
+            code_label(ui, &setup::folder(&effective, "input").to_string_lossy());
             field_label(ui, "ComfyUI output folder");
-            code_label(
-                ui,
-                &setup::folder(&self.settings, "output").to_string_lossy(),
-            );
+            code_label(ui, &setup::folder(&effective, "output").to_string_lossy());
             ui.separator();
             ui.add_enabled_ui(self.worker.is_none(), |ui| {
                 let default = setup::data_dir().ok();
@@ -1814,9 +1947,10 @@ impl Installer {
                         || "Default user folder".into(),
                         |path| path.to_string_lossy().into_owned(),
                     ),
-                ) && let Some(data) = self.installation_dir.as_ref().or(default.as_ref())
+                ) && let Some(data) = self.installation_dir.clone().or(default)
                 {
-                    self.install_assets.load(data);
+                    self.install_assets.load(&data);
+                    self.use_setup_destination(&data);
                 }
                 caption(
                     ui,
@@ -2278,8 +2412,10 @@ impl Installer {
                                         self.select_workspace(ctx, WorkspaceTab::Pipelines);
                                     }
                                 }
-                                WorkspaceTab::Pipelines => self.pipelines.show(ui, url, data_dir),
-                                WorkspaceTab::Nodes => self.nodes.show(ui, url),
+                                WorkspaceTab::Pipelines => {
+                                    self.pipelines.show(ui, url, data_dir, self.installed.as_ref());
+                                }
+                                WorkspaceTab::Nodes => self.nodes.show(ui, url, self.installed.as_ref()),
                                 WorkspaceTab::Jobs => {}
                             }
                         }
@@ -2496,14 +2632,18 @@ impl Installer {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (label, ready) = match self.step {
-                            Step::Prerequisites if self.python_ready() => {
-                                ("Continue to ComfyUI", idle)
-                            }
+                            Step::Prerequisites if self.python_ready() => (
+                                "Continue to ComfyUI",
+                                idle && self.setup_config_error.is_none(),
+                            ),
                             Step::Prerequisites => ("Check Python again", idle),
-                            Step::Comfy if self.can_continue() => ("Continue", idle),
+                            Step::Comfy if self.can_continue() => {
+                                ("Continue", idle && self.setup_config_error.is_none())
+                            }
                             Step::Comfy => (
                                 "Check ComfyUI",
-                                idle && !self.settings.comfy_root.trim().is_empty()
+                                idle && self.setup_config_error.is_none()
+                                    && !self.settings.comfy_root.trim().is_empty()
                                     && !self.settings.comfy_url.trim().is_empty(),
                             ),
                             Step::Models => ("Continue to install", self.can_continue() && idle),
@@ -2527,7 +2667,10 @@ impl Installer {
                             match self.step {
                                 Step::Prerequisites if self.python_ready() => {
                                     self.change_step(Step::Comfy);
-                                    if self.instances.is_empty() {
+                                    if self.instances.is_empty()
+                                        && !self.using_saved_setup
+                                        && self.setup_profile.is_none()
+                                    {
                                         self.start_discovery(ctx);
                                     }
                                 }
@@ -3142,8 +3285,40 @@ fn copy_row(ui: &mut Ui, title: &str, button: &str, value: &str) -> bool {
 }
 
 fn launch_mode(mut args: impl Iterator<Item = std::ffi::OsString>) -> LaunchMode {
-    if !args.next().is_some_and(|value| value == "--job-monitor") {
-        return LaunchMode::Setup;
+    let first = args.next();
+    if first
+        .as_deref()
+        .is_none_or(|value| value != "--job-monitor")
+    {
+        let mut setup = SetupLaunch::default();
+        let mut options = first.into_iter().chain(args);
+        while let Some(flag) = options.next() {
+            let field = match flag.to_str() {
+                Some("--config") if setup.config.is_none() => &mut setup.config,
+                Some("--data-dir") if setup.directory.is_none() => &mut setup.directory,
+                _ => {
+                    setup.invalid = true;
+                    break;
+                }
+            };
+            let Some(value) = options
+                .next()
+                .filter(|value| !value.is_empty() && !value.to_string_lossy().starts_with("--"))
+            else {
+                setup.invalid = true;
+                break;
+            };
+            *field = Some(PathBuf::from(value));
+        }
+        if setup
+            .directory
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            setup.invalid = true;
+            setup.directory = None;
+        }
+        return LaunchMode::Setup(setup);
     }
     let flag = args.next();
     let value = args.next();
@@ -3328,6 +3503,30 @@ mod launch_tests {
         ));
     }
 
+    #[test]
+    fn installer_accepts_a_config_and_distinguishes_an_invalid_command() {
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("Render Bridge fixture");
+        let mode = launch_mode(
+            [
+                OsString::from("--config"),
+                OsString::from("profile.json"),
+                OsString::from("--data-dir"),
+                directory.clone().into_os_string(),
+            ]
+            .into_iter(),
+        );
+        assert!(matches!(mode, LaunchMode::Setup(SetupLaunch {
+            config: Some(config), directory: Some(data), invalid: false,
+        }) if config == Path::new("profile.json") && data == directory));
+        let invalid = launch_mode([OsString::from("--config")].into_iter());
+        assert!(matches!(
+            invalid,
+            LaunchMode::Setup(SetupLaunch { invalid: true, .. })
+        ));
+    }
+
     #[cfg(windows)]
     #[test]
     fn setup_starts_the_selected_installation_in_the_tray() {
@@ -3434,7 +3633,7 @@ fn open_app() -> eframe::Result {
         }
     );
     let (title, size, minimum, start_hidden) = match &mode {
-        LaunchMode::Setup => (
+        LaunchMode::Setup(_) => (
             "Render Bridge Installer",
             Vec2::new(990.0, 670.0),
             Vec2::new(760.0, 540.0),
