@@ -816,14 +816,26 @@ fn installation(data_dir: &Path, app_dir: PathBuf) -> Result<Installed, String> 
 
 pub fn existing_install() -> Option<Installed> {
     let data = data_dir().ok()?;
-    let app = active_runtime(&data).ok()?;
-    let installed = installation(&data, app).ok()?;
-    settings_for_runtime(&data, &installed.app_dir)?;
+    existing_install_at(&data)
+}
+
+pub fn existing_install_at(data: &Path) -> Option<Installed> {
+    if !data.is_absolute() {
+        return None;
+    }
+    let app = active_runtime(data).ok()?;
+    let installed = installation(data, app).ok()?;
+    settings_for_runtime(data, &installed.app_dir)?;
     (venv_python(&installed.app_dir).is_file()
         && RUNTIME_FILES
             .iter()
             .all(|(file, _)| installed.app_dir.join(file).is_file()))
     .then_some(installed)
+}
+
+pub fn installed_comfy_url(installed: &Installed) -> Option<String> {
+    let settings = settings_for_runtime(&installed.data_dir, &installed.app_dir)?;
+    validate_comfy_url(&settings.comfy_url).ok()
 }
 
 pub(crate) fn saved_install_settings(installed: &Installed) -> Result<Settings, String> {

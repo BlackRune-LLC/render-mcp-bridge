@@ -8,7 +8,7 @@ python -m pip install -r requirements.txt
 python -B -m unittest discover
 ```
 
-Run the Python commands inside an isolated virtual environment. Have the clean-machine check cover missing prerequisite guidance, detection after installation, instance selection, fresh install, an interrupted upgrade, Start & Verify, the opt-in shortcut, and shutdown. A simulated ComfyUI backend is enough to exercise setup and the authenticated status call without loading weights.
+Run the Python commands inside an isolated virtual environment. Have the clean-machine check cover missing prerequisite guidance, detection after installation, instance selection, fresh install, an interrupted upgrade, and Start & Verify. Open **ComfyUI Jobs** from the wizard and check the queue in the opt-in Gaming Mode shortcut. Verify that the panel distinguishes running work, queued work, an idle queue, and an unavailable queue. Confirm that **Keep Bridge running** cancels a stop request and that the wizard asks before stopping when work is active or the queue is unavailable. A simulated ComfyUI backend is enough to exercise these checks and the authenticated status call without loading weights.
 
 ## Windows x64
 

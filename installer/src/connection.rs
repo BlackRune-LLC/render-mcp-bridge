@@ -88,6 +88,10 @@ impl RunningBridge {
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    pub fn backend_url(&self) -> &str {
+        &self.settings.comfy_url
+    }
 }
 
 impl Drop for RunningBridge {

@@ -39,7 +39,11 @@ The Windows v0.1.0 download uses the original wizard. Complete the prerequisites
 3. Review the starter pipelines. The Models screen groups the files for Z-Image Turbo and NetaYume, shows which are available, and links to each download and its ComfyUI folder. You can add weights later. Select **Install Render Bridge** to set up the server and its Python environment. Setup checks a new runtime in its own directory before activating it. If an update fails or is cancelled, the previous runtime stays usable with the same token. Select **Create a Gaming Mode shortcut** before installing if you want one.
 4. Select **Start & Verify** with **Claude Code**, **Codex**, or both checked. The wizard starts a local Bridge and makes an authenticated `server_status` call without rendering. It also checks the saved user settings for the selected clients. If you run Codex with a named profile, enter its name to check that file too. If an entry is missing, add it using the displayed endpoint and private token file, following [the client instructions](#connect-an-mcp-client). Select **Verify again**, then open a fresh client session to test that client's effective configuration.
 
-Use **Open existing setup** on **Prerequisites** to return to Connect with your installed Bridge runtime. **Stop Bridge** or closing the wizard stops its Bridge session. To keep the Bridge running after closing setup, use **Shutdown and terminal commands** to copy the start command. Press **Ctrl+C** in that terminal when you want to stop it.
+Use **Open existing setup** on **Prerequisites** to return to **Connect** with your installed Bridge runtime. Open **ComfyUI Jobs** from **ComfyUI** or **Connect** to see live running and queued counts for your selected local build. Select **Refresh** to check again.
+
+When you choose **Stop Bridge** or close a wizard that started the Bridge, review the queue before confirming. Choose **Keep Bridge running** to wait or **Stop Bridge** to confirm. The confirmation reads **Stop Bridge anyway** when work is running or queued, or when the queue is unavailable. ComfyUI runs separately and has its own shutdown controls.
+
+To keep the Bridge running after closing setup, use **Shutdown and terminal commands** to copy the start command. Press **Ctrl+C** in that terminal when you want to stop it.
 
 #### Build the desktop installer
 
@@ -155,7 +159,9 @@ The [pipeline guide](docs/pipelines.md#what-each-pipeline-does) covers editing, 
 
 ## AI server gaming mode
 
-Toggle the **Gaming Mode** checkbox on **Connect**. If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu to toggle it outside the wizard. For terminal control, go to **Connect → Shutdown and terminal commands → Turn Gaming Mode off** and run the copied command. Use **Copy status command** to check it in a terminal or replace the final `off` with `on` to enable it. In the v0.1.0 download, copy the start command and replace the final `start` with `gaming-mode off`.
+Toggle the **Gaming Mode** checkbox on **Connect**. If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu. The shortcut opens a controls window with the queue and a **Gaming Mode** checkbox. If you have an older shortcut that toggles Gaming Mode immediately, rename or remove it before creating the new shortcut.
+
+For terminal control, go to **Connect → Shutdown and terminal commands → Turn Gaming Mode off** and run the copied command. Use **Copy status command** to check it in a terminal or replace the final `off` with `on` to enable it. In the v0.1.0 download, copy the start command and replace the final `start` with `gaming-mode off`.
 
 If you used the terminal installer, open a second terminal in the repo and use the same Python launcher you used for setup (`py -3` on Windows or `python3` on macOS and Linux).
 

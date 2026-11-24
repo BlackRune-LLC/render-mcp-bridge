@@ -2,6 +2,8 @@
 
 mod connection;
 mod discovery;
+mod jobs;
+mod jobs_panel;
 mod models;
 #[cfg(windows)]
 mod python_install;
@@ -10,13 +12,14 @@ mod shortcuts;
 
 use connection::{Client, RunningBridge};
 use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui, Vec2};
+use jobs_panel::QueueView;
 use setup::{Installed, ModelCheck, PythonReadiness, Settings};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const RAIL: Color32 = Color32::from_rgb(48, 36, 80);
 const RAIL_ACTIVE: Color32 = Color32::from_rgb(224, 212, 249);
@@ -76,6 +79,29 @@ enum CheckOutcome {
     Failed(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueueAction {
+    Inspect,
+    StopBridge,
+    CloseWindow,
+}
+
+struct QueueDialog {
+    queue: QueueView,
+    action: QueueAction,
+}
+
+enum LaunchMode {
+    Setup,
+    Controls(Option<PathBuf>),
+}
+
+struct ControlsState {
+    data_dir: Option<PathBuf>,
+    queue: Option<QueueView>,
+    next_load: Instant,
+}
+
 struct Installer {
     step: Step,
     python: Option<PythonReadiness>,
@@ -107,10 +133,12 @@ struct Installer {
     verify_claude: bool,
     verify_codex: bool,
     codex_profile: String,
+    queue_dialog: Option<QueueDialog>,
+    controls: Option<ControlsState>,
 }
 
 impl Installer {
-    fn new(ctx: &egui::Context) -> Self {
+    fn new(ctx: &egui::Context, mode: LaunchMode) -> Self {
         ctx.set_theme(egui::Theme::Light);
         ctx.style_mut(|style| {
             style.spacing.item_spacing = egui::vec2(10.0, 10.0);
@@ -164,8 +192,20 @@ impl Installer {
             verify_claude: true,
             verify_codex: true,
             codex_profile: String::new(),
+            queue_dialog: None,
+            controls: None,
         };
-        installer.check_python(ctx);
+        match mode {
+            LaunchMode::Setup => installer.check_python(ctx),
+            LaunchMode::Controls(data_dir) => {
+                installer.step = Step::Connect;
+                installer.controls = Some(ControlsState {
+                    data_dir,
+                    queue: None,
+                    next_load: Instant::now(),
+                });
+            }
+        }
         installer
     }
 
@@ -191,6 +231,56 @@ impl Installer {
 
     fn python_ready(&self) -> bool {
         matches!(self.python, Some(PythonReadiness::Ready { .. }))
+    }
+
+    fn show_jobs(&mut self, action: QueueAction) {
+        let url = if self.step == Step::Comfy {
+            Some(self.settings.comfy_url.clone())
+        } else {
+            self.running
+                .as_ref()
+                .map(|running| running.backend_url().to_owned())
+                .or_else(|| self.installed.as_ref().and_then(setup::installed_comfy_url))
+        };
+        self.queue_dialog = Some(QueueDialog {
+            queue: QueueView::new(url.unwrap_or_default()),
+            action,
+        });
+    }
+
+    fn jobs_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.queue_dialog else {
+            return;
+        };
+        let action = dialog.action;
+        let response = egui::Modal::new(egui::Id::new("comfyui-jobs")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading(RichText::new("ComfyUI Jobs").size(28.0).strong());
+            dialog.queue.show(ui);
+            if action == QueueAction::Inspect {
+                return (secondary(ui, "Close", true).clicked(), false);
+            }
+            caption(ui, "Stopping Render Bridge can interrupt Bridge job tracking. ComfyUI and its queue keep running separately.");
+            let label = dialog.queue.stop_confirmation();
+            let mut keep = false;
+            let mut stop = false;
+            ui.horizontal_wrapped(|ui| {
+                keep = secondary(ui, "Keep Bridge running", true).clicked();
+                stop = primary(ui, label.unwrap_or("Stop Bridge"), label.is_some()).clicked();
+            });
+            (keep, stop)
+        });
+        let (dismiss, stop) = response.inner;
+        if dismiss || stop || response.should_close() {
+            self.queue_dialog = None;
+        }
+        if stop {
+            self.running = None;
+            self.verification = None;
+            if action == QueueAction::CloseWindow {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
     }
 
     fn check_python(&mut self, ctx: &egui::Context) {
@@ -360,6 +450,22 @@ impl Installer {
     }
 
     fn change_gaming_mode(&mut self, ctx: &egui::Context, enabled: bool) {
+        if self.controls.as_ref().is_some_and(|controls| {
+            controls
+                .data_dir
+                .as_deref()
+                .and_then(setup::existing_install_at)
+                .as_ref()
+                .map(|current| &current.app_dir)
+                != self.installed.as_ref().map(|opened| &opened.app_dir)
+        }) {
+            self.load_controls(ctx);
+            self.gaming_error = Some(
+                "The active setup changed. Review the updated queue before using Gaming Mode."
+                    .into(),
+            );
+            return;
+        }
         let Some(installed) = self.installed.clone() else {
             return;
         };
@@ -753,6 +859,9 @@ impl Installer {
             if secondary(ui, "Detect running ComfyUI", idle).clicked() {
                 self.start_discovery(ui.ctx());
             }
+            if secondary(ui, "ComfyUI Jobs", idle).clicked() {
+                self.show_jobs(QueueAction::Inspect);
+            }
         });
         if !self.instances.is_empty() {
             let mut chosen = None;
@@ -1113,38 +1222,13 @@ impl Installer {
                 if *passed { GREEN } else { CAUTION },
             );
         }
-        if let Some(mut enabled) = gaming_mode(&installed) {
-            card(ui, |ui| {
-                if ui
-                    .add_enabled(idle, egui::Checkbox::new(&mut enabled, "Gaming Mode"))
-                    .changed()
-                {
-                    self.change_gaming_mode(ui.ctx(), enabled);
-                }
-                caption(
-                    ui,
-                    if enabled {
-                        "New GPU jobs are paused for this Bridge."
-                    } else {
-                        "This Bridge can accept new GPU jobs."
-                    },
-                );
-            });
-        } else {
-            status(
-                ui,
-                "Gaming Mode",
-                "Status unavailable. Run the status command in a terminal.",
-                MUTED,
-            );
+        self.show_gaming_mode(ui, &installed);
+        if secondary(ui, "ComfyUI Jobs", idle).clicked() {
+            self.show_jobs(QueueAction::Inspect);
         }
-        if let Some(message) = &self.gaming_error {
-            status(ui, "Gaming Mode could not change", message, ERROR);
-        }
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
         caption(
             ui,
-            "Stop Bridge or close this window to stop the Bridge started here.",
+            "Stop Bridge or close this window to review the queue and stop the Bridge started here.",
         );
         caption(
             ui,
@@ -1175,6 +1259,131 @@ impl Installer {
         }
     }
 
+    fn show_gaming_mode(&mut self, ui: &mut Ui, installed: &Installed) {
+        if let Some(mut enabled) = gaming_mode(installed) {
+            card(ui, |ui| {
+                if ui
+                    .add_enabled(
+                        self.worker.is_none(),
+                        egui::Checkbox::new(&mut enabled, "Gaming Mode"),
+                    )
+                    .changed()
+                {
+                    self.change_gaming_mode(ui.ctx(), enabled);
+                }
+                caption(
+                    ui,
+                    if enabled {
+                        "New GPU jobs are paused for this Bridge."
+                    } else {
+                        "This Bridge can accept new GPU jobs."
+                    },
+                );
+            });
+        } else {
+            status(
+                ui,
+                "Gaming Mode",
+                "Status unavailable. Run the status command in a terminal.",
+                MUTED,
+            );
+        }
+        if let Some(message) = &self.gaming_error {
+            status(ui, "Gaming Mode could not change", message, ERROR);
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+
+    fn load_controls(&mut self, ctx: &egui::Context) {
+        let Some(controls) = &mut self.controls else {
+            return;
+        };
+        let installed = controls
+            .data_dir
+            .as_deref()
+            .and_then(setup::existing_install_at);
+        let url = installed.as_ref().and_then(setup::installed_comfy_url);
+        let changed = installed.as_ref().map(|current| &current.app_dir)
+            != self.installed.as_ref().map(|opened| &opened.app_dir);
+        match url {
+            Some(url)
+                if changed
+                    || !controls
+                        .queue
+                        .as_ref()
+                        .is_some_and(|queue| queue.is_for(&url)) =>
+            {
+                controls.queue = Some(QueueView::new(url));
+            }
+            None => controls.queue = None,
+            _ => {}
+        }
+        self.installed = installed;
+        controls.next_load = Instant::now() + Duration::from_secs(2);
+        ctx.request_repaint_after(Duration::from_secs(2));
+    }
+
+    fn controls_screen(&mut self, ctx: &egui::Context) {
+        if self
+            .controls
+            .as_ref()
+            .is_some_and(|controls| Instant::now() >= controls.next_load)
+        {
+            self.load_controls(ctx);
+        }
+        egui::TopBottomPanel::top("controls-banner")
+            .show_separator_line(false)
+            .frame(
+                Frame::new()
+                    .fill(RAIL)
+                    .inner_margin(egui::Margin::symmetric(28, 14)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    bridge_mark(ui);
+                    ui.label(
+                        RichText::new("Render Bridge")
+                            .size(23.0)
+                            .strong()
+                            .color(CREAM),
+                    );
+                });
+            });
+        egui::TopBottomPanel::bottom("controls-actions")
+            .show_separator_line(false)
+            .frame(
+                Frame::new()
+                    .fill(CREAM)
+                    .inner_margin(egui::Margin::symmetric(28, 10)),
+            )
+            .show(ctx, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if primary(ui, "Close", true).clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(CREAM).inner_margin(egui::Margin::symmetric(28, 20)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    header(ui, "ComfyUI Jobs", "Check running and queued work before shutting down.");
+                    if let Some(queue) = self.controls.as_mut().and_then(|controls| controls.queue.as_mut()) {
+                        queue.show(ui);
+                    } else {
+                        status(ui, "Queue status unavailable",
+                            "The saved ComfyUI connection could not be read. Open Render Bridge Setup to review the installation.", CAUTION);
+                    }
+                    if let Some(installed) = self.installed.clone() {
+                        self.show_gaming_mode(ui, &installed);
+                    }
+                    if self.worker.is_some() {
+                        activity(ui, &self.progress);
+                    }
+                });
+            });
+    }
+
     fn actions(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("setup-actions")
             .exact_height(82.0)
@@ -1197,8 +1406,7 @@ impl Installer {
                     if self.step == Step::Connect && idle {
                         if self.running.is_some() {
                             if secondary(ui, "Stop Bridge", true).clicked() {
-                                self.running = None;
-                                self.verification = None;
+                                self.show_jobs(QueueAction::StopBridge);
                             }
                         } else if secondary(ui, "Close", true).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1270,14 +1478,28 @@ impl Installer {
 impl eframe::App for Installer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_updates();
+        if self.controls.is_some() {
+            self.controls_screen(ctx);
+            return;
+        }
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
         if matches!(self.step, Step::Install | Step::Connect)
             && self.worker.is_some()
-            && ctx.input(|input| input.viewport().close_requested())
+            && close_requested
         {
             if let Some(cancel) = &self.install_cancel {
                 cancel.store(true, Ordering::Relaxed);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        } else if close_requested && self.running.as_mut().is_some_and(RunningBridge::is_running) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self
+                .queue_dialog
+                .as_ref()
+                .is_none_or(|dialog| dialog.action != QueueAction::CloseWindow)
+            {
+                self.show_jobs(QueueAction::CloseWindow);
+            }
         }
         self.rail(ctx);
         self.actions(ctx);
@@ -1306,6 +1528,7 @@ impl eframe::App for Installer {
                         Step::Connect => self.connect_screen(ui),
                     });
             });
+        self.jobs_dialog(ctx);
     }
 }
 
@@ -1530,17 +1753,70 @@ fn copy_row(ui: &mut Ui, title: &str, button: &str, value: &str) -> bool {
     clicked
 }
 
+fn launch_mode(mut args: impl Iterator<Item = std::ffi::OsString>) -> LaunchMode {
+    if !args.next().is_some_and(|value| value == "--job-monitor") {
+        return LaunchMode::Setup;
+    }
+    let data_dir = if args.next().is_some_and(|value| value == "--data-dir") {
+        args.next()
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    } else {
+        None
+    };
+    LaunchMode::Controls(data_dir.filter(|_| args.next().is_none()))
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn shortcut_opens_controls_for_the_exact_data_directory() {
+        let data = std::env::current_dir()
+            .unwrap()
+            .join("Render Bridge fixture");
+        let arguments = [
+            OsString::from("--job-monitor"),
+            OsString::from("--data-dir"),
+            data.clone().into_os_string(),
+        ];
+        assert!(matches!(
+            launch_mode(arguments.into_iter()),
+            LaunchMode::Controls(Some(directory)) if directory == data
+        ));
+        assert!(matches!(
+            launch_mode([OsString::from("--job-monitor")].into_iter()),
+            LaunchMode::Controls(None)
+        ));
+    }
+}
+
 fn main() -> eframe::Result {
+    let mode = launch_mode(std::env::args_os().skip(1));
+    let (title, size, minimum) = match &mode {
+        LaunchMode::Setup => (
+            "Render Bridge Installer",
+            Vec2::new(990.0, 670.0),
+            Vec2::new(760.0, 540.0),
+        ),
+        LaunchMode::Controls(_) => (
+            "Render Bridge Controls",
+            Vec2::new(590.0, 535.0),
+            Vec2::new(420.0, 400.0),
+        ),
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(Vec2::new(990.0, 670.0))
-            .with_min_inner_size(Vec2::new(760.0, 540.0))
+            .with_inner_size(size)
+            .with_min_inner_size(minimum)
             .with_resizable(true),
         ..Default::default()
     };
     eframe::run_native(
-        "Render Bridge Installer",
+        title,
         options,
-        Box::new(|creation| Ok(Box::new(Installer::new(&creation.egui_ctx)))),
+        Box::new(move |creation| Ok(Box::new(Installer::new(&creation.egui_ctx, mode)))),
     )
 }

@@ -13,16 +13,45 @@ pub fn create_gaming_shortcut(installed: &Installed) -> Result<PathBuf, String> 
             "Finish installing Render Bridge before creating its Gaming Mode shortcut.".into(),
         );
     }
+    let source = std::env::current_exe()
+        .map_err(|_| "The running Render Bridge app could not be located.")?;
+    stage_monitor(app_dir, data_dir, &source, create_native_shortcut)
+}
+
+fn stage_monitor(
+    app_dir: &Path,
+    data_dir: &Path,
+    source: &Path,
+    create_shortcut: impl FnOnce(&Path, &[&str]) -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    let state = path_text(data_dir)?;
+    let stage_error = "The Render Bridge controls could not be copied into this installation.";
+    let staging = tempfile::Builder::new()
+        .prefix("controls-")
+        .tempdir_in(app_dir)
+        .map_err(|_| stage_error)?;
+    let executable = staging.path().join(format!(
+        "render-bridge-controls{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::copy(source, &executable).map_err(|_| stage_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| stage_error)?;
+    }
     let command = [
-        path_text(&python)?,
-        path_text(&launcher)?,
+        path_text(&executable)?,
+        "--job-monitor",
         "--data-dir",
-        path_text(data_dir)?,
-        "gaming-mode",
-        "toggle",
-        "--wait",
+        state,
     ];
-    create_native_shortcut(app_dir, &command)
+    let shortcut = create_shortcut(app_dir, &command)?;
+    // A saved shortcut owns this copy. Failure leaves the previous shortcut
+    // untouched and drops the newly staged directory.
+    let _ = staging.keep();
+    Ok(shortcut)
 }
 
 fn path_text(path: &Path) -> Result<&str, String> {
@@ -143,8 +172,10 @@ fn write_windows_shortcut(
             .map_err(native)?;
         link.SetWorkingDirectory(&HSTRING::from(path_text(app_dir)?.replace('/', "\\")))
             .map_err(native)?;
-        link.SetDescription(w!("Toggle Gaming Mode for Render Bridge"))
-            .map_err(native)?;
+        link.SetDescription(w!(
+            "Check ComfyUI jobs and control Render Bridge Gaming Mode"
+        ))
+        .map_err(native)?;
         link.cast::<IPersistFile>()
             .map_err(native)?
             .Save(&HSTRING::from(shortcut.as_os_str()), true)
@@ -225,7 +256,7 @@ fn create_native_shortcut(_app_dir: &Path, command: &[&str]) -> Result<PathBuf, 
         .join(" ");
     let entry = format!(
         "[Desktop Entry]\nType=Application\nName=Render Bridge Gaming Mode\n\
-         Comment=Toggle Gaming Mode for Render Bridge\nTerminal=true\nExec={command}\n\
+         Comment=Check ComfyUI jobs and control Render Bridge Gaming Mode\nTerminal=false\nExec={command}\n\
          Categories=Utility;\n"
     );
     std::fs::create_dir_all(&directory)
@@ -286,6 +317,46 @@ mod tests {
     }
 
     #[test]
+    fn staged_monitor_persists_only_if_its_shortcut_is_saved() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("installer");
+        let data_dir = fixture.path().join("State with spaces");
+        let app_dir = data_dir.join("app");
+        let shortcut = fixture.path().join("shortcut");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&source, b"installer bytes").unwrap();
+        std::fs::write(&shortcut, b"existing shortcut").unwrap();
+
+        let mut previous_copy = PathBuf::new();
+        let existing = stage_monitor(&app_dir, &data_dir, &source, |directory, command| {
+            assert_eq!(directory, app_dir);
+            previous_copy = PathBuf::from(command[0]);
+            assert_eq!(std::fs::read(&previous_copy).unwrap(), b"installer bytes");
+            save_shortcut(&shortcut, b"would replace the existing shortcut", false)
+        });
+        assert!(existing.is_err());
+        assert!(!previous_copy.exists());
+        assert_eq!(std::fs::read(&shortcut).unwrap(), b"existing shortcut");
+
+        let new_shortcut = fixture.path().join("new shortcut");
+        let mut retained_copy = PathBuf::new();
+        assert_eq!(
+            stage_monitor(&app_dir, &data_dir, &source, |_, command| {
+                retained_copy = PathBuf::from(command[0]);
+                assert_eq!(
+                    &command[1..],
+                    &["--job-monitor", "--data-dir", path_text(&data_dir).unwrap()]
+                );
+                save_shortcut(&new_shortcut, command[0].as_bytes(), false)
+            })
+            .unwrap(),
+            new_shortcut
+        );
+        assert!(retained_copy.starts_with(&app_dir));
+        assert_eq!(std::fs::read(retained_copy).unwrap(), b"installer bytes");
+    }
+
+    #[test]
     fn windows_arguments_handle_spaces_quotes_and_trailing_slashes() {
         assert_eq!(
             windows_argument(r"C:\Render Bridge\根\"),
@@ -312,19 +383,14 @@ mod tests {
         std::fs::create_dir(&desktop).unwrap();
         let data_dir = fixture.path().join("State 试 O'Brien & 100%");
         let app_dir = data_dir.join("app");
-        let python = venv_python(&app_dir);
-        let launcher = app_dir.join("setup_render_bridge.py");
-        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
-        std::fs::write(&python, []).unwrap();
-        std::fs::write(&launcher, []).unwrap();
+        let monitor = app_dir.join("render-bridge-controls.exe");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&monitor, []).unwrap();
         let command = [
-            path_text(&python).unwrap(),
-            path_text(&launcher).unwrap(),
+            path_text(&monitor).unwrap(),
+            "--job-monitor",
             "--data-dir",
             path_text(&data_dir).unwrap(),
-            "gaming-mode",
-            "toggle",
-            "--wait",
         ];
         let shortcut = write_windows_shortcut(&desktop, &app_dir, &command).unwrap();
 
@@ -346,12 +412,11 @@ mod tests {
             link.GetArguments(&mut arguments).unwrap();
             link.GetWorkingDirectory(&mut working_directory).unwrap();
         };
-        assert_eq!(Path::new(&decode(&path)), python);
+        assert_eq!(Path::new(&decode(&path)), monitor);
         assert_eq!(
             decode(&arguments),
             format!(
-                "\"{}\" \"--data-dir\" \"{}\" \"gaming-mode\" \"toggle\" \"--wait\"",
-                launcher.display(),
+                "\"--job-monitor\" \"--data-dir\" \"{}\"",
                 data_dir.display()
             )
         );
