@@ -1,0 +1,128 @@
+# Models, nodes, and pipelines
+
+Render Bridge turns your agent's requests into ComfyUI jobs. A **model** is a weight file ComfyUI loads. A **node** is an operation in the graph, such as loading a model, sampling an image, or saving the output. A **pipeline** is the graph that connects those operations. Render Bridge builds graphs for its named tools and can also submit a workflow you export.
+
+## Accounts and credentials
+
+| Account or credential | When you need it |
+| --- | --- |
+| Hugging Face account | The public, ungated starter downloads below work anonymously. For a gated model, sign in, request or accept access on its model page, and wait if approval is manual. For a private repo, first make sure its owner or organization has granted your account access. Download while signed in. [Hugging Face gated models](https://huggingface.co/docs/hub/en/models-gated#access-gated-models-as-a-user) |
+| Hugging Face CLI sign-in | Optional for authenticated terminal downloads. Install the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/main/guides/cli) separately and run `hf auth login` interactively. Use a read-scoped token if you choose token sign-in. |
+| Your agent's usual login | Sign in to the MCP client you choose as you normally would. [Claude Code authentication](https://code.claude.com/docs/en/authentication) · [Codex authentication](https://learn.chatgpt.com/docs/auth#openai-authentication) |
+| Render Bridge bearer token | The bridge generates this on the host. Put it in your agent's private MCP settings as described in the [README](../README.md#connect-an-mcp-client). Keep model-host and agent-provider credentials in their own tools. |
+| Hosted or paid node credentials | The local pipelines here use installed weights and run without a Comfy account. A workflow using ComfyUI Partner Nodes may require a Comfy account and credits, or provider-specific sign-in. Verify those workflows in ComfyUI first. Render Bridge's `run_workflow` accepts the graph and has no provider-auth input. [ComfyUI Partner Nodes](https://docs.comfy.org/tutorials/partner-nodes/overview) |
+
+Model weights and custom nodes have their own terms. Check the model card and node repository for the exact files you install.
+
+## Recommended first pipeline
+
+Start with **Z-Image Turbo**, the default `generate_image` preset (`z_image_turbo`). It uses ComfyUI core nodes and makes a good first test before adding editing, transparency, or video. The three weights below total about 15 GB of downloads. Disk size and GPU memory use are separate.
+
+| Download | Place under your ComfyUI model root |
+| --- | --- |
+| [`SwarmUI_Z-Image-Turbo-FP8Mix.safetensors`](https://huggingface.co/mcmonkey/swarm-models/blob/main/SwarmUI_Z-Image-Turbo-FP8Mix.safetensors) | `models/diffusion_models/` |
+| [`qwen_3_4b.safetensors`](https://huggingface.co/Comfy-Org/Z-Image-Turbo/blob/main/split_files/text_encoders/qwen_3_4b.safetensors) | `models/text_encoders/` |
+| [`ae.safetensors`](https://huggingface.co/Comfy-Org/Z-Image-Turbo/blob/main/split_files/vae/ae.safetensors) | `models/vae/` |
+
+Keep those filenames. The named preset looks up the listed FP8 checkpoint. For a different Z-Image variant, use a ComfyUI workflow that already selects that variant and submit it with [`run_workflow`](#run-a-workflow-from-comfyui).
+
+1. Put the files in the directories used by the ComfyUI instance Render Bridge connects to. If your install uses extra model locations, use its [configured model search paths](https://docs.comfy.org/installation/manual_install#adding-extra-model-paths).
+2. Refresh the model lists in ComfyUI or restart it after installing weights or nodes. Ask your agent to call `list_models` and look for `z_image_turbo` with `available: true`. If it reports an error, match the missing loader filename to the table.
+3. Try one 512 × 512 image with the [first-render prompt](../README.md#make-your-first-render). Start with a batch of one and leave transparency off.
+
+`list_models` checks filenames reported by ComfyUI's loaders. A listed preset still needs compatible graph nodes and enough memory to run.
+
+For a one-file illustration starter, choose `anime` instead. Put [`NetaYumev35_pretrained_all_in_one.safetensors`](https://huggingface.co/duongve/NetaYume-Lumina-Image-2.0/blob/main/NetaYumev35_pretrained_all_in_one.safetensors) in `models/checkpoints/` and ask your agent to use that preset after `list_models` shows it is available.
+
+## Check and install nodes
+
+Standard generation, Qwen image tools, and BiRefNet cutouts use nodes supplied with current ComfyUI. The named Wan and 3D pipelines also use newer core nodes. Start by updating ComfyUI if a core node is missing. Examples include `RemoveBackground`, `WanAnimate2ToVideo`, `WanFirstLastFrameToVideo`, `LoadMoGeModel`, and `Save3DAdvanced`.
+
+For a workflow that explicitly calls for a third-party node pack, open it in ComfyUI and use [ComfyUI Manager's missing-node flow](https://docs.comfy.org/installation/install_custom_node) or follow the node author's instructions. Install only packs you trust into the ComfyUI environment, restart ComfyUI, and run the graph in its UI before using Render Bridge. A node's API class can also be checked via `GET /object_info/<class_type>` on the local ComfyUI API. [ComfyUI API routes](https://docs.comfy.org/development/comfyui-server/comms_routes)
+
+## What each pipeline does
+
+| Goal | Render Bridge tool | Install or prepare |
+| --- | --- | --- |
+| Create a still image from text | `generate_image` | Start with [Z-Image Turbo](#recommended-first-pipeline). Try [Qwen-Image](#qwen-image-generation-and-editing) for another text-to-image option. |
+| Edit an image or repaint a sequence of frames | `edit_image`, `repaint_frames` | Install the [Qwen editing files](#qwen-image-generation-and-editing). |
+| Cut out a subject or generate a transparent PNG | `remove_background` or `transparent=true` | Install [BiRefNet](#transparent-images-and-cutouts) and its core ComfyUI nodes. |
+| Animate a character from a driving clip or make a loop | `animate_from_clip`, `animate_loop` | Install the [Wan video files](#animation). |
+| Generate a GLB from a single image | `image_to_3d` | Set up the [3D model files and workflow](#image-to-3d). |
+| Submit a graph you build yourself | `run_workflow` | [Export it in API format](#run-a-workflow-from-comfyui) after testing it in ComfyUI. |
+
+For model-heavy operations that support it, call `start_job`, then `get_job` to retrieve the finished result. Keep the job ID and returned file references together.
+
+For an image already generated on this server, give the editing or cutout tool its returned `filename` and `subfolder` with `source="output"`. For a file on your own device, ask your agent to use `upload_link`, upload the file, then pass the returned file reference with `source="input"`.
+
+### Transparent images and cutouts
+
+Place [`birefnet.safetensors`](https://huggingface.co/Comfy-Org/BiRefNet/blob/main/background_removal/birefnet.safetensors) in `models/background_removal/`. The bridge uses ComfyUI's `LoadBackgroundRemovalModel` and `RemoveBackground` nodes to create a mask and save RGBA PNGs. Use `remove_background` on an existing image, or pass `transparent=true` to supported tools. The animation tools and `repaint_frames` ask for transparency by default. Pass `transparent=false` if you do not want that step. [ComfyUI's BiRefNet guide](https://docs.comfy.org/tutorials/utility/remove-background-birefnet)
+
+### Qwen image generation and editing
+
+Install the shared encoder and VAE first. Then choose generation, editing, or both. Qwen weights are substantially larger than the Z-Image Turbo starter.
+
+| Use | Download | Folder under `models/` |
+| --- | --- | --- |
+| Shared | [`qwen_2.5_vl_7b_fp8_scaled.safetensors`](https://huggingface.co/Comfy-Org/Qwen-Image/blob/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors) | `text_encoders/` |
+| Shared | [`qwen_image_vae.safetensors`](https://huggingface.co/Comfy-Org/Qwen-Image/blob/main/split_files/vae/qwen_image_vae.safetensors) | `vae/` |
+| `qwen_image` or `qwen_image_fast` | [`qwen_image_2512_fp8_e4m3fn.safetensors`](https://huggingface.co/Comfy-Org/Qwen-Image/blob/main/split_files/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors) | `diffusion_models/` |
+| `qwen_image_fast` | [`Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors`](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning/blob/main/Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors) | `loras/` |
+| `edit_image` or `repaint_frames` | [`qwen_image_edit_2511_fp8mixed.safetensors`](https://huggingface.co/Comfy-Org/Qwen-Image-Edit/blob/main/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors) | `diffusion_models/` |
+| `edit_image` or `repaint_frames` | [`Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/blob/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors) | `loras/` |
+
+The editing tools check for all four editing files, including the editing LoRA, even if you choose `fast=false`. The generation and editing Lightning files are separate downloads. For `repaint_frames`, provide the frames in order at a consistent size. Use [BiRefNet](#transparent-images-and-cutouts) if the result should have an alpha channel.
+
+### Animation
+
+Use a short clip or a small loop first. Video files and runtime memory requirements are larger than the still-image starter.
+
+**`animate_from_clip`** repaints a character along a driving MP4/MOV clip or an ordered set of frames. Install the following [Wan Animate 2 files](https://huggingface.co/Comfy-Org/Wan-Animate-2) for the default mode. The [official distilled template](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/video_wan_animate2_distilled.json) has the download locations.
+
+| Folder under `models/` | Filename |
+| --- | --- |
+| `diffusion_models/` | `wan_animate_2_distill_int8_convrot.safetensors` |
+| `text_encoders/` | `umt5_xxl_fp8_e4m3fn_scaled.safetensors` |
+| `vae/` | `Wan2_1_VAE_bf16.safetensors` |
+| `clip_vision/` | `clip_vision_h.safetensors` |
+
+For `quality=true`, use `wan_animate_2_int8_convrot.safetensors` in `diffusion_models/` and add `lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors` in `loras/`. See the [quality template](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_wan_animate2.json). Video input is limited to 64 MiB, with a cap of 49 frames and a lower frame budget at larger sizes.
+
+**`animate_loop`** makes a short loop from one image. Follow the links in the [Wan 2.2 first/last-frame template](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_wan2_2_14B_flf2v.json) for these exact files.
+
+| Folder under `models/` | Filename |
+| --- | --- |
+| `diffusion_models/` | `wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors`, `wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors` |
+| `text_encoders/` | `umt5_xxl_fp8_e4m3fn_scaled.safetensors` |
+| `vae/` | `wan_2.1_vae.safetensors` |
+| `loras/` (fast mode) | `wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors`, `wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors` |
+
+The default fast mode needs both LoRAs. `quality=true` skips them. The product of `frames` and `spacing` must be divisible by four and at most 48. For both Wan tools, install [BiRefNet](#transparent-images-and-cutouts) for transparent frames or pass `transparent=false`.
+
+### Image to 3D
+
+1. Download the official [Pixal3D and TRELLIS.2 template JSON](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/3d_pixal3d_trellis2_image_to_model.json) and open it in current ComfyUI. Install the models specified by the template for the branches you intend to run.
+2. Save its API export locally. Keep the graph's expected node IDs and `viewport_state` on the `Save3DAdvanced` node. Set `COMFY_3D_WORKFLOW` to that JSON file's path in the environment that starts Render Bridge.
+3. Restart Render Bridge. `list_models` reports whether the workflow path is configured. Confirm the chosen branch can run in ComfyUI before calling `image_to_3d`.
+
+For the full two-model template, use the file links in the template to install the following weights.
+
+| Folder under `models/` | Filename |
+| --- | --- |
+| `diffusion_models/` | `pixal3d_int8_convrot.safetensors`, `trellis_2_int8_convrot.safetensors` |
+| `clip_vision/` | `dino_v3_L_naf_fp32.safetensors` |
+| `vae/` | `trellis_2_shape_vae_bf16.safetensors`, `trellis_2_texture_vae_bf16.safetensors` |
+| `geometry_estimation/` | `moge_2_vitl_normal_fp16.safetensors` |
+| `background_removal/` | `birefnet.safetensors` if using background removal |
+
+Pixal3D and TRELLIS.2 produce textured GLBs. The optional Hunyuan 3D 2.1 path uses `models/checkpoints/hunyuan_3d_v2.1.safetensors` and the same workflow file for the save viewport. It produces an untextured GLB. Check model terms before using these outputs, including [DINOv3's license](https://raw.githubusercontent.com/facebookresearch/dinov3/main/LICENSE.md) with the Pixal/TRELLIS pipeline and [Hunyuan's territorial terms](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1/blob/main/LICENSE) if you choose Hunyuan.
+
+`optimize_glb` is optional. Install Node.js and the [glTF Transform CLI](https://gltf-transform.dev/cli), put `node` on PATH, then set `GLTF_TRANSFORM_CLI` to the installed package's JavaScript entry point (`bin/cli.js`). Use an input GLB accessible to the bridge.
+
+### Run a workflow from ComfyUI
+
+1. Open a trusted workflow in ComfyUI. Resolve any missing nodes and weights, set its inputs, and run it once in the UI. Include a save node such as `SaveImage` so the bridge has a persisted file to return.
+2. Use **Export (API)** in ComfyUI. The result should be an object keyed by node ID, with `class_type` and `inputs` for each node.
+3. If the graph uses local images and your agent is on another machine, use `upload_link` to stage them on the Render Bridge host. Use the returned filenames and subfolders in the graph inputs.
+4. Ask your agent to pass the API graph object to `run_workflow`. It can return the saved image links, or use `start_job` and `get_job` if the workflow will take a while.
