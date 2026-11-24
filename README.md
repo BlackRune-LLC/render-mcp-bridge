@@ -66,6 +66,8 @@ Choose an optional generated asset folder, backup folder, or both during install
 
 Use **Settings → Advanced configuration → Open configuration file** to review the saved ComfyUI data root, URL, and any separate input or output paths. Stop Render Bridge before editing the file, then restart it and verify the connection. Set runtime tuning variables in the environment that starts Render Bridge. Render Bridge requests a model unload after 10 minutes of idle time by default. Set `IDLE_UNLOAD_MIN=0` to disable idle unloading. [Configuration reference](docs/configuration.md)
 
+Use **Settings → Open crash logs** to find local Render Bridge crash reports on Windows. [Local crash logs](docs/configuration.md#local-crash-logs)
+
 #### Build the desktop installer
 
 Install a current [Rust toolchain](https://www.rust-lang.org/tools/install) and your platform's native build tools. Download and extract the source archive or use [Git](https://git-scm.com/downloads) to clone the repository. Open a terminal in the extracted folder or checkout and start the wizard.

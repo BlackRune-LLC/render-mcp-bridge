@@ -31,6 +31,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
+from setup_render_bridge import DEFAULT_URL, atomic_text, backend_url, default_data_dir, enable_crash_reports
+
+if __name__ == "__main__":
+    enable_crash_reports("server")
+
 import httpx
 import uvicorn
 from PIL import Image as PILImage
@@ -41,14 +46,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
-from setup_render_bridge import DEFAULT_URL, atomic_text, backend_url
-
-if os.name == "nt":
-    USER_DATA_ROOT = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-else:
-    USER_DATA_ROOT = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-
-DATA_DIR = Path(os.environ.get("COMFY_MCP_DATA_DIR", USER_DATA_ROOT / "comfy-mcp")).expanduser()
+DATA_DIR = Path(os.environ.get("COMFY_MCP_DATA_DIR", default_data_dir())).expanduser()
 try:
     COMFY_URL = backend_url(os.environ.get("COMFY_URL", DEFAULT_URL))
 except ValueError as exc:

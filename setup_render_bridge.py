@@ -1,6 +1,7 @@
 """Set up and run Render Bridge with a locally managed ComfyUI backend."""
 
 import argparse
+import builtins
 import http.client
 import ipaddress
 import json
@@ -8,11 +9,15 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+from collections import deque
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from traceback import walk_tb
 from urllib.parse import urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -40,17 +45,21 @@ STARTER_MODELS = (
     ("VAELoader", "vae_name", "ae.safetensors"),
     ("CheckpointLoaderSimple", "ckpt_name", "NetaYumev35_pretrained_all_in_one.safetensors"),
 )
+CRASH_COMPONENTS = {"server", "terminal-installer"}
+CRASH_SOURCE_FILES = {"comfy_mcp_server.py", "setup_render_bridge.py"}
 
 
-def data_dir() -> Path:
-    override = os.environ.get("COMFY_MCP_DATA_DIR")
-    if override:
-        return Path(override).expanduser().resolve()
+def default_data_dir() -> Path:
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
     else:
         base = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
-    return (Path(base).expanduser() / "comfy-mcp").resolve()
+    return Path(base).expanduser() / "comfy-mcp"
+
+
+def data_dir() -> Path:
+    override = os.environ.get("COMFY_MCP_DATA_DIR")
+    return (Path(override).expanduser() if override else default_data_dir()).resolve()
 
 
 def load_settings(path: Path) -> dict[str, str]:
@@ -67,8 +76,9 @@ def load_settings(path: Path) -> dict[str, str]:
     return settings
 
 
-def atomic_text(path: Path, text: str) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+def atomic_text(path: Path, text: str, *, create_parent: bool = True) -> None:
+    if create_parent:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".render-bridge-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
@@ -78,6 +88,57 @@ def atomic_text(path: Path, text: str) -> None:
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def record_crash(component: str, error: BaseException) -> None:
+    if component not in CRASH_COMPONENTS or not isinstance(error, Exception) or isinstance(error, EOFError):
+        return
+    try:
+        directory = default_data_dir()
+        if not directory.is_absolute():
+            return
+        logs = directory / "crash-logs"
+        for folder in (directory, logs):
+            folder.mkdir(mode=0o700, parents=folder == directory, exist_ok=True)
+            metadata = folder.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or (
+                getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                return
+
+        stack = deque(maxlen=6)
+        for frame, line in walk_tb(error.__traceback__):
+            source = Path(frame.f_code.co_filename)
+            function = frame.f_code.co_name
+            if (source.name in CRASH_SOURCE_FILES and source.parent.resolve() == PROJECT_ROOT
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}|<module>", function)):
+                stack.append({"file": source.name, "function": function, "line": line})
+
+        kind = type(error)
+        report = {
+            "schema": 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "component": component,
+            "python_version": ".".join(map(str, sys.version_info[:3])),
+            "exception_type": kind.__name__ if getattr(builtins, kind.__name__, None) is kind else "Exception",
+            "stack": list(stack),
+        }
+        atomic_text(logs / f"{component}.json", json.dumps(report, indent=2) + "\n", create_parent=False)
+    except Exception:
+        # A reporting failure must leave the original process error intact.
+        pass
+
+
+def enable_crash_reports(component: str) -> None:
+    if any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+        return
+    previous_hook = sys.excepthook
+
+    def report_and_display(kind, error, traceback):
+        record_crash(component, error)
+        previous_hook(kind, error, traceback)
+
+    sys.excepthook = report_and_display
 
 
 def save_settings(path: Path, settings: dict[str, str]) -> None:
@@ -445,10 +506,13 @@ def main(argv: list[str] | None = None) -> int:
     except InstallFailure as error:
         print(error, file=sys.stderr)
         return 1
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError) as error:
+        if isinstance(error, RuntimeError):
+            record_crash("terminal-installer", error)
         print("A local file or process could not be accessed. Check the setup paths and permissions.", file=sys.stderr)
         return 1
 
 
 if __name__ == "__main__":
+    enable_crash_reports("terminal-installer")
     sys.exit(main())

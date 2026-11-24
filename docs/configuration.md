@@ -4,6 +4,17 @@ In the Windows control panel, open **Settings** to change appearance, sign-in be
 
 To keep your runtime, shortcuts, and token when reinstalling, select the existing Render Bridge installation directory. Use **Storage** to choose where to copy generated assets or their backups. To change where ComfyUI writes the originals or searches for models, configure that ComfyUI build. [ComfyUI folder settings](https://docs.comfy.org/installation/desktop/usage/instance-management) · [Model storage](pipelines.md#store-models-on-another-drive)
 
+## Local crash logs
+
+In the Windows control panel, use **Settings → Open crash logs** after a report exists. You can also open the folder directly after a crash.
+
+- **Windows** `%LOCALAPPDATA%\comfy-mcp\crash-logs`
+- **macOS and Linux** `${XDG_DATA_HOME:-$HOME/.local/share}/comfy-mcp/crash-logs`
+
+Render Bridge keeps the latest JSON report for each component in the default user data location, including when you choose another installation folder. On Windows, macOS, and Linux, the desktop app uses `desktop.json` for panics and window errors. The server and terminal installer use `server.json` and `terminal-installer.json` for unexpected Python errors at their entry points. The reports contain basic diagnostics and omit exception messages, full file paths, credentials, prompts, and memory dumps. Fatal operating system errors and forced termination can prevent a report from being written. Sending a report for support is up to you. [Privacy and network use](../PRIVACY.md)
+
+If your operating system redirects or syncs your user profile, the reports follow that profile's storage settings.
+
 ## Terminal and server options
 
 For desktop setup, choose the ComfyUI build and folders in the wizard. The terminal installer saves the same pairing. Set `COMFY_INPUT_DIR` or `COMFY_OUTPUT_DIR` before running `setup_render_bridge.py install` if the build uses separate folders. For a manual server launch, set the pairing variables before starting `comfy_mcp_server.py`. Render Bridge connects directly to ComfyUI on loopback and bypasses system HTTP proxies.

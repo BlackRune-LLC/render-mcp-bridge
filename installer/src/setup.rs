@@ -143,23 +143,21 @@ fn resolve_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 pub(crate) fn data_dir() -> Result<PathBuf, String> {
-    let path = if let Some(override_path) = environment_path("COMFY_MCP_DATA_DIR") {
-        override_path
-    } else {
-        let base = if cfg!(windows) {
-            environment_path("LOCALAPPDATA")
-                .or_else(|| home_dir().map(|home| home.join("AppData/Local")))
-        } else {
-            environment_path("XDG_DATA_HOME")
-                .or_else(|| home_dir().map(|home| home.join(".local/share")))
-        }
-        .ok_or(
-            "A user data directory could not be found. Set COMFY_MCP_DATA_DIR and reopen setup.",
-        )?;
-        base.join("comfy-mcp")
-    };
+    let path = environment_path("COMFY_MCP_DATA_DIR").map_or_else(default_data_dir, Ok)?;
     resolve_path(&path)
         .map_err(|_| "The Render Bridge user data directory could not be resolved.".into())
+}
+
+pub(crate) fn default_data_dir() -> Result<PathBuf, String> {
+    let base = if cfg!(windows) {
+        environment_path("LOCALAPPDATA")
+            .or_else(|| home_dir().map(|home| home.join("AppData/Local")))
+    } else {
+        environment_path("XDG_DATA_HOME")
+            .or_else(|| home_dir().map(|home| home.join(".local/share")))
+    }
+    .ok_or("A user data directory could not be found. Set COMFY_MCP_DATA_DIR and reopen setup.")?;
+    Ok(base.join("comfy-mcp"))
 }
 
 fn read_settings(directory: &Path) -> Option<Settings> {

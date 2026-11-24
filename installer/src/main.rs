@@ -3,6 +3,7 @@
 mod asset_folders;
 mod asset_ui;
 mod connection;
+mod diagnostics;
 mod discovery;
 mod icons;
 #[cfg(windows)]
@@ -234,7 +235,7 @@ impl StartupSetting {
                 "Open Render Bridge in the Windows tray when you sign in.",
             );
             if let Some(error) = &self.error {
-                status(ui, "Startup setting unavailable", error, CAUTION);
+                status(ui, "Settings unavailable", error, CAUTION);
             }
             if let Some(installed) = installed {
                 ui.separator();
@@ -260,7 +261,18 @@ impl StartupSetting {
                     ui.hyperlink_to("Server and model settings", SETTINGS_GUIDE);
                 });
             }
-            secondary(ui, "Done", true).clicked()
+            ui.horizontal_wrapped(|ui| {
+                let logs = diagnostics::existing_directory();
+                if secondary(ui, "Open crash logs", logs.is_some())
+                    .on_disabled_hover_text("No local crash logs yet.")
+                    .clicked()
+                    && let Some(folder) = logs
+                    && !diagnostics::open_directory(&folder)
+                {
+                    self.error = Some("Could not open the crash logs folder.".into());
+                }
+                secondary(ui, "Done", true).clicked()
+            }).inner
         });
         if response.inner || response.should_close() {
             self.open = false;
@@ -2904,7 +2916,17 @@ mod launch_tests {
     }
 }
 
-fn main() -> eframe::Result {
+fn main() -> std::process::ExitCode {
+    diagnostics::install_panic_hook();
+    if open_app().is_ok() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        diagnostics::window_error();
+        std::process::ExitCode::FAILURE
+    }
+}
+
+fn open_app() -> eframe::Result {
     let args = std::env::args_os().skip(1);
     #[cfg(windows)]
     let mode = {

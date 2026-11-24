@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -30,6 +31,40 @@ class InstallRuntimeTest(unittest.TestCase):
         self.assertEqual(list(self.data.glob("app-*")), [self.previous])
         self.assertEqual(setup.load_settings(self.previous / "settings.json"), self.settings)
         self.assertEqual((self.data / "token.txt").read_text(encoding="utf-8"), "fixture-token")
+
+    def test_unexpected_installer_crash_reports_only_safe_fields_in_the_default_location(self):
+        local = self.data / "local profile"
+        custom = self.data / "custom runtime"
+        custom.mkdir()
+        custom.joinpath("runtime-marker").write_text("retain", encoding="utf-8")
+        override = {"LOCALAPPDATA": str(local), "XDG_DATA_HOME": str(local), "COMFY_MCP_DATA_DIR": str(custom)}
+        message = f"fixture confidential token and absolute folder {custom}"
+        logs = local / "comfy-mcp" / "crash-logs"
+        with patch.dict(os.environ, override), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            setup.record_crash("server", RuntimeError(message))
+            original_server_log = (logs / "server.json").read_bytes()
+            with patch.object(setup, "install", side_effect=RuntimeError(message)):
+                self.assertEqual(setup.main(["--data-dir", str(custom), "install"]), 1)
+            self.assertIn("A local file or process could not be accessed.", stderr.getvalue())
+            log = logs / "terminal-installer.json"
+            original = log.read_text(encoding="utf-8")
+            with patch.object(setup, "install", side_effect=EOFError()):
+                self.assertEqual(setup.main(["--data-dir", str(custom), "install"]), 130)
+            self.assertEqual(log.read_text(encoding="utf-8"), original)
+
+        report = json.loads(original)
+        self.assertEqual(set(report), {"schema", "timestamp", "component", "python_version", "exception_type", "stack"})
+        self.assertEqual((report["schema"], report["component"], report["exception_type"]), (1, "terminal-installer", "RuntimeError"))
+        self.assertRegex(report["timestamp"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(len(report["stack"]), 1)
+        self.assertEqual(report["stack"][0]["file"], "setup_render_bridge.py")
+        self.assertEqual(report["stack"][0]["function"], "main")
+        self.assertIsInstance(report["stack"][0]["line"], int)
+        self.assertNotIn("fixture confidential token", original)
+        self.assertNotIn("custom runtime", original)
+        self.assertEqual((logs / "server.json").read_bytes(), original_server_log)
+        self.assertFalse((custom / "crash-logs").exists())
+        self.assertEqual((custom / "runtime-marker").read_text(encoding="utf-8"), "retain")
 
     def test_verified_upgrade_switches_the_pointer_and_keeps_copied_launchers_usable(self):
         updated = {**self.settings, "COMFY_URL": "http://localhost:9288"}

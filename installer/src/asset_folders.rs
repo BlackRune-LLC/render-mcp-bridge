@@ -199,7 +199,7 @@ fn is_link(metadata: &Metadata) -> bool {
     }
 }
 
-fn check_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn check_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || is_link(&metadata) {
         return Err(io::Error::new(
