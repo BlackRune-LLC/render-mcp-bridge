@@ -2,7 +2,7 @@
 
 A self-hosted image MCP server that lets your agents do the work in ComfyUI. Your agent can pick a preset, run a workflow, track the queue, and return the result as a signed download link. ComfyUI runs the pipeline on your own machine. Render Bridge is an independent integration by BlackRune LLC.
 
-[Run the guided installer](#guided-installer) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to install it](#ask-your-agent-to-set-it-up)
+[Run the desktop installer](#desktop-installer) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to install it](#ask-your-agent-to-set-it-up)
 
 ## Install and run
 
@@ -14,7 +14,21 @@ git clone https://github.com/BlackRune-LLC/render-mcp-bridge.git
 cd render-mcp-bridge
 ```
 
-### Guided installer
+### Desktop installer
+
+The Rust wizard checks your local ComfyUI connection and shows which starter files ComfyUI can see. Select **Install** to set up the bundled Render Bridge server and its Python dependencies in a per-user virtual environment. Copy the start command from the final screen into a terminal (PowerShell on Windows). Then use the displayed MCP URL and private token file path to [connect your client](#connect-an-mcp-client). ComfyUI and Python 3.11 or later should already be installed.
+
+The desktop installer places the server and virtual environment in the `app` folder inside your Render Bridge user data directory. It saves the chosen ComfyUI folder and local API URL for subsequent launches.
+
+From a checkout with [Rust](https://www.rust-lang.org/tools/install) and your platform's native build tools, start the wizard with:
+
+```sh
+cargo run --locked --manifest-path installer/Cargo.toml
+```
+
+To build the standalone setup executable for the current platform, run `cargo build --release --locked --manifest-path installer/Cargo.toml`. The binary is in `installer/target/release/`. The packaged binary includes the bridge source and the pinned requirements. Installing those Python dependencies needs access to your configured package index.
+
+### Terminal installer
 
 Use the wizard for a bridge and a ComfyUI API running on the same machine. It checks the data directory, the local API, and the starter model filenames. With your confirmation, it creates or updates the bridge's Python virtual environment and saves the ComfyUI path and URL in your user data directory. Use the model guide for any weights or nodes it flags as missing.
 
@@ -109,7 +123,9 @@ The [pipeline guide](docs/pipelines.md#what-each-pipeline-does) covers editing, 
 
 ## AI server gaming mode
 
-If you used guided setup, open a second terminal in the repo and run these commands with the same Python launcher you used for setup (`py -3` on Windows or `python3` on macOS and Linux).
+If you used the desktop installer, copy the start command from its Connect screen and replace the final `start` argument with `gaming-mode on`, `gaming-mode status`, or `gaming-mode off`.
+
+If you used the terminal installer, open a second terminal in the repo and use the same Python launcher you used for setup (`py -3` on Windows or `python3` on macOS and Linux).
 
 ```sh
 python3 setup_render_bridge.py gaming-mode on
@@ -125,7 +141,7 @@ Turning gaming mode on pauses new GPU work through the MCP server. If ComfyUI's 
 
 Give the following prompt to an agent with terminal access on the machine where you want to run the server.
 
-> Set up Render Bridge on this machine using the README and pipeline guide at https://github.com/BlackRune-LLC/render-mcp-bridge. Find my ComfyUI installation, check its API, and identify its data directory. If ComfyUI is missing, use its official installation guide. Use the guided installer in an interactive terminal, or follow manual setup if a terminal handoff is unavailable. Register the server in the user-scope MCP config for the client I actually use. Preserve existing entries and keep tokens in private user settings. Never display tokens, put them on a command line, or ask me to send them in chat. Ask me to complete any required sign-in or gated-model agreement in my browser or terminal. Recommend one pipeline for my hardware, identify its exact model files and nodes, and ask before installing extra nodes, downloading weights, or generating anything. In a fresh client session, verify `server_status`, `list_jobs`, and `list_models`. Show me the launch, gaming-mode, and first-render commands.
+> Set up Render Bridge on this machine using the README and pipeline guide at https://github.com/BlackRune-LLC/render-mcp-bridge. Find my ComfyUI installation, check its API, and identify its data directory. If ComfyUI is missing, use its official installation guide. Walk me through the Rust desktop installer if I can use the GUI, the terminal installer if I can use an interactive shell, or manual setup if I need to run the steps separately. Register the server in the user-scope MCP config for the client I actually use. Preserve existing entries and keep tokens in private user settings. Never display tokens, put them on a command line, or ask me to send them in chat. Ask me to complete any required sign-in or gated-model agreement in my browser or terminal. Recommend one pipeline for my hardware, identify its exact model files and nodes, and ask before installing extra nodes, downloading weights, or generating anything. In a fresh client session, verify `server_status`, `list_jobs`, and `list_models`. Show me the launch, gaming-mode, and first-render commands.
 
 ## License
 
