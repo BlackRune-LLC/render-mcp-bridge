@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 const REPOSITORY: &str = "BlackRune-LLC/render-mcp-bridge";
+const USER_AGENT: &str = "RenderBridge";
 const INSTALLED_VERSION: &str = env!("CARGO_PKG_VERSION");
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
@@ -61,10 +62,7 @@ pub fn check() -> Result<Option<Release>, String> {
             "https://api.github.com/repos/{REPOSITORY}/releases/latest"
         ))
         .header("Accept", "application/vnd.github+json")
-        .header(
-            "User-Agent",
-            concat!("RenderBridge/", env!("CARGO_PKG_VERSION")),
-        )
+        .header("User-Agent", USER_AGENT)
         .header("X-GitHub-Api-Version", "2022-11-28")
         .call()
         .map_err(|_| REQUEST_ERROR.to_owned())?;
@@ -191,7 +189,6 @@ mod windows_download {
 
     const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
     const MAX_REDIRECTS: usize = 4;
-    const USER_AGENT: &str = concat!("RenderBridge/", env!("CARGO_PKG_VERSION"));
 
     pub struct StagedInstaller {
         // Keep writes and replacement blocked until the caller starts the

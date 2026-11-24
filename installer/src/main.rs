@@ -60,6 +60,8 @@ const MODEL_GUIDE: &str =
     "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/pipelines.md";
 const CLIENT_GUIDE: &str =
     "https://github.com/BlackRune-LLC/render-mcp-bridge#connect-an-mcp-client";
+const PRIVACY_GUIDE: &str =
+    "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/PRIVACY.md";
 const REMOTE_GUIDE: &str = "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/connections.md#connect-from-another-device";
 #[cfg(windows)]
 const SETTINGS_GUIDE: &str =
@@ -1135,6 +1137,7 @@ impl Installer {
             "Get ready to render",
             "Set up a clean machine with Python and ComfyUI. Choose an agent when you are ready to connect.",
         );
+        ui.hyperlink_to("Privacy and network use", PRIVACY_GUIDE);
         let idle = self.worker.is_none();
         let ready = self.python_ready();
         card(ui, |ui| {

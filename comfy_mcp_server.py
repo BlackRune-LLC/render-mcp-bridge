@@ -35,10 +35,13 @@ import httpx
 import uvicorn
 from PIL import Image as PILImage
 from PIL import ImageChops, ImageFilter, ImageOps
+from mcp.server._otel import OpenTelemetryMiddleware
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+
+from setup_render_bridge import DEFAULT_URL, atomic_text, backend_url
 
 if os.name == "nt":
     USER_DATA_ROOT = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
@@ -46,7 +49,10 @@ else:
     USER_DATA_ROOT = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
 
 DATA_DIR = Path(os.environ.get("COMFY_MCP_DATA_DIR", USER_DATA_ROOT / "comfy-mcp")).expanduser()
-COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
+try:
+    COMFY_URL = backend_url(os.environ.get("COMFY_URL", DEFAULT_URL))
+except ValueError as exc:
+    raise SystemExit(f"Invalid COMFY_URL. {exc}") from None
 MCP_HOSTS = [host.strip() for host in os.environ.get("MCP_HOST", "127.0.0.1").split(",") if host.strip()]
 MCP_PORT = int(os.environ.get("MCP_PORT", "8189"))
 PUBLIC_URLS = {
@@ -407,7 +413,7 @@ TRANSPARENT_HINT = ", isolated on a plain solid white background, centered, full
 _http = httpx.AsyncClient(
     base_url=COMFY_URL,
     timeout=httpx.Timeout(60.0, connect=5.0),
-    trust_env=not bool(os.environ.get("RENDER_BRIDGE_MANAGED_ID")),
+    trust_env=False,
 )
 _model_cache: dict[str, Any] = {"t": 0.0, "lists": {}}
 
@@ -1257,48 +1263,22 @@ mcp = MCPServer(
     name="comfyui",
     title="Render Bridge",
     instructions=(
-        "Provides tools for a locally managed ComfyUI instance. "
-        "Use generate_image for game art; set transparent=true for sprites/icons/UI elements (returns RGBA PNG). "
-        "Results contain full-size download URLs; fetch them with curl to save files locally. "
-        "Presets: z_image_turbo (fast default), qwen_image (best quality/text), qwen_image_fast (4-step Qwen), "
-        "anime (anime/illustration concept art), cinematic (Unreal-style cinematic renders), flux_dev "
-        "(general/photoreal/painterly), sd35 (wide style range), anima_turbo / anima_aesthetic (Anima: anime, "
-        "illustration and painterly art, fast / best-looking), juggernaut_xl (Juggernaut XI SDXL workhorse), "
-        "flux3_klein / flux3_klein_base (FLUX.3 Image Klein, the newest BFL model: fast distilled / slower base). "
-        "Switch models with generate_image(preset=...), or per game with set_project_context(default_preset=...). "
-        "Style LoRAs (painterly, watercolor, gouache, oil, hand-painted textures) go in generate_image(loras=[{name, "
-        "strength}]); each works only with presets of its family (sdxl: juggernaut_xl, flux1: flux_dev, anima: "
-        "anima_*), and list_models lists them by family with their trigger words. "
-        "edit_image edits an existing image or combines it with up to 2 references (same character in new poses, "
-        "recolours, turnarounds). "
-        "repaint_frames repaints a whole action's pose-guide frames (a rig's exported frames) in one call, with the "
-        "same instruction, references and seed for every frame: frames in, finished frames out, in order. "
-        "animate_from_clip repaints a character along a short driving clip (a rig's exported action, as a video or as "
-        "frames): the character's image and the clip in, one frame per clip frame and an mp4 out (Wan-Animate-2). "
-        "animate_loop makes a looping animation from ONE image: a short video that starts and ends on it, cut into "
-        "evenly spaced frames, with an mp4 (Wan 2.2 image-to-video; the model invents the motion from the prompt). "
-        "edit_region changes ONE AREA of an image (a rectangle or a mask) and keeps every other pixel exactly, at any "
-        "image size: use it for local fixes to a large or approved image instead of building masked workflows by hand. "
-        "image_to_3d turns an image (ideally a transparent generate_image result) into a textured GLB model. "
-        "For slow work (image_to_3d, quality renders, batches) use start_job + get_job so calls don't time out. "
-        "Finishing tools: optimize_glb (game-ready/mobile GLB), pack_spritesheet (sheet PNG + Godot SpriteFrames .tres), "
-        "export_icons (iOS/Android/Godot/web/Windows icon sets). "
-        "Model weights are installed separately and subject to their own licenses. "
-        "Call set_project_context at the start of work on a game (art direction, theme, lore, and optionally a style "
-        "lock: style_prompt, style_negative, default_preset, style_anchor); every asset is then logged with that "
-        "context, its prompts, inputs and edits (asset_history) as an authorship record. Pass project=<game> on every "
-        "asset call: it applies that game's style lock and logs under it (the server-wide active project is only a "
-        "fallback). edit_image(match_style=true) uses the game's style anchor image. When the owner says which "
-        "results they pick or reject, record it with approve_asset (their words in notes); never on your own judgment. "
-        "ComfyUI loads models as needed. Call load_models to prepare a preset before a batch, unload_models to free "
-        "the GPU immediately, server_status to see what is loaded. "
-        "All sessions share one GPU queue, first come first served; time spent waiting in it doesn't count toward a "
-        "job's timeout. When server_status shows a long queue, use start_job + get_job (which shows your place in line). "
-        "To send a file to the server, call "
-        "upload_link and run the curl it gives you; then pass the returned filename/subfolder with source=\"input\". "
-        "When gaming mode is on, wait for the operator to turn it off before submitting GPU work."
+        "Render Bridge uses a local ComfyUI instance. Call server_status for availability and queue state, "
+        "and list_models for available presets, compatible LoRAs, and installed files. "
+        "Check with the user before adding weights or nodes. Wait when Gaming Mode is on. "
+        "Use start_job and get_job for long work. Download outputs using their signed links. "
+        "Use upload_link for inputs, then pass the returned filename and subfolder with source=\"input\". "
+        "Pass project on asset calls to apply that project's style and keep local provenance. "
+        "Use approve_asset only when the user chooses which results to approve or reject."
     ),
 )
+
+# MCP 2.3 installs tracing middleware by default. Keep Render Bridge out of
+# any OpenTelemetry exporter configured in the host Python environment.
+mcp._lowlevel_server.middleware[:] = [
+    middleware for middleware in mcp._lowlevel_server.middleware
+    if not isinstance(middleware, OpenTelemetryMiddleware)
+]
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True), structured_output=False)
@@ -4285,8 +4265,6 @@ def bind_listen_sockets(hosts: list[str], port: int) -> list[socket.socket]:
 
 
 def rotate_token() -> None:
-    from setup_render_bridge import atomic_text
-
     if not MCP_HOSTS or not 1 <= MCP_PORT <= 65535:
         raise SystemExit("Set MCP_HOST and MCP_PORT to the stopped server's listen addresses and port.")
     # Reserve the configured listener while replacing its credential, so a

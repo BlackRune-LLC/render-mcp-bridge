@@ -26,11 +26,9 @@ pub fn create_gaming_shortcut(installed: &Installed) -> Result<PathBuf, String> 
             "Finish installing Render Bridge before creating its Gaming Mode shortcut.".into(),
         );
     }
-    let source = std::env::current_exe()
-        .map_err(|_| "The running Render Bridge app could not be located.")?;
     #[cfg(windows)]
     {
-        let executable = install_monitor_from(data_dir, &source)?;
+        let executable = install_current_monitor(data_dir)?;
         create_native_shortcut(
             data_dir,
             &[
@@ -43,6 +41,8 @@ pub fn create_gaming_shortcut(installed: &Installed) -> Result<PathBuf, String> 
     }
     #[cfg(not(windows))]
     {
+        let source = std::env::current_exe()
+            .map_err(|_| "The running Render Bridge app could not be located.")?;
         stage_monitor(app_dir, data_dir, &source, create_native_shortcut)
     }
 }
@@ -92,9 +92,7 @@ pub fn create_monitor_shortcut(installed: &Installed) -> Result<PathBuf, String>
         &FOLDERID_Programs,
         "The current user's Windows app menu could not be located.",
     )?;
-    let source = std::env::current_exe()
-        .map_err(|_| "The running Render Bridge app could not be located.")?;
-    let executable = install_monitor_from(&installed.data_dir, &source)?;
+    let executable = install_current_monitor(&installed.data_dir)?;
     app_menu_link_at(&programs, &installed.data_dir, &executable)
 }
 

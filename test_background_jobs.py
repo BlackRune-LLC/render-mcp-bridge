@@ -1,5 +1,8 @@
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -9,6 +12,24 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 import comfy_mcp_server as server
+
+
+class RuntimeNetworkTests(unittest.TestCase):
+    def test_manual_runtime_rejects_a_nonlocal_backend(self):
+        result = subprocess.run(
+            [sys.executable, "-B", server.__file__, "--help"],
+            env={**os.environ, "COMFY_URL": "https://backend.example.test:8188"},
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid COMFY_URL", result.stderr)
+        self.assertNotIn("backend.example.test", result.stderr)
+
+    def test_mcp_tracing_middleware_is_disabled(self):
+        self.assertFalse(any(
+            isinstance(middleware, server.OpenTelemetryMiddleware)
+            for middleware in server.mcp._lowlevel_server.middleware
+        ))
 
 
 def response(status=200, **body):

@@ -190,12 +190,16 @@ fn active_runtime(directory: &Path) -> io::Result<PathBuf> {
     Ok(directory.join(name))
 }
 
-fn settings_for_runtime(data: &Path, runtime: &Path) -> Option<Settings> {
-    read_settings(if runtime == data.join("app") {
+fn settings_directory<'a>(data: &'a Path, runtime: &'a Path) -> &'a Path {
+    if runtime == data.join("app") {
         data
     } else {
         runtime
-    })
+    }
+}
+
+fn settings_for_runtime(data: &Path, runtime: &Path) -> Option<Settings> {
+    read_settings(settings_directory(data, runtime))
 }
 
 pub fn default_settings() -> Settings {
@@ -850,11 +854,7 @@ pub(crate) fn saved_install_settings(installed: &Installed) -> Result<Settings, 
 
 #[cfg(windows)]
 pub(crate) fn config_file(installed: &Installed) -> PathBuf {
-    if installed.app_dir == installed.data_dir.join("app") {
-        installed.data_dir.join("settings.json")
-    } else {
-        installed.app_dir.join("settings.json")
-    }
+    settings_directory(&installed.data_dir, &installed.app_dir).join("settings.json")
 }
 
 pub(crate) fn rotate_token(installed: &Installed) -> Result<(), String> {

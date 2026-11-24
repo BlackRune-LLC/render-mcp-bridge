@@ -2,7 +2,9 @@
 
 A self-hosted image MCP server that lets your agents do the work in ComfyUI. Your agent can pick a preset, run a workflow, track the queue, and return the result as a signed download link. ComfyUI runs the pipeline on your own machine. Render Bridge is an independent integration by BlackRune LLC.
 
-[Download v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Windows control panel](#windows-control-panel) · [Connect an MCP client](#connect-an-mcp-client) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to set it up](#ask-your-agent-to-set-it-up)
+Render Bridge runs locally and sends no telemetry or crash reports to BlackRune. [Privacy and network use](PRIVACY.md)
+
+[Download v0.1.0 for Windows x64 (unsigned)](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Windows control panel](#windows-control-panel) · [Connect an MCP client](#connect-an-mcp-client) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to set it up](#ask-your-agent-to-set-it-up)
 
 ## Install and run
 
@@ -130,14 +132,7 @@ export COMFY_ROOT="/path/to/ComfyUI"
 
 Leave both processes running and check `http://127.0.0.1:8189/health`. Both `mcp` and `comfyui` should report `ok`. On first run, Render Bridge creates a bearer token. Its default path is `%LOCALAPPDATA%\comfy-mcp\token.txt` on Windows or `${XDG_DATA_HOME:-$HOME/.local/share}/comfy-mcp/token.txt` on macOS and Linux. Keep the token in the server's private token file and your MCP client's user-scope config.
 
-| Setting | Default and purpose |
-| --- | --- |
-| `COMFY_ROOT` | `~/ComfyUI`. Set this to the actual ComfyUI data directory used for local file transfers. |
-| `COMFY_INPUT_DIR`, `COMFY_OUTPUT_DIR` | Optional absolute paths for builds that use separate input or output folders. The defaults are `input` and `output` under `COMFY_ROOT`. |
-| `COMFY_URL` | `http://127.0.0.1:8188`. Set this if your ComfyUI API uses a different port. |
-| `MCP_HOST`, `MCP_PORT` | `127.0.0.1` and `8189`. |
-| `COMFY_MCP_DATA_DIR` | Per-user data directory. Stores the token, gaming-mode state, and project records. |
-| `PUBLIC_URLS` | Comma-separated `name=base-url` entries for signed files, such as `private=https://render.example.com`. Defaults to loopback at the MCP port. |
+For custom ComfyUI folders, a different local port, or signed links for other devices, see the [configuration reference](docs/configuration.md).
 
 ## Connect an MCP client
 
@@ -177,9 +172,9 @@ Turning gaming mode on pauses new GPU work through the MCP server. If ComfyUI's 
 
 ## Ask your agent to set it up
 
-If Render Bridge is already installed, use the [short connection prompt](docs/connections.md#paste-a-connection-prompt). For a first-time installation, give the following prompt to an agent with terminal access on the render host. [Agent instructions](AGENTS.md)
+If Render Bridge is already installed, use the [connection prompt](docs/connections.md#paste-a-connection-prompt). For first-time setup, give this prompt to an agent with terminal access on the render host.
 
-> Set up Render Bridge on this machine using the README, connection guide, and pipeline guide at https://github.com/BlackRune-LLC/render-mcp-bridge. Start with its first-time prerequisites. Check for Python 3.11 or newer with virtual environment support. If it is missing, guide me through the official Python installer or distribution packages for my OS. Ask before starting a machine-wide install and let me approve any operating system prompt myself. Find my local ComfyUI build, check its API, and identify its data directory. If it is missing, help me choose and start a local build using the official ComfyUI instructions. Walk me through the Rust desktop wizard, the terminal installer, or manual setup according to the tools available. Register the server in the user-scope MCP config for the client I use. If the client runs on another device, follow the private-network setup in the connection guide for both MCP and signed file transfers. Preserve existing entries and keep tokens in private user settings. Never display tokens, put them on a command line, or ask me to send them in chat. Ask me to complete any required client sign-in or gated-model agreement in my own app, browser, or terminal. Recommend one pipeline for my hardware, identify its exact model files and nodes, and ask before installing extra nodes, downloading weights, or generating anything. In a fresh client session, verify `server_status`, `list_jobs`, and `list_models`. Show me the launch, gaming-mode, and first-render commands.
+> Set up Render Bridge and connect my MCP client. Check for Python 3.11 or newer with virtual environment support and a running local ComfyUI build first. Ask me before installing system software, model weights, or nodes. Let me approve administrator prompts and sign in to any required accounts myself. Use the agent instructions to keep my token private and verify with `server_status`, `list_jobs`, and `list_models`. Ask before the first render. [Render Bridge agent instructions](https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/AGENTS.md)
 
 ## License
 
