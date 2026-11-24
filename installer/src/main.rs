@@ -15,6 +15,9 @@ mod model_download;
 mod model_library;
 mod model_ui;
 mod models;
+mod node_view;
+mod pipeline;
+mod pipeline_ui;
 #[cfg(windows)]
 mod python_install;
 mod setup;
@@ -22,6 +25,8 @@ mod shortcuts;
 #[cfg(windows)]
 mod startup;
 mod theme;
+#[cfg(windows)]
+mod theme_ui;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
@@ -168,6 +173,7 @@ struct StartupSetting {
     enabled: Option<bool>,
     error: Option<String>,
     appearance_error: Option<String>,
+    theme_editor: theme_ui::ThemeEditor,
     assets: asset_ui::AssetEditor,
 }
 
@@ -291,6 +297,7 @@ impl StartupSetting {
         if let Some(error) = &self.appearance_error {
             status(ui, "Theme setting unavailable", error, CAUTION);
         }
+        self.theme_editor.show(ui, data_dir);
         ui.separator();
         if let Some(mut enabled) = self.enabled
             && ui
@@ -444,6 +451,22 @@ impl TrayPanel {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum WorkspaceTab {
+    #[default]
+    Jobs,
+    Models,
+    Pipelines,
+    Nodes,
+}
+
+const WORKSPACE_TABS: [(WorkspaceTab, &str); 4] = [
+    (WorkspaceTab::Jobs, "Jobs"),
+    (WorkspaceTab::Models, "Models"),
+    (WorkspaceTab::Pipelines, "Pipelines"),
+    (WorkspaceTab::Nodes, "Nodes"),
+];
+
 struct ControlsState {
     data_dir: Option<PathBuf>,
     backend_url: Option<String>,
@@ -465,7 +488,10 @@ struct Installer {
     installation_dir: Option<PathBuf>,
     install_assets: asset_ui::AssetEditor,
     model_manager: model_ui::ModelManager,
-    models_visible: bool,
+    workspace_tab: WorkspaceTab,
+    compact_window_size: Option<Vec2>,
+    pipelines: pipeline_ui::PipelinePanel,
+    nodes: node_view::NodePanel,
     model_destination_error: Option<String>,
     python_check_failed: bool,
     #[cfg(windows)]
@@ -528,7 +554,7 @@ impl Installer {
             _ => None,
         };
         let appearance = theme::load(data_dir);
-        theme::configure(ctx, appearance);
+        theme::configure_for(ctx, appearance, data_dir);
         let mut installer = Self {
             step: Step::Prerequisites,
             python: None,
@@ -536,7 +562,10 @@ impl Installer {
             installation_dir: None,
             install_assets: asset_ui::AssetEditor::default(),
             model_manager: model_ui::ModelManager::default(),
-            models_visible: false,
+            workspace_tab: WorkspaceTab::Jobs,
+            compact_window_size: None,
+            pipelines: pipeline_ui::PipelinePanel::default(),
+            nodes: node_view::NodePanel::default(),
             model_destination_error: None,
             python_check_failed: false,
             #[cfg(windows)]
@@ -682,7 +711,7 @@ impl Installer {
     #[cfg(windows)]
     fn request_server_action(&mut self, ctx: &egui::Context, action: ServerAction) {
         if matches!(action, ServerAction::Exit) && self.model_manager.downloading() {
-            self.models_visible = true;
+            self.select_workspace(ctx, WorkspaceTab::Models);
             self.queue_dialog = None;
             self.model_manager.cancel();
             return;
@@ -1294,7 +1323,7 @@ impl Installer {
                         RichText::new("Render\nBridge")
                             .size(27.0)
                             .strong()
-                            .color(CREAM),
+                            .color(theme::on_fill(theme::color(ctx, RAIL))),
                     );
                 });
                 ui.add_space(37.0);
@@ -1306,7 +1335,7 @@ impl Installer {
                         Color32::TRANSPARENT
                     };
                     let foreground = if selected {
-                        theme::color(ctx, INK)
+                        theme::on_fill(background)
                     } else {
                         theme::color(ctx, RAIL_TEXT)
                     };
@@ -2045,7 +2074,7 @@ impl Installer {
         let changed = installed.as_ref().map(|current| &current.app_dir)
             != self.installed.as_ref().map(|opened| &opened.app_dir);
         controls.backend_url = url.clone();
-        if changed || self.models_visible {
+        if changed || self.workspace_tab == WorkspaceTab::Models {
             controls.model_root = installed
                 .as_ref()
                 .and_then(|installed| setup::saved_install_settings(installed).ok())
@@ -2106,6 +2135,33 @@ impl Installer {
         ctx.request_repaint_after(Duration::from_secs(2));
     }
 
+    fn select_workspace(&mut self, ctx: &egui::Context, tab: WorkspaceTab) {
+        if self.workspace_tab == tab {
+            return;
+        }
+        if self.workspace_tab == WorkspaceTab::Jobs {
+            let (previous, monitor) = ctx.input(|input| {
+                let viewport = input.viewport();
+                (
+                    viewport.inner_rect.map(|rect| rect.size()),
+                    viewport.monitor_size,
+                )
+            });
+            self.compact_window_size = previous;
+            let available = monitor.map_or(egui::vec2(1000.0, 680.0), |size| {
+                (size - egui::vec2(64.0, 96.0)).max(egui::vec2(408.0, 330.0))
+            });
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                egui::vec2(1000.0, 680.0).min(available),
+            ));
+        } else if tab == WorkspaceTab::Jobs
+            && let Some(previous) = self.compact_window_size.take()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(previous));
+        }
+        self.workspace_tab = tab;
+    }
+
     fn controls_screen(&mut self, ctx: &egui::Context) {
         if self.controls.as_ref().is_some_and(|controls| {
             controls.data_dir.is_some() && Instant::now() >= controls.next_load
@@ -2120,32 +2176,24 @@ impl Installer {
                     .inner_margin(egui::Margin::symmetric(16, 5)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     bridge_mark(ui);
                     ui.label(
                         RichText::new("Render Bridge")
                             .size(20.0)
                             .strong()
-                            .color(CREAM),
+                            .color(theme::on_fill(theme::color(ctx, RAIL))),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let models_fill = if self.models_visible {
-                            RAIL_ACTIVE
+                    for (tab, label) in WORKSPACE_TABS {
+                        let fill = if self.workspace_tab == tab {
+                            LIME
                         } else {
                             SURFACE
                         };
-                        if monitor_button(ui, "Models", true, models_fill).clicked() {
-                            self.models_visible = true;
+                        if monitor_button(ui, label, true, fill).clicked() {
+                            self.select_workspace(ctx, tab);
                         }
-                        let jobs_fill = if self.models_visible {
-                            SURFACE
-                        } else {
-                            RAIL_ACTIVE
-                        };
-                        if monitor_button(ui, "Jobs", true, jobs_fill).clicked() {
-                            self.models_visible = false;
-                        }
-                    });
+                    }
                 });
             });
         egui::TopBottomPanel::bottom("controls-actions")
@@ -2196,7 +2244,7 @@ impl Installer {
                                 return;
                             }
                             if self.model_manager.downloading() {
-                                self.models_visible = true;
+                                self.select_workspace(ctx, WorkspaceTab::Models);
                                 self.model_manager.cancel();
                                 return;
                             }
@@ -2217,14 +2265,23 @@ impl Installer {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 7.0;
-                    if self.models_visible {
+                    if self.workspace_tab != WorkspaceTab::Jobs {
                         if let Some(controls) = &self.controls {
-                            self.model_manager.show(
-                                ui,
-                                controls.backend_url.as_deref(),
-                                controls.model_root.clone(),
-                                controls.data_dir.as_deref(),
-                            );
+                            let url = controls.backend_url.as_deref();
+                            let data_dir = controls.data_dir.as_deref();
+                            match self.workspace_tab {
+                                WorkspaceTab::Models => {
+                                    self.model_manager.show_workspace(
+                                        ui, url, controls.model_root.clone(), data_dir,
+                                    );
+                                    if self.model_manager.take_pipeline_request() {
+                                        self.select_workspace(ctx, WorkspaceTab::Pipelines);
+                                    }
+                                }
+                                WorkspaceTab::Pipelines => self.pipelines.show(ui, url, data_dir),
+                                WorkspaceTab::Nodes => self.nodes.show(ui, url),
+                                WorkspaceTab::Jobs => {}
+                            }
                         }
                         return;
                     }
@@ -2525,7 +2582,7 @@ impl eframe::App for Installer {
             self.model_manager.cancel();
             self.queue_dialog = None;
             if self.controls.is_some() {
-                self.models_visible = true;
+                self.select_workspace(ctx, WorkspaceTab::Models);
             } else {
                 self.change_step(Step::Models);
             }
@@ -2876,15 +2933,16 @@ fn activity(ui: &mut Ui, message: &str) {
 }
 
 fn primary(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
+    let fill = theme::color(ui.ctx(), LIME);
     ui.add_enabled(
         enabled,
         egui::Button::new(
             RichText::new(title)
                 .size(15.0)
                 .strong()
-                .color(theme::color(ui.ctx(), INK)),
+                .color(theme::on_fill(fill)),
         )
-        .fill(theme::color(ui.ctx(), LIME))
+        .fill(fill)
         .min_size(egui::vec2(143.0, 44.0))
         .corner_radius(12),
     )
@@ -2900,33 +2958,37 @@ fn secondary(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
 }
 
 fn destructive(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
+    let fill = destructive_fill(ui.ctx());
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(title).size(15.0).strong().color(CREAM))
-            .fill(destructive_fill(ui.ctx()))
-            .min_size(egui::vec2(143.0, 44.0))
-            .corner_radius(12),
+        egui::Button::new(
+            RichText::new(title)
+                .size(15.0)
+                .strong()
+                .color(theme::on_fill(fill)),
+        )
+        .fill(fill)
+        .min_size(egui::vec2(143.0, 44.0))
+        .corner_radius(12),
     )
 }
 
 fn destructive_fill(ctx: &egui::Context) -> Color32 {
-    match ctx.theme() {
-        egui::Theme::Dark => Color32::from_rgb(148, 53, 67),
-        egui::Theme::Light => theme::color(ctx, ERROR),
-    }
+    theme::destructive_fill(ctx)
 }
 
 fn monitor_button(ui: &mut Ui, title: &str, enabled: bool, fill: Color32) -> egui::Response {
     let ctx = ui.ctx();
-    let text = match fill {
-        ERROR => CREAM,
-        LINE => theme::color(ctx, MUTED),
-        _ => theme::color(ctx, INK),
-    };
-    let fill = match (ctx.theme(), fill) {
-        (_, ERROR) => destructive_fill(ctx),
-        (egui::Theme::Dark, LINE) => Color32::from_rgb(28, 51, 49),
+    let muted = fill == LINE;
+    let fill = match fill {
+        ERROR => destructive_fill(ctx),
+        LINE if ctx.theme() == egui::Theme::Dark => theme::color(ctx, RAIL),
         _ => theme::color(ctx, fill),
+    };
+    let text = if muted {
+        theme::on_fill(fill).gamma_multiply(0.78)
+    } else {
+        theme::on_fill(fill)
     };
     ui.add_enabled(
         enabled,
@@ -2940,11 +3002,12 @@ fn monitor_button(ui: &mut Ui, title: &str, enabled: bool, fill: Color32) -> egu
 fn gaming_mode_button(ui: &mut Ui, on: bool, enabled: bool) -> egui::Response {
     let ctx = ui.ctx();
     let (label, fill, ink, border, hint) = if on {
+        let fill = theme::color(ctx, GREEN);
         (
             "Gaming Mode · On",
-            LIME,
-            INK,
-            LIME,
+            fill,
+            theme::on_fill(fill),
+            fill,
             "Allow agents to start GPU jobs again",
         )
     } else {
@@ -3160,6 +3223,7 @@ fn startup_setting(mode: &LaunchMode) -> Option<StartupSetting> {
         enabled: None,
         error: None,
         appearance_error: None,
+        theme_editor: theme_ui::ThemeEditor::default(),
         assets: asset_ui::AssetEditor::default(),
     })
 }

@@ -245,7 +245,7 @@ impl ApplyWindow {
             .as_ref()
             .ok()
             .map(|request| request.data_dir.as_path());
-        theme::configure(ctx, theme::load(data_dir));
+        theme::configure_for(ctx, theme::load(data_dir), data_dir);
         let mut app = Self {
             worker: None,
             target: None,
@@ -339,7 +339,7 @@ impl eframe::App for ApplyWindow {
                         egui::RichText::new("Render Bridge")
                             .size(20.0)
                             .strong()
-                            .color(CREAM),
+                            .color(theme::on_fill(theme::color(ctx, RAIL))),
                     );
                 });
             });

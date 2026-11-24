@@ -2,6 +2,25 @@
 
 In the Windows control panel, open **Settings** to change appearance, sign-in behavior, or storage. In **Advanced configuration**, **Open configuration file** opens the active Render Bridge JSON settings. Stop the server before editing, keep a copy of the original, then start it again to verify the updated ComfyUI connection.
 
+## Theme plugins
+
+On Windows, open **Settings → Custom theme** to edit a color and select **Apply theme**. Edit Dark and Light palettes separately. **System** uses the palette that matches Windows appearance. **Export theme** saves a shareable JSON file and **Import theme** applies an existing file to this installation. **Reset to defaults** restores the built-in colors.
+
+A theme plugin contains a name and color overrides. Each value is a six-digit hex color. Omitted colors use the built-in palette. Export an edited theme to use as a starting point.
+
+```json
+{
+  "version": 1,
+  "name": "Lilac",
+  "dark": { "primary": "#9F7AFB", "destructive": "#A23243" },
+  "light": { "accent": "#533585" }
+}
+```
+
+Both palettes support `background`, `surface`, `rail`, `selection`, `rail_text`, `text`, `muted`, `border`, `accent`, `primary`, `success`, `warning`, `error`, `destructive`, and `logo`.
+
+Render Bridge reads the file locally and saves the active palette as `appearance-palette.json` in its installation folder. The file changes colors only and contains no executable code.
+
 To keep your runtime, shortcuts, and token when reinstalling, select the existing Render Bridge installation directory. Use **Storage** to choose where to copy generated assets or their backups. To change where ComfyUI writes the originals or searches for models, configure that ComfyUI build. [ComfyUI folder settings](https://docs.comfy.org/installation/desktop/usage/instance-management) · [Model storage](pipelines.md#store-models-on-another-drive)
 
 ## Windows installation, repair, and removal

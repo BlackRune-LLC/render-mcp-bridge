@@ -16,7 +16,7 @@ Model weights and custom nodes have their own terms. Check the model card and no
 
 ## Download models in Render Bridge
 
-Open **Models** in setup or in the installed panel. **Download** lists curated file sets for Z-Image Turbo stills, BiRefNet cutouts, and Wan Animate 2 video. It shows each pack's terms, missing download size, and destination before you start. **Installed** shows the files reported by the current ComfyUI build, including manually added models.
+Open **Models** in setup or in the installed panel. **Packs** in the panel and **Download** in setup list curated file sets for Z-Image Turbo stills, BiRefNet cutouts, and Wan Animate 2 video. They show each pack's terms, missing download size, and destination before you start. **Installed** shows the files reported by the current ComfyUI build, including manually added models. The panel's **Downloads** tab shows transfer progress.
 
 Render Bridge chooses a registered writable folder for each model category and checks space on each destination drive. **Pause download** keeps completed files and partial data. Select **Download missing files** again to resume the same catalog version. Render Bridge checks the full size and SHA-256 before making a downloaded file available. The library refreshes after the transfer, and your agent can use `list_models` to see which pipelines are ready.
 
@@ -62,6 +62,12 @@ The current installer includes the advanced categories below. If you copied YAML
 ```
 
 Restart the selected ComfyUI build after saving the paths. Use **Refresh** on the **Models** page or call `list_models` from your agent to confirm the model filenames are available.
+
+## Review pipelines and nodes
+
+Open **Pipelines**, or choose **Use in pipeline** on the Wan Animate 2 pack. Select the motion model to compare **Distilled** and **Full quality**. Full quality uses another diffusion weight, the Lightx2v LoRA, and a different step count. The selected ComfyUI build must report the required models and nodes before you can save a revision. Share the copied run option with the agent you want to use for its next `animate_from_clip` call. A saved revision stays local and existing jobs keep their settings.
+
+Open **Nodes** to search the selected build by name, ID, or category. Filter by built-in, custom, or unreported origin. If the backend reports a source or version, the selected node shows it. Follow the next section to manage custom nodes.
 
 ## Check and install nodes
 
