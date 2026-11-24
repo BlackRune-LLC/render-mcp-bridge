@@ -929,31 +929,22 @@ fn activate_runtime(
     staging: tempfile::TempDir,
     settings: &Settings,
 ) -> io::Result<()> {
-    save_settings(staging.path(), settings)?;
-    let name = staging
-        .path()
-        .file_name()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid runtime name"))?;
-    atomic_write(&directory.join(ACTIVE_RUNTIME), name.as_bytes())?;
+    publish_runtime(directory, staging.path(), settings)?;
     // Existing shortcut and command paths can still point to a previous generation.
     let _ = staging.keep();
     Ok(())
 }
 
-pub fn install(
-    settings: &Settings,
-    selected_python: Option<&Path>,
-    cancel: &AtomicBool,
-    mut progress: impl FnMut(&str),
-) -> Result<Installed, String> {
-    check_cancel(cancel)?;
-    let settings = validate_settings(settings)?;
-    progress("Checking Python 3.11 or newer.");
-    let mut command = python_for_creation(selected_python, cancel)?;
-    let data_dir = data_dir()?;
-    create_private_dir(&data_dir)
-        .map_err(|_| "Could not create the Render Bridge data directory.")?;
+fn publish_runtime(directory: &Path, runtime: &Path, settings: &Settings) -> io::Result<()> {
+    save_settings(runtime, settings)?;
+    let name = runtime
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid runtime name"))?;
+    atomic_write(&directory.join(ACTIVE_RUNTIME), name.as_bytes())
+}
+
+fn lock_install(data_dir: &Path) -> Result<fs::File, String> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -964,12 +955,20 @@ pub fn install(
     lock.try_lock().map_err(
         |_| "Could not lock the runtime for setup. Close any other setup wizard and retry.",
     )?;
+    Ok(lock)
+}
 
+fn stage_runtime(
+    data_dir: &Path,
+    mut command: Command,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(&str),
+) -> Result<(tempfile::TempDir, Installed), String> {
     let staging = tempfile::Builder::new()
         .prefix(RUNTIME_PREFIX)
-        .tempdir_in(&data_dir)
+        .tempdir_in(data_dir)
         .map_err(|_| "Could not create a staging directory for this upgrade.")?;
-    let installed = installation(&data_dir, staging.path().to_path_buf())?;
+    let installed = installation(data_dir, staging.path().to_path_buf())?;
     let python = venv_python(&installed.app_dir);
     for (name, content) in RUNTIME_FILES {
         check_cancel(cancel)?;
@@ -1031,10 +1030,104 @@ pub fn install(
     )?;
     drop(smoke_data);
 
+    Ok((staging, installed))
+}
+
+pub fn install(
+    settings: &Settings,
+    selected_python: Option<&Path>,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(&str),
+) -> Result<Installed, String> {
+    check_cancel(cancel)?;
+    let settings = validate_settings(settings)?;
+    progress("Checking Python 3.11 or newer.");
+    let command = python_for_creation(selected_python, cancel)?;
+    let data_dir = data_dir()?;
+    create_private_dir(&data_dir)
+        .map_err(|_| "Could not create the Render Bridge data directory.")?;
+    let _lock = lock_install(&data_dir)?;
+    let (staging, installed) = stage_runtime(&data_dir, command, cancel, &mut progress)?;
     check_cancel(cancel)?;
     progress("Activating the verified Render Bridge runtime.");
     activate_runtime(&data_dir, staging, &settings)
         .map_err(|_| "Could not activate the verified runtime. Retry setup.")?;
+    Ok(installed)
+}
+
+#[cfg(windows)]
+fn activate_upgrade(
+    data_dir: &Path,
+    staging: tempfile::TempDir,
+    settings: &Settings,
+    previous_marker: Option<&[u8]>,
+    update_monitor: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    publish_runtime(data_dir, staging.path(), settings)
+        .map_err(|_| "Could not activate the verified runtime. Retry the update.")?;
+    if let Err(error) = update_monitor() {
+        let marker = data_dir.join(ACTIVE_RUNTIME);
+        let rollback = match previous_marker {
+            Some(previous) => atomic_write(&marker, previous),
+            None => fs::remove_file(marker),
+        };
+        if rollback.is_ok() {
+            return Err(error);
+        }
+        // The new pointer may still be active. Keep its verified runtime usable.
+        let _ = staging.keep();
+        return Err(format!(
+            "{error} The update could not restore the previous runtime selection. The verified runtime is still available."
+        ));
+    }
+    let _ = staging.keep();
+    Ok(())
+}
+
+/// Upgrade the selected installation with the new setup binary's bundled runtime.
+///
+/// The monitor callback runs under the install lock after the runtime is activated.
+/// The callback must atomically replace the owned monitor and preserve it on error.
+#[cfg(windows)]
+pub fn upgrade_existing(
+    data_dir: &Path,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(&str),
+    update_monitor: impl FnOnce(&Installed) -> Result<(), String>,
+) -> Result<Installed, String> {
+    check_cancel(cancel)?;
+    if !data_dir.is_absolute() || !data_dir.is_dir() {
+        return Err("The existing Render Bridge data directory could not be located.".into());
+    }
+    let _lock = lock_install(data_dir)?;
+    let current = active_runtime(data_dir)
+        .map_err(|_| "The existing Render Bridge installation could not be read.")?;
+    // The previous version may predate some files bundled in this updater.
+    let settings = settings_for_runtime(data_dir, &current)
+        .ok_or("Bridge setup settings are missing. Run setup again.")?;
+    let settings = validate_settings(&settings)?;
+    let previous_marker = match fs::read(data_dir.join(ACTIVE_RUNTIME)) {
+        Ok(marker) => Some(marker),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => {
+            return Err("Could not read the previous Render Bridge runtime selection.".into());
+        }
+    };
+
+    progress("Checking the existing Python installation.");
+    let interpreter = venv_python(&current);
+    let command = python_for_creation(Some(&interpreter), cancel)
+        .or_else(|_| python_for_creation(None, cancel))?;
+    let (staging, installed) = stage_runtime(data_dir, command, cancel, &mut progress)?;
+    check_cancel(cancel)?;
+    progress("Activating the verified Render Bridge runtime.");
+    activate_upgrade(
+        data_dir,
+        staging,
+        &settings,
+        previous_marker.as_deref(),
+        || update_monitor(&installed),
+    )?;
     Ok(installed)
 }
 
@@ -1184,6 +1277,62 @@ mod tests {
                 .is_some_and(|stored| stored == settings)
         );
         assert_eq!(fs::read(&token).unwrap(), b"fixture-token");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_monitor_update_restores_versioned_and_legacy_runtime_markers() {
+        for legacy in [false, true] {
+            let data = tempfile::tempdir().unwrap();
+            let token = data.path().join("token.txt");
+            fs::write(&token, b"fixture-token").unwrap();
+            let settings = Settings {
+                comfy_root: "fixture".into(),
+                comfy_url: "http://localhost:8188".into(),
+                comfy_input: String::new(),
+                comfy_output: String::new(),
+            };
+            let old_runtime = if legacy {
+                let path = data.path().join("app");
+                fs::create_dir(&path).unwrap();
+                save_settings(data.path(), &settings).unwrap();
+                path
+            } else {
+                let previous = tempfile::Builder::new()
+                    .prefix(RUNTIME_PREFIX)
+                    .tempdir_in(data.path())
+                    .unwrap();
+                let path = previous.path().to_path_buf();
+                activate_runtime(data.path(), previous, &settings).unwrap();
+                path
+            };
+            let staged = tempfile::Builder::new()
+                .prefix(RUNTIME_PREFIX)
+                .tempdir_in(data.path())
+                .unwrap();
+            let updated = staged.path().to_path_buf();
+            let marker = data.path().join(ACTIVE_RUNTIME);
+            let previous_marker = fs::read(&marker).ok();
+
+            let error = activate_upgrade(
+                data.path(),
+                staged,
+                &settings,
+                previous_marker.as_deref(),
+                || {
+                    assert_eq!(active_runtime(data.path()).unwrap(), updated);
+                    assert!(read_settings(&updated).is_some_and(|stored| stored == settings));
+                    Err("The monitor is still running.".into())
+                },
+            );
+
+            assert_eq!(error, Err("The monitor is still running.".into()));
+            assert_eq!(active_runtime(data.path()).unwrap(), old_runtime);
+            assert_eq!(fs::read(marker).ok(), previous_marker);
+            assert_eq!(fs::read(token).unwrap(), b"fixture-token");
+            assert!(old_runtime.is_dir());
+            assert!(!updated.exists());
+        }
     }
 
     #[test]

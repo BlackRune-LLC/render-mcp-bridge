@@ -4,7 +4,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::jobs::{self, QueueStatus};
-use crate::{CAUTION, GREEN, INK, MUTED, VIOLET, activity, caption, card, secondary, status};
+use crate::{
+    CAUTION, GREEN, INK, MUTED, RAIL_ACTIVE, SURFACE, VIOLET, activity, caption, card,
+    monitor_button, status,
+};
+
+#[cfg(windows)]
+use crate::job_progress::Observer;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -13,6 +19,8 @@ pub struct QueueView {
     result: Option<Result<QueueStatus, String>>,
     worker: Option<Receiver<Result<QueueStatus, String>>>,
     next_check: Instant,
+    #[cfg(windows)]
+    progress: Option<Observer>,
 }
 
 impl QueueView {
@@ -22,6 +30,21 @@ impl QueueView {
             result: None,
             worker: None,
             next_check: Instant::now(),
+            #[cfg(windows)]
+            progress: None,
+        }
+    }
+
+    pub fn with_progress(url: String, ctx: &egui::Context) -> Self {
+        #[cfg(windows)]
+        return Self {
+            progress: Observer::start(&url, ctx.clone()),
+            ..Self::new(url)
+        };
+        #[cfg(not(windows))]
+        {
+            let _ = ctx;
+            Self::new(url)
         }
     }
 
@@ -70,28 +93,29 @@ impl QueueView {
         match &self.result {
             Some(Ok(queue)) => {
                 card(ui, |ui| {
-                    let (label, color) = match (self.worker.is_some(), queue.is_idle()) {
-                        (true, true) => ("Last check was idle", MUTED),
-                        (true, false) => ("Work was in progress", VIOLET),
-                        (false, true) => ("ComfyUI is idle", GREEN),
-                        (false, false) => ("Work in progress", VIOLET),
-                    };
+                    let (label, color) =
+                        match (self.worker.is_some(), queue.running > 0, queue.queued > 0) {
+                            (true, false, false) => ("Last check was idle", MUTED),
+                            (_, true, _) => ("Work in progress", VIOLET),
+                            (_, false, true) => ("Waiting to run", VIOLET),
+                            _ => ("Queue is idle", GREEN),
+                        };
                     ui.label(RichText::new(label).size(17.0).strong().color(color));
-                    ui.columns(2, |columns| {
-                        for (column, label, count) in
-                            [(0, "Running", queue.running), (1, "Queued", queue.queued)]
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, count) in [("Running", queue.running), ("Queued", queue.queued)]
                         {
-                            columns[column].label(
+                            ui.label(
                                 RichText::new(count.to_string())
-                                    .size(29.0)
+                                    .size(19.0)
                                     .strong()
                                     .color(INK),
                             );
-                            columns[column].label(RichText::new(label).color(MUTED));
+                            ui.label(RichText::new(label).color(MUTED));
+                            ui.add_space(9.0);
                         }
                     });
-                    if !queue.is_idle() {
-                        activity(ui, "Watching the active queue");
+                    if queue.running > 0 {
+                        self.show_progress(ui, queue);
                     }
                 });
             }
@@ -99,7 +123,7 @@ impl QueueView {
             None => activity(ui, "Checking the ComfyUI queue…"),
         }
         ui.horizontal_wrapped(|ui| {
-            if secondary(ui, "Refresh", self.worker.is_none()).clicked() {
+            if monitor_button(ui, "Refresh", self.worker.is_none(), SURFACE).clicked() {
                 self.refresh(ui.ctx());
             }
             caption(
@@ -113,15 +137,81 @@ impl QueueView {
         });
     }
 
-    pub fn stop_confirmation(&self) -> Option<&'static str> {
+    fn show_progress(&self, ui: &mut Ui, _queue: &QueueStatus) {
+        #[cfg(windows)]
+        if let Some(progress) = self.progress.as_ref().and_then(|observer| {
+            _queue
+                .running_ids
+                .iter()
+                .find_map(|id| observer.latest_for(id))
+        }) {
+            let fraction = progress.value / progress.max;
+            let percent = if progress.value < progress.max {
+                (fraction * 100.0).round().min(99.0)
+            } else {
+                100.0
+            };
+            ui.horizontal(|ui| {
+                caption(
+                    ui,
+                    &format!("Current stage {:.0} of {:.0}", progress.value, progress.max),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{percent:.0}%"))
+                            .strong()
+                            .color(VIOLET),
+                    );
+                });
+            });
+            ui.scope(|ui| {
+                ui.visuals_mut().extreme_bg_color = RAIL_ACTIVE;
+                ui.add(
+                    egui::ProgressBar::new(fraction as f32)
+                        .desired_height(10.0)
+                        .fill(VIOLET),
+                );
+            });
+            return;
+        }
+
+        let (track, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::ProgressIndicator,
+                ui.is_enabled(),
+                "Job in progress",
+            )
+        });
+        if ui.is_rect_visible(track) {
+            let width = track.width() * 0.24;
+            let phase = ui.input(|input| (input.time * 2.3).sin() * 0.5 + 0.5) as f32;
+            let left = track.left() + (track.width() - width) * phase;
+            let segment = egui::Rect::from_min_size(
+                egui::pos2(left, track.top()),
+                egui::vec2(width, track.height()),
+            );
+            ui.painter().rect_filled(track, 5, RAIL_ACTIVE);
+            ui.painter().rect_filled(segment, 5, VIOLET);
+            ui.ctx().request_repaint_after(Duration::from_millis(32));
+        }
+        caption(ui, "Step updates appear when available.");
+    }
+
+    pub fn stop_confirmation(
+        &self,
+        stop: &'static str,
+        stop_anyway: &'static str,
+    ) -> Option<&'static str> {
         if self.worker.is_some() {
             return None;
         }
         self.result.as_ref().map(|result| {
             if result.as_ref().is_ok_and(QueueStatus::is_idle) {
-                "Stop Bridge"
+                stop
             } else {
-                "Stop Bridge anyway"
+                stop_anyway
             }
         })
     }
@@ -134,21 +224,25 @@ mod tests {
     #[test]
     fn only_an_observed_idle_queue_gets_the_ordinary_stop_label() {
         let mut view = QueueView::new("http://127.0.0.1:8188".into());
-        assert_eq!(view.stop_confirmation(), None);
+        let confirmation =
+            |view: &QueueView| view.stop_confirmation("Stop Bridge", "Stop Bridge anyway");
+        assert_eq!(confirmation(&view), None);
         view.finish(Ok(QueueStatus {
             running: 0,
             queued: 0,
+            running_ids: Vec::new(),
         }));
-        assert_eq!(view.stop_confirmation(), Some("Stop Bridge"));
+        assert_eq!(confirmation(&view), Some("Stop Bridge"));
         let (_sender, pending) = mpsc::channel();
         view.worker = Some(pending);
-        assert_eq!(view.stop_confirmation(), None);
+        assert_eq!(confirmation(&view), None);
         view.finish(Ok(QueueStatus {
             running: 0,
             queued: 2,
+            running_ids: Vec::new(),
         }));
-        assert_eq!(view.stop_confirmation(), Some("Stop Bridge anyway"));
+        assert_eq!(confirmation(&view), Some("Stop Bridge anyway"));
         view.finish(Err("unavailable".into()));
-        assert_eq!(view.stop_confirmation(), Some("Stop Bridge anyway"));
+        assert_eq!(confirmation(&view), Some("Stop Bridge anyway"));
     }
 }

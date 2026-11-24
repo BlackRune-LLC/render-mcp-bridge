@@ -3,6 +3,19 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
+#[cfg(windows)]
+const MONITOR_LINK_NAME: &str = "Render Bridge.lnk";
+#[cfg(windows)]
+const MONITOR_DIR: &str = "monitor";
+#[cfg(windows)]
+const MONITOR_EXECUTABLE: &str = "RenderBridgeMonitor.exe";
+#[cfg(windows)]
+const MONITOR_OWNER: &str = "render-bridge-monitor.owner";
+#[cfg(windows)]
+const MONITOR_OWNER_CONTENTS: &[u8] = b"Render Bridge monitor directory v1\n";
+#[cfg(windows)]
+const MONITOR_CONFLICT: &str = "Existing files in the Render Bridge monitor location could not be verified. The files were kept.";
+
 pub fn create_gaming_shortcut(installed: &Installed) -> Result<PathBuf, String> {
     let app_dir = &installed.app_dir;
     let data_dir = &installed.data_dir;
@@ -15,9 +28,26 @@ pub fn create_gaming_shortcut(installed: &Installed) -> Result<PathBuf, String> 
     }
     let source = std::env::current_exe()
         .map_err(|_| "The running Render Bridge app could not be located.")?;
-    stage_monitor(app_dir, data_dir, &source, create_native_shortcut)
+    #[cfg(windows)]
+    {
+        let executable = install_monitor_from(data_dir, &source)?;
+        create_native_shortcut(
+            data_dir,
+            &[
+                path_text(&executable)?,
+                "--job-monitor",
+                "--data-dir",
+                path_text(data_dir)?,
+            ],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        stage_monitor(app_dir, data_dir, &source, create_native_shortcut)
+    }
 }
 
+#[cfg(any(not(windows), test))]
 fn stage_monitor(
     app_dir: &Path,
     data_dir: &Path,
@@ -54,15 +84,194 @@ fn stage_monitor(
     Ok(shortcut)
 }
 
+#[cfg(windows)]
+pub fn create_monitor_shortcut(installed: &Installed) -> Result<PathBuf, String> {
+    use windows::Win32::UI::Shell::FOLDERID_Programs;
+
+    let programs = windows_known_folder(
+        &FOLDERID_Programs,
+        "The current user's Windows app menu could not be located.",
+    )?;
+    let source = std::env::current_exe()
+        .map_err(|_| "The running Render Bridge app could not be located.")?;
+    let executable = install_monitor_from(&installed.data_dir, &source)?;
+    app_menu_link_at(&programs, &installed.data_dir, &executable)
+}
+
+#[cfg(windows)]
+pub fn open_monitor(installed: &Installed) -> Result<(), String> {
+    let executable = install_current_monitor(&installed.data_dir)?;
+    crate::setup::quiet_command(&executable)
+        .args(["--job-monitor", "--data-dir"])
+        .arg(&installed.data_dir)
+        .current_dir(&installed.data_dir)
+        .spawn()
+        .map_err(|_| "Could not open Render Bridge. Try again from setup.".to_owned())?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn install_current_monitor(data: &Path) -> Result<PathBuf, String> {
+    let source = std::env::current_exe()
+        .map_err(|_| "The running Render Bridge app could not be located.")?;
+    install_monitor_from(data, &source)
+}
+
+#[cfg(windows)]
+pub(crate) fn existing_monitor_executable(data: &Path) -> Result<PathBuf, String> {
+    if !data.is_absolute() {
+        return Err(MONITOR_CONFLICT.into());
+    }
+    let directory = data.join(MONITOR_DIR);
+    verify_monitor_directory(&directory)?;
+    let executable = directory.join(MONITOR_EXECUTABLE);
+    let metadata = std::fs::symlink_metadata(&executable).map_err(|_| MONITOR_CONFLICT)?;
+    if !metadata.is_file() || is_reparse(&metadata) {
+        return Err(MONITOR_CONFLICT.into());
+    }
+    Ok(executable)
+}
+
+#[cfg(windows)]
+fn app_menu_link_at(programs: &Path, data: &Path, executable: &Path) -> Result<PathBuf, String> {
+    let destination = programs.join(MONITOR_LINK_NAME);
+    let command = ["--job-monitor", "--data-dir", path_text(data)?];
+    let expected = command.map(std::ffi::OsString::from);
+    if crate::startup::matches_existing_link(&destination, executable, &expected)? {
+        return Ok(destination);
+    }
+    let arguments = command.map(windows_argument).join(" ");
+    let written = write_windows_link(
+        &destination,
+        executable,
+        data,
+        &arguments,
+        "Open Render Bridge",
+    );
+    if written.is_err()
+        && crate::startup::matches_existing_link(&destination, executable, &expected)?
+    {
+        // Another setup can finish the same per-user link while this one stages it.
+        return Ok(destination);
+    }
+    written
+}
+
+#[cfg(windows)]
+fn install_monitor_from(data: &Path, source: &Path) -> Result<PathBuf, String> {
+    use std::fs;
+
+    const PREPARE: &str = "Could not prepare the Render Bridge monitor folder.";
+    const WRITE: &str = "Could not install the Render Bridge monitor.";
+    if !data.is_absolute() || !data.is_dir() {
+        return Err(PREPARE.into());
+    }
+    let directory = data.join(MONITOR_DIR);
+    match fs::symlink_metadata(&directory) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let staged = tempfile::tempdir_in(data).map_err(|_| PREPARE)?;
+            fs::write(staged.path().join(MONITOR_OWNER), MONITOR_OWNER_CONTENTS)
+                .map_err(|_| PREPARE)?;
+            if fs::rename(staged.path(), &directory).is_err() && !directory.exists() {
+                return Err(PREPARE.into());
+            }
+        }
+        Err(_) => return Err(PREPARE.into()),
+    }
+    verify_monitor_directory(&directory)?;
+
+    let executable = directory.join(MONITOR_EXECUTABLE);
+    let mut setup = fs::File::open(source).map_err(|_| WRITE)?;
+    let exists = match fs::symlink_metadata(&executable) {
+        Ok(metadata) if metadata.is_file() && !is_reparse(&metadata) => {
+            if same_contents(&mut setup, &executable, metadata.len()).map_err(|_| WRITE)? {
+                return Ok(executable);
+            }
+            true
+        }
+        Ok(_) => return Err(MONITOR_CONFLICT.into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => return Err(WRITE.into()),
+    };
+    let mut staged = NamedTempFile::new_in(directory).map_err(|_| WRITE)?;
+    io::copy(&mut setup, staged.as_file_mut()).map_err(|_| WRITE)?;
+    staged.as_file().sync_all().map_err(|_| WRITE)?;
+    if exists {
+        staged.persist(&executable).map_err(|error| {
+            if matches!(error.error.raw_os_error(), Some(5 | 32 | 33)) {
+                "Exit Render Bridge from the notification area, then retry the monitor update."
+            } else {
+                WRITE
+            }
+        })?;
+    } else {
+        staged.persist_noclobber(&executable).map_err(|_| WRITE)?;
+    }
+    Ok(executable)
+}
+
+#[cfg(windows)]
+fn verify_monitor_directory(directory: &Path) -> Result<(), String> {
+    use std::fs;
+
+    let metadata = fs::symlink_metadata(directory).map_err(|_| MONITOR_CONFLICT)?;
+    if !metadata.is_dir() || is_reparse(&metadata) {
+        return Err(MONITOR_CONFLICT.into());
+    }
+    let owner = directory.join(MONITOR_OWNER);
+    let marker = fs::symlink_metadata(&owner).map_err(|_| MONITOR_CONFLICT)?;
+    if !marker.is_file()
+        || is_reparse(&marker)
+        || marker.len() != MONITOR_OWNER_CONTENTS.len() as u64
+        || fs::read(owner).map_err(|_| MONITOR_CONFLICT)? != MONITOR_OWNER_CONTENTS
+    {
+        return Err(MONITOR_CONFLICT.into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse(entry: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    entry.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+}
+
+#[cfg(windows)]
+fn same_contents(setup: &mut std::fs::File, executable: &Path, length: u64) -> io::Result<bool> {
+    use std::io::{Read, Seek};
+
+    if setup.metadata()?.len() != length {
+        return Ok(false);
+    }
+    let mut current = std::fs::File::open(executable)?;
+    let mut original = [0; 8192];
+    let mut installed = [0; 8192];
+    let mut remaining = length;
+    while remaining != 0 {
+        let count = remaining.min(original.len() as u64) as usize;
+        setup.read_exact(&mut original[..count])?;
+        current.read_exact(&mut installed[..count])?;
+        if original[..count] != installed[..count] {
+            setup.rewind()?;
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(true)
+}
+
 fn path_text(path: &Path) -> Result<&str, String> {
     path.to_str()
-        .ok_or_else(|| "Gaming Mode shortcuts require Unicode installation paths.".into())
+        .ok_or_else(|| "Render Bridge shortcuts require Unicode installation paths.".into())
 }
 
 fn save_shortcut(destination: &Path, contents: &[u8], executable: bool) -> Result<PathBuf, String> {
     let create_error = || {
         format!(
-            "Gaming Mode shortcut could not be saved to {}.",
+            "Render Bridge shortcut could not be saved to {}.",
             destination.display()
         )
     };
@@ -92,11 +301,11 @@ fn save_shortcut(destination: &Path, contents: &[u8], executable: bool) -> Resul
 }
 
 #[cfg(windows)]
-struct ComApartment(bool);
+pub(crate) struct ComApartment(bool);
 
 #[cfg(windows)]
 impl ComApartment {
-    fn initialize() -> Result<Self, String> {
+    pub(crate) fn initialize() -> Result<Self, String> {
         use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
         use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 
@@ -123,23 +332,35 @@ impl Drop for ComApartment {
 }
 
 #[cfg(windows)]
-fn create_native_shortcut(app_dir: &Path, command: &[&str]) -> Result<PathBuf, String> {
+pub(crate) fn windows_known_folder(
+    id: &windows::core::GUID,
+    error: &str,
+) -> Result<PathBuf, String> {
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{FOLDERID_Desktop, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 
-    let _apartment = ComApartment::initialize()?;
     // The known-folder API allocates a NUL-terminated path. Copy it before freeing it.
-    let desktop = unsafe {
-        let path = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None)
-            .map_err(|_| "The Windows Desktop folder could not be located.")?;
-        let desktop = PathBuf::from(std::ffi::OsString::from_wide(path.as_wide()));
+    let directory = unsafe {
+        let path = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).map_err(|_| error.to_owned())?;
+        let directory = PathBuf::from(std::ffi::OsString::from_wide(path.as_wide()));
         CoTaskMemFree(Some(path.0.cast()));
-        desktop
+        directory
     };
-    if !desktop.is_dir() {
-        return Err("The Windows Desktop folder could not be located.".into());
+    if !directory.is_dir() {
+        return Err(error.into());
     }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn create_native_shortcut(app_dir: &Path, command: &[&str]) -> Result<PathBuf, String> {
+    use windows::Win32::UI::Shell::FOLDERID_Desktop;
+
+    let desktop = windows_known_folder(
+        &FOLDERID_Desktop,
+        "The Windows Desktop folder could not be located.",
+    )?;
     write_windows_shortcut(&desktop, app_dir, command)
 }
 
@@ -149,48 +370,61 @@ fn write_windows_shortcut(
     app_dir: &Path,
     command: &[&str],
 ) -> Result<PathBuf, String> {
-    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
-    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
-    use windows::core::{HSTRING, Interface, w};
-
-    let save_error = "Windows could not create the Gaming Mode shortcut.";
-    let staging = tempfile::tempdir_in(desktop).map_err(|_| save_error)?;
-    let shortcut = staging.path().join("Gaming Mode.lnk");
     let arguments = command[1..]
         .iter()
         .map(|argument| windows_argument(argument))
         .collect::<Vec<_>>()
         .join(" ");
+    write_windows_link(
+        &desktop.join("Render Bridge Gaming Mode.lnk"),
+        Path::new(command[0]),
+        app_dir,
+        &arguments,
+        "Check ComfyUI jobs and control Render Bridge Gaming Mode",
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn write_windows_link(
+    destination: &Path,
+    executable: &Path,
+    working_directory: &Path,
+    arguments: &str,
+    description: &str,
+) -> Result<PathBuf, String> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::{HSTRING, Interface};
+
+    let _apartment = ComApartment::initialize()?;
+    let save_error = "Windows could not create the Render Bridge shortcut.";
+    let directory = destination.parent().ok_or(save_error)?;
+    let staging = tempfile::tempdir_in(directory).map_err(|_| save_error)?;
+    let shortcut = staging.path().join("Render Bridge.lnk");
     let native = |error: windows::core::Error| format!("{save_error} ({})", error.code());
-    // The caller owns a COM apartment. Each HSTRING holds a NUL-terminated UTF-16 value.
+    // This thread owns a COM apartment. Each HSTRING is NUL-terminated.
     unsafe {
         let link: IShellLinkW =
             CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(native)?;
-        link.SetPath(&HSTRING::from(command[0].replace('/', "\\")))
+        link.SetPath(&HSTRING::from(executable.as_os_str()))
             .map_err(native)?;
         link.SetArguments(&HSTRING::from(arguments))
             .map_err(native)?;
-        link.SetWorkingDirectory(&HSTRING::from(path_text(app_dir)?.replace('/', "\\")))
+        link.SetWorkingDirectory(&HSTRING::from(working_directory.as_os_str()))
             .map_err(native)?;
-        link.SetDescription(w!(
-            "Check ComfyUI jobs and control Render Bridge Gaming Mode"
-        ))
-        .map_err(native)?;
+        link.SetDescription(&HSTRING::from(description))
+            .map_err(native)?;
         link.cast::<IPersistFile>()
             .map_err(native)?
             .Save(&HSTRING::from(shortcut.as_os_str()), true)
             .map_err(native)?;
     };
     let contents = std::fs::read(shortcut).map_err(|_| save_error)?;
-    save_shortcut(
-        &desktop.join("Render Bridge Gaming Mode.lnk"),
-        &contents,
-        false,
-    )
+    save_shortcut(destination, &contents, false)
 }
 
 #[cfg(any(windows, test))]
-fn windows_argument(argument: &str) -> String {
+pub(crate) fn windows_argument(argument: &str) -> String {
     let mut quoted = String::from("\"");
     let mut slashes = 0;
     for character in argument.chars() {
@@ -354,6 +588,60 @@ mod tests {
         );
         assert!(retained_copy.starts_with(&app_dir));
         assert_eq!(std::fs::read(retained_copy).unwrap(), b"installer bytes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_monitor_has_one_stable_executable_and_an_idempotent_app_link() {
+        let fixture = tempfile::tempdir().unwrap();
+        let state = fixture.path().join("Render Bridge state");
+        let programs = fixture.path().join("Programs");
+        let source = fixture.path().join("setup.exe");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&programs).unwrap();
+        std::fs::write(&source, b"version 1").unwrap();
+
+        let first = install_monitor_from(&state, &source).unwrap();
+        let link = app_menu_link_at(&programs, &state, &first).unwrap();
+        let original_link = std::fs::read(&link).unwrap();
+        std::fs::write(&source, b"version 2").unwrap();
+        assert_eq!(install_monitor_from(&state, &source).unwrap(), first);
+        assert_eq!(std::fs::read(&first).unwrap(), b"version 2");
+        assert_eq!(app_menu_link_at(&programs, &state, &first).unwrap(), link);
+        assert_eq!(std::fs::read(link).unwrap(), original_link);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_monitor_keeps_unowned_paths_and_reports_a_locked_update() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let state = fixture.path().join("state");
+        let source = fixture.path().join("setup.exe");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(&source, b"first version").unwrap();
+        let executable = install_monitor_from(&state, &source).unwrap();
+        let unrelated_link = fixture.path().join(MONITOR_LINK_NAME);
+        std::fs::write(&unrelated_link, b"personal shortcut").unwrap();
+        assert!(app_menu_link_at(fixture.path(), &state, &executable).is_err());
+        assert_eq!(std::fs::read(unrelated_link).unwrap(), b"personal shortcut");
+
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&executable)
+            .unwrap();
+        std::fs::write(&source, b"updated version").unwrap();
+        let error = install_monitor_from(&state, &source).unwrap_err();
+        assert!(error.contains("Exit Render Bridge"), "{error}");
+        assert_eq!(std::fs::read(&executable).unwrap(), b"first version");
+        drop(locked);
+
+        std::fs::remove_file(state.join(MONITOR_DIR).join(MONITOR_OWNER)).unwrap();
+        assert!(install_monitor_from(&state, &source).is_err());
+        assert_eq!(std::fs::read(executable).unwrap(), b"first version");
     }
 
     #[test]

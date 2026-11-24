@@ -10,6 +10,7 @@ const ACTIVE_JOBS: &str = "/api/jobs?status=in_progress,pending&limit=100";
 pub struct QueueStatus {
     pub running: usize,
     pub queued: usize,
+    pub running_ids: Vec<String>,
 }
 
 impl QueueStatus {
@@ -46,10 +47,16 @@ fn from_jobs(response: &Value) -> Option<QueueStatus> {
     let mut status = QueueStatus {
         running: 0,
         queued: 0,
+        running_ids: Vec::new(),
     };
     for job in jobs {
         match job.get("status")?.as_str()? {
-            "in_progress" => status.running += 1,
+            "in_progress" => {
+                status.running += 1;
+                if let Some(id) = job.get("id").and_then(Value::as_str) {
+                    status.running_ids.push(id.into());
+                }
+            }
             "pending" => status.queued += 1,
             _ => return None,
         }
@@ -58,17 +65,21 @@ fn from_jobs(response: &Value) -> Option<QueueStatus> {
 }
 
 fn from_queue(response: &Value) -> Option<QueueStatus> {
-    let count = |key| {
-        let items = response.get(key)?.as_array()?;
-        for item in items {
-            item.get(0)?.as_f64()?;
-            item.get(1)?.as_str()?;
-        }
-        Some(items.len())
-    };
+    let running = response.get("queue_running")?.as_array()?;
+    let pending = response.get("queue_pending")?.as_array()?;
+    let mut running_ids = Vec::with_capacity(running.len());
+    for item in running {
+        item.get(0)?.as_f64()?;
+        running_ids.push(item.get(1)?.as_str()?.to_owned());
+    }
+    for item in pending {
+        item.get(0)?.as_f64()?;
+        item.get(1)?.as_str()?;
+    }
     Some(QueueStatus {
-        running: count("queue_running")?,
-        queued: count("queue_pending")?,
+        running: running.len(),
+        queued: pending.len(),
+        running_ids,
     })
 }
 
@@ -133,12 +144,13 @@ mod tests {
             &[(
                 ACTIVE_JOBS,
                 "200 OK",
-                r#"{"jobs":[{"status":"in_progress"},{"status":"pending"},{"status":"pending"}],"pagination":{"offset":0,"total":3,"has_more":false}}"#,
+                r#"{"jobs":[{"id":"render-id","status":"in_progress"},{"id":"queued-1","status":"pending"},{"status":"pending"}],"pagination":{"offset":0,"total":3,"has_more":false}}"#,
             )],
             |result| {
                 let status = result.unwrap();
                 assert_eq!(status.running, 1);
                 assert_eq!(status.queued, 2);
+                assert_eq!(status.running_ids, ["render-id"]);
                 assert!(!status.is_idle());
             },
         );
@@ -192,7 +204,8 @@ mod tests {
             status,
             QueueStatus {
                 running: 1,
-                queued: 1
+                queued: 1,
+                running_ids: vec!["running prompt".into()]
             }
         );
     }

@@ -2,6 +2,8 @@
 
 mod connection;
 mod discovery;
+#[cfg(windows)]
+mod job_progress;
 mod jobs;
 mod jobs_panel;
 mod models;
@@ -9,6 +11,16 @@ mod models;
 mod python_install;
 mod setup;
 mod shortcuts;
+#[cfg(windows)]
+mod startup;
+#[cfg(windows)]
+mod tray;
+#[cfg(windows)]
+mod update_handoff;
+#[cfg(windows)]
+mod update_ui;
+#[cfg(windows)]
+mod updates;
 
 use connection::{Client, RunningBridge};
 use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui, Vec2};
@@ -91,15 +103,164 @@ struct QueueDialog {
     action: QueueAction,
 }
 
+enum MonitorTarget {
+    Installation(PathBuf),
+    ComfyUrl(String),
+    Missing,
+}
+
 enum LaunchMode {
     Setup,
-    Controls(Option<PathBuf>),
+    Controls {
+        target: MonitorTarget,
+        start_hidden: bool,
+    },
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum ServerAction {
+    Start,
+    Stop,
+    Exit,
+}
+
+#[cfg(windows)]
+struct TrayPanel {
+    icon: tray::Tray,
+    hidden: bool,
+    first_frame: bool,
+    exiting: bool,
+    server_action: Option<ServerAction>,
+}
+
+#[cfg(windows)]
+struct StartupSetting {
+    executable: PathBuf,
+    arguments: Vec<std::ffi::OsString>,
+    open: bool,
+    enabled: Option<bool>,
+    error: Option<String>,
+}
+
+#[cfg(windows)]
+impl StartupSetting {
+    fn open(&mut self) {
+        self.open = true;
+        match startup::enabled(&self.executable, &self.arguments) {
+            Ok(enabled) => {
+                self.enabled = Some(enabled);
+                self.error = None;
+            }
+            Err(message) => {
+                self.enabled = None;
+                self.error = Some(message);
+            }
+        }
+    }
+
+    fn show(&mut self, ctx: &egui::Context) {
+        if !self.open {
+            return;
+        }
+        let response = egui::Modal::new(egui::Id::new("render-bridge-settings")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Render Bridge Settings");
+            if let Some(mut enabled) = self.enabled
+                && ui
+                    .checkbox(&mut enabled, "Start hidden when I sign in")
+                    .changed()
+            {
+                match startup::set_enabled(&self.executable, &self.arguments, enabled) {
+                    Ok(()) => {
+                        self.enabled = Some(enabled);
+                        self.error = None;
+                    }
+                    Err(message) => self.error = Some(message),
+                }
+            }
+            caption(
+                ui,
+                "Open Render Bridge in the Windows tray when you sign in.",
+            );
+            if let Some(error) = &self.error {
+                status(ui, "Startup setting unavailable", error, CAUTION);
+            }
+            secondary(ui, "Done", true).clicked()
+        });
+        if response.inner || response.should_close() {
+            self.open = false;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl TrayPanel {
+    fn hide(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    fn update(&mut self, ctx: &egui::Context, guard_exit: bool) -> bool {
+        while let Some(event) = self.icon.try_recv() {
+            match event {
+                event @ (tray::TrayEvent::Open
+                | tray::TrayEvent::StartServer
+                | tray::TrayEvent::StopServer)
+                    if !self.exiting =>
+                {
+                    self.hidden = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.server_action = match event {
+                        tray::TrayEvent::StartServer => Some(ServerAction::Start),
+                        tray::TrayEvent::StopServer => Some(ServerAction::Stop),
+                        _ => self.server_action,
+                    };
+                }
+                tray::TrayEvent::Exit if guard_exit => {
+                    self.hidden = false;
+                    self.server_action = Some(ServerAction::Exit);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::TrayEvent::Exit => {
+                    self.exiting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                _ => {}
+            }
+        }
+        if self.exiting {
+            return true;
+        }
+        if ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !matches!(self.server_action, Some(ServerAction::Exit)) {
+                self.hide(ctx);
+            }
+        } else if self.first_frame && self.hidden {
+            // eframe shows the root after its first frame, so reapply visibility
+            // as part of that frame's viewport commands.
+            self.hide(ctx);
+        }
+        self.first_frame = false;
+        self.hidden
+    }
 }
 
 struct ControlsState {
     data_dir: Option<PathBuf>,
     queue: Option<QueueView>,
     next_load: Instant,
+    #[cfg(windows)]
+    bridge_online: bool,
+    #[cfg(windows)]
+    bridge_probe: Option<Receiver<bool>>,
+    #[cfg(windows)]
+    update_available_here: bool,
 }
 
 struct Installer {
@@ -135,6 +296,16 @@ struct Installer {
     codex_profile: String,
     queue_dialog: Option<QueueDialog>,
     controls: Option<ControlsState>,
+    #[cfg(windows)]
+    tray_panel: Option<TrayPanel>,
+    #[cfg(windows)]
+    tray_error: Option<String>,
+    #[cfg(windows)]
+    startup_setting: Option<StartupSetting>,
+    #[cfg(windows)]
+    monitor_error: Option<String>,
+    #[cfg(windows)]
+    update: update_ui::UpdateDialog,
 }
 
 impl Installer {
@@ -194,15 +365,41 @@ impl Installer {
             codex_profile: String::new(),
             queue_dialog: None,
             controls: None,
+            #[cfg(windows)]
+            tray_panel: None,
+            #[cfg(windows)]
+            tray_error: None,
+            #[cfg(windows)]
+            startup_setting: None,
+            #[cfg(windows)]
+            monitor_error: None,
+            #[cfg(windows)]
+            update: update_ui::UpdateDialog::default(),
         };
         match mode {
             LaunchMode::Setup => installer.check_python(ctx),
-            LaunchMode::Controls(data_dir) => {
+            LaunchMode::Controls { target, .. } => {
+                #[cfg(windows)]
+                let update_available_here = matches!(&target, MonitorTarget::Installation(data)
+                    if update_handoff::is_installed_monitor(data));
+                let (data_dir, queue) = match target {
+                    MonitorTarget::Installation(directory) => (Some(directory), None),
+                    MonitorTarget::ComfyUrl(url) => {
+                        (None, Some(QueueView::with_progress(url, ctx)))
+                    }
+                    MonitorTarget::Missing => (None, None),
+                };
                 installer.step = Step::Connect;
                 installer.controls = Some(ControlsState {
                     data_dir,
-                    queue: None,
+                    queue,
                     next_load: Instant::now(),
+                    #[cfg(windows)]
+                    bridge_online: false,
+                    #[cfg(windows)]
+                    bridge_probe: None,
+                    #[cfg(windows)]
+                    update_available_here,
                 });
             }
         }
@@ -248,25 +445,60 @@ impl Installer {
         });
     }
 
+    #[cfg(windows)]
+    fn request_server_action(&mut self, ctx: &egui::Context, action: ServerAction) {
+        if self.worker.is_some() || self.update.blocks_controls() {
+            return;
+        }
+        if let Some(setting) = &mut self.startup_setting {
+            setting.open = false;
+        }
+        match action {
+            ServerAction::Start => {
+                self.queue_dialog = None;
+                self.start_panel_server(ctx);
+            }
+            action @ (ServerAction::Stop | ServerAction::Exit) => {
+                if self.running.as_mut().is_some_and(RunningBridge::is_running) {
+                    self.show_jobs(match action {
+                        ServerAction::Exit => QueueAction::CloseWindow,
+                        _ => QueueAction::StopBridge,
+                    });
+                }
+            }
+        }
+    }
+
     fn jobs_dialog(&mut self, ctx: &egui::Context) {
+        let in_panel = self.controls.is_some();
         let Some(dialog) = &mut self.queue_dialog else {
             return;
         };
         let action = dialog.action;
         let response = egui::Modal::new(egui::Id::new("comfyui-jobs")).show(ctx, |ui| {
-            ui.set_width(420.0);
-            ui.heading(RichText::new("ComfyUI Jobs").size(28.0).strong());
+            ui.set_width((ctx.content_rect().width() - 32.0).clamp(120.0, 420.0));
+            ui.heading(RichText::new("Jobs").size(28.0).strong());
             dialog.queue.show(ui);
             if action == QueueAction::Inspect {
                 return (secondary(ui, "Close", true).clicked(), false);
             }
-            caption(ui, "Stopping Render Bridge can interrupt Bridge job tracking. ComfyUI and its queue keep running separately.");
-            let label = dialog.queue.stop_confirmation();
+            caption(ui, "Stopping Render Bridge can interrupt job tracking. ComfyUI and its queue keep running.");
+            let (stop_label, force_label) = if in_panel {
+                ("Stop server", "Stop server anyway")
+            } else {
+                ("Stop Bridge", "Stop Bridge anyway")
+            };
+            let label = dialog.queue.stop_confirmation(stop_label, force_label);
             let mut keep = false;
             let mut stop = false;
             ui.horizontal_wrapped(|ui| {
                 keep = secondary(ui, "Keep Bridge running", true).clicked();
-                stop = primary(ui, label.unwrap_or("Stop Bridge"), label.is_some()).clicked();
+                let label_text = label.unwrap_or(stop_label);
+                stop = if in_panel {
+                    monitor_button(ui, label_text, label.is_some(), ERROR)
+                } else {
+                    primary(ui, label_text, label.is_some())
+                }.clicked();
             });
             (keep, stop)
         });
@@ -277,7 +509,17 @@ impl Installer {
         if stop {
             self.running = None;
             self.verification = None;
+            #[cfg(windows)]
+            if let Some(controls) = &mut self.controls {
+                controls.bridge_online = false;
+                controls.bridge_probe = None;
+                controls.next_load = Instant::now();
+            }
             if action == QueueAction::CloseWindow {
+                #[cfg(windows)]
+                if let Some(tray) = &mut self.tray_panel {
+                    tray.exiting = true;
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -499,6 +741,46 @@ impl Installer {
         }
     }
 
+    #[cfg(windows)]
+    fn start_panel_server(&mut self, ctx: &egui::Context) {
+        let Some(installed) = self.installed.clone() else {
+            return;
+        };
+        let already_running = || serde_json::json!({ "bridge": "already_running" });
+        if self.running.as_mut().is_some_and(RunningBridge::is_running) {
+            self.verification = Some(Ok(already_running()));
+            return;
+        }
+        let confirm_only = self
+            .controls
+            .as_ref()
+            .is_some_and(|controls| controls.bridge_online);
+        self.verification = None;
+        self.progress = "Checking the Render Bridge server…".into();
+        self.running = None;
+        let ctx = ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("render-bridge-panel-start".into())
+            .spawn(move || {
+                let mut running = None;
+                let result = if connection::bridge_is_listening(&installed) {
+                    Ok(already_running())
+                } else if confirm_only {
+                    Err("The server no longer responds. Check the status and try again.".into())
+                } else {
+                    connection::start_and_verify(&installed, &mut running, &[], "")
+                };
+                let _ = sender.send(Event::Verified(running, result));
+                ctx.request_repaint();
+            });
+        if worker.is_ok() {
+            self.worker = Some(receiver);
+        } else {
+            self.verification = Some(Err("Could not check the Render Bridge server.".into()));
+        }
+    }
+
     fn start_install(&mut self, ctx: &egui::Context) {
         let settings = self.settings.clone();
         let selected_python = self.selected_python.clone();
@@ -566,6 +848,17 @@ impl Installer {
                 Ok(Event::Verified(running, result)) => {
                     self.worker = None;
                     self.running = running;
+                    #[cfg(windows)]
+                    if let Some(controls) = &mut self.controls {
+                        controls.bridge_online = result.as_ref().is_ok_and(|result| {
+                            matches!(
+                                result["bridge"].as_str(),
+                                Some("ok" | "already_running" | "comfyui_unavailable")
+                            )
+                        });
+                        controls.bridge_probe = None;
+                        controls.next_load = Instant::now();
+                    }
                     self.verification = Some(result);
                 }
                 Ok(Event::GamingModeChanged(result)) => {
@@ -578,6 +871,11 @@ impl Installer {
                     self.install_cancel = None;
                     match result {
                         Ok(installed) => {
+                            #[cfg(windows)]
+                            {
+                                self.monitor_error =
+                                    shortcuts::create_monitor_shortcut(&installed).err();
+                            }
                             if self.gaming_shortcut {
                                 self.shortcut_message =
                                     Some(match shortcuts::create_gaming_shortcut(&installed) {
@@ -1223,6 +1521,15 @@ impl Installer {
             );
         }
         self.show_gaming_mode(ui, &installed);
+        #[cfg(windows)]
+        {
+            if secondary(ui, "Open Render Bridge", idle).clicked() {
+                self.monitor_error = shortcuts::open_monitor(&installed).err();
+            }
+            if let Some(message) = &self.monitor_error {
+                status(ui, "Render Bridge panel", message, CAUTION);
+            }
+        }
         if secondary(ui, "ComfyUI Jobs", idle).clicked() {
             self.show_jobs(QueueAction::Inspect);
         }
@@ -1305,6 +1612,42 @@ impl Installer {
         let url = installed.as_ref().and_then(setup::installed_comfy_url);
         let changed = installed.as_ref().map(|current| &current.app_dir)
             != self.installed.as_ref().map(|opened| &opened.app_dir);
+        #[cfg(windows)]
+        {
+            if changed {
+                controls.bridge_probe = None;
+                controls.bridge_online = false;
+                self.verification = None;
+            }
+            if let Some(probe) = &controls.bridge_probe {
+                match probe.try_recv() {
+                    Ok(online) => {
+                        if controls.bridge_online && !online {
+                            self.verification = None;
+                        }
+                        controls.bridge_online = online;
+                        controls.bridge_probe = None;
+                    }
+                    Err(TryRecvError::Disconnected) => controls.bridge_probe = None,
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+            if controls.bridge_probe.is_none()
+                && self.worker.is_none()
+                && let Some(installed) = installed.clone()
+            {
+                let (sender, receiver) = mpsc::channel();
+                if thread::Builder::new()
+                    .name("check-render-bridge-status".into())
+                    .spawn(move || {
+                        let _ = sender.send(connection::bridge_is_listening(&installed));
+                    })
+                    .is_ok()
+                {
+                    controls.bridge_probe = Some(receiver);
+                }
+            }
+        }
         match url {
             Some(url)
                 if changed
@@ -1313,7 +1656,7 @@ impl Installer {
                         .as_ref()
                         .is_some_and(|queue| queue.is_for(&url)) =>
             {
-                controls.queue = Some(QueueView::new(url));
+                controls.queue = Some(QueueView::with_progress(url, ctx));
             }
             None => controls.queue = None,
             _ => {}
@@ -1324,11 +1667,9 @@ impl Installer {
     }
 
     fn controls_screen(&mut self, ctx: &egui::Context) {
-        if self
-            .controls
-            .as_ref()
-            .is_some_and(|controls| Instant::now() >= controls.next_load)
-        {
+        if self.controls.as_ref().is_some_and(|controls| {
+            controls.data_dir.is_some() && Instant::now() >= controls.next_load
+        }) {
             self.load_controls(ctx);
         }
         egui::TopBottomPanel::top("controls-banner")
@@ -1336,14 +1677,14 @@ impl Installer {
             .frame(
                 Frame::new()
                     .fill(RAIL)
-                    .inner_margin(egui::Margin::symmetric(28, 14)),
+                    .inner_margin(egui::Margin::symmetric(16, 5)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     bridge_mark(ui);
                     ui.label(
                         RichText::new("Render Bridge")
-                            .size(23.0)
+                            .size(20.0)
                             .strong()
                             .color(CREAM),
                     );
@@ -1354,34 +1695,122 @@ impl Installer {
             .frame(
                 Frame::new()
                     .fill(CREAM)
-                    .inner_margin(egui::Margin::symmetric(28, 10)),
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
             )
             .show(ctx, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if primary(ui, "Close", true).clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                ui.horizontal(|ui| {
+                    #[cfg(windows)]
+                    if let Some(setting) = &mut self.startup_setting
+                        && monitor_button(ui, "Settings", true, SURFACE).clicked()
+                    {
+                        setting.open();
                     }
+                    #[cfg(windows)]
+                    if self.installed.is_some()
+                        && self
+                            .controls
+                            .as_ref()
+                            .is_some_and(|controls| controls.update_available_here)
+                        && monitor_button(ui, "Update", true, SURFACE).clicked()
+                    {
+                        self.update.check(ctx);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        #[cfg(windows)]
+                        let close_label = if self.tray_panel.is_some() {
+                            "Hide to tray"
+                        } else {
+                            "Close"
+                        };
+                        #[cfg(not(windows))]
+                        let close_label = "Close";
+                        if monitor_button(ui, close_label, true, LIME).clicked() {
+                            #[cfg(windows)]
+                            if let Some(tray) = &mut self.tray_panel {
+                                tray.hide(ctx);
+                                return;
+                            }
+                            if self.running.as_mut().is_some_and(RunningBridge::is_running) {
+                                self.show_jobs(QueueAction::CloseWindow);
+                                return;
+                            }
+                            if self.worker.is_some() {
+                                return;
+                            }
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
                 });
             });
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(CREAM).inner_margin(egui::Margin::symmetric(28, 20)))
+            .frame(Frame::new().fill(CREAM).inner_margin(egui::Margin::symmetric(16, 12)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    header(ui, "ComfyUI Jobs", "Check running and queued work before shutting down.");
+                    ui.spacing_mut().item_spacing.y = 7.0;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Jobs").size(23.0).strong());
+                        #[cfg(windows)]
+                        if self.installed.is_some() {
+                            let idle = self.worker.is_none();
+                            let owned = self.running.as_mut().is_some_and(RunningBridge::is_running);
+                            let online = owned || self.controls.as_ref().is_some_and(|controls| controls.bridge_online);
+                            ui.add_space(4.0);
+                            let start_fill = if online { LINE } else { SURFACE };
+                            if monitor_button(ui, "Start server", idle, start_fill)
+                                .on_hover_text(if online { "Confirm the server is running" } else { "Start Render Bridge" })
+                                .clicked() {
+                                self.request_server_action(ctx, ServerAction::Start);
+                            }
+                            if monitor_button(ui, "Stop server", idle && owned, ERROR)
+                                .on_disabled_hover_text("This panel can stop the server it starts.")
+                                .clicked() {
+                                self.request_server_action(ctx, ServerAction::Stop);
+                            }
+                        }
+                    });
                     if let Some(queue) = self.controls.as_mut().and_then(|controls| controls.queue.as_mut()) {
                         queue.show(ui);
                     } else {
                         status(ui, "Queue status unavailable",
                             "The saved ComfyUI connection could not be read. Open Render Bridge Setup to review the installation.", CAUTION);
                     }
-                    if let Some(installed) = self.installed.clone() {
-                        self.show_gaming_mode(ui, &installed);
-                    }
                     if self.worker.is_some() {
                         activity(ui, &self.progress);
                     }
+                    #[cfg(windows)]
+                    if let Some(verification) = &self.verification {
+                        match verification {
+                            Ok(result) => {
+                                let (message, passed) = bridge_status(result["bridge"].as_str().unwrap_or_default());
+                                status(ui, "Render Bridge", message, if passed { GREEN } else { CAUTION });
+                            }
+                            Err(message) => status(ui, "Render Bridge server", message, CAUTION),
+                        }
+                    }
+                    if let Some(installed) = self.installed.clone() {
+                        ui.collapsing("Gaming Mode", |ui| self.show_gaming_mode(ui, &installed));
+                    }
+                    #[cfg(windows)]
+                    if let Some(error) = &self.tray_error {
+                        status(ui, "Tray icon unavailable", error, CAUTION);
+                    }
                 });
             });
+        #[cfg(windows)]
+        if let Some(setting) = &mut self.startup_setting {
+            setting.show(ctx);
+        }
+        #[cfg(windows)]
+        {
+            let can_replace = self.worker.is_none()
+                && !self.running.as_mut().is_some_and(RunningBridge::is_running);
+            if self.update.show(ctx, self.installed.as_ref(), can_replace) {
+                if let Some(tray) = &mut self.tray_panel {
+                    tray.exiting = true;
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
     }
 
     fn actions(&mut self, ctx: &egui::Context) {
@@ -1479,7 +1908,49 @@ impl eframe::App for Installer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_updates();
         if self.controls.is_some() {
+            #[cfg(windows)]
+            {
+                if self
+                    .tray_panel
+                    .as_ref()
+                    .is_some_and(|tray| !tray.exiting && !tray.icon.is_running())
+                {
+                    self.tray_panel = None;
+                    self.tray_error = Some(
+                        "Windows stopped the tray icon. You can keep reading the queue here."
+                            .into(),
+                    );
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                }
+                let guard_exit = self.worker.is_some()
+                    || self.update.blocks_controls()
+                    || self.running.as_mut().is_some_and(RunningBridge::is_running);
+                if self
+                    .tray_panel
+                    .as_mut()
+                    .is_some_and(|tray| tray.update(ctx, guard_exit))
+                {
+                    return;
+                }
+                if let Some(action) = self
+                    .tray_panel
+                    .as_mut()
+                    .and_then(|tray| tray.server_action.take())
+                {
+                    self.request_server_action(ctx, action);
+                }
+            }
+            #[cfg(windows)]
+            if self.tray_panel.is_none() && ctx.input(|input| input.viewport().close_requested()) {
+                if self.worker.is_some() || self.update.blocks_controls() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                } else if self.running.as_mut().is_some_and(RunningBridge::is_running) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.show_jobs(QueueAction::CloseWindow);
+                }
+            }
             self.controls_screen(ctx);
+            self.jobs_dialog(ctx);
             return;
         }
         let close_requested = ctx.input(|input| input.viewport().close_requested());
@@ -1561,6 +2032,7 @@ fn python_venv_help() -> &'static str {
 
 fn bridge_status(code: &str) -> (&'static str, bool) {
     match code {
+        "already_running" => ("Render Bridge is already running.", true),
         "ok" => (
             "Authenticated MCP connection verified. ComfyUI is reachable.",
             true,
@@ -1738,6 +2210,21 @@ fn secondary(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
     )
 }
 
+fn monitor_button(ui: &mut Ui, title: &str, enabled: bool, fill: Color32) -> egui::Response {
+    let text = match fill {
+        ERROR => CREAM,
+        LINE => MUTED,
+        _ => INK,
+    };
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(title).size(14.0).strong().color(text))
+            .fill(fill)
+            .min_size(egui::vec2(0.0, 34.0))
+            .corner_radius(10),
+    )
+}
+
 fn copy_row(ui: &mut Ui, title: &str, button: &str, value: &str) -> bool {
     let mut clicked = false;
     ui.horizontal(|ui| {
@@ -1757,14 +2244,77 @@ fn launch_mode(mut args: impl Iterator<Item = std::ffi::OsString>) -> LaunchMode
     if !args.next().is_some_and(|value| value == "--job-monitor") {
         return LaunchMode::Setup;
     }
-    let data_dir = if args.next().is_some_and(|value| value == "--data-dir") {
-        args.next()
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-    } else {
-        None
+    let flag = args.next();
+    let value = args.next();
+    let option = args.next();
+    let start_hidden = option
+        .as_deref()
+        .is_some_and(|value| value == "--start-in-tray");
+    let valid_options = (option.is_none() || start_hidden) && args.next().is_none();
+    let target = match (
+        valid_options,
+        flag.as_deref().and_then(std::ffi::OsStr::to_str),
+        value,
+    ) {
+        (true, Some("--data-dir"), Some(value)) if Path::new(&value).is_absolute() => {
+            MonitorTarget::Installation(PathBuf::from(value))
+        }
+        (true, Some("--comfy-url"), Some(value)) => value
+            .to_str()
+            .and_then(|url| setup::validate_comfy_url(url).ok())
+            .map_or(MonitorTarget::Missing, MonitorTarget::ComfyUrl),
+        _ => MonitorTarget::Missing,
     };
-    LaunchMode::Controls(data_dir.filter(|_| args.next().is_none()))
+    LaunchMode::Controls {
+        start_hidden: start_hidden && !matches!(&target, MonitorTarget::Missing),
+        target,
+    }
+}
+
+#[cfg(windows)]
+fn tray_key(mode: &LaunchMode) -> Option<String> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hash = DefaultHasher::new();
+    match mode {
+        LaunchMode::Controls {
+            target: MonitorTarget::ComfyUrl(url),
+            ..
+        } => ("url", url).hash(&mut hash),
+        LaunchMode::Controls {
+            target: MonitorTarget::Installation(directory),
+            ..
+        } => ("installation", directory).hash(&mut hash),
+        _ => return None,
+    }
+    Some(format!("{:016x}", hash.finish()))
+}
+
+#[cfg(windows)]
+fn startup_setting(mode: &LaunchMode) -> Option<StartupSetting> {
+    use std::ffi::OsString;
+    let (flag, value) = match mode {
+        LaunchMode::Controls {
+            target: MonitorTarget::ComfyUrl(url),
+            ..
+        } => ("--comfy-url", OsString::from(url)),
+        LaunchMode::Controls {
+            target: MonitorTarget::Installation(directory),
+            ..
+        } => ("--data-dir", directory.as_os_str().to_owned()),
+        _ => return None,
+    };
+    Some(StartupSetting {
+        executable: std::env::current_exe().ok()?,
+        arguments: vec![
+            OsString::from("--job-monitor"),
+            OsString::from(flag),
+            value,
+            OsString::from("--start-in-tray"),
+        ],
+        open: false,
+        enabled: None,
+        error: None,
+    })
 }
 
 #[cfg(test)]
@@ -1784,39 +2334,205 @@ mod launch_tests {
         ];
         assert!(matches!(
             launch_mode(arguments.into_iter()),
-            LaunchMode::Controls(Some(directory)) if directory == data
+            LaunchMode::Controls { target: MonitorTarget::Installation(directory), start_hidden: false, .. } if directory == data
         ));
         assert!(matches!(
             launch_mode([OsString::from("--job-monitor")].into_iter()),
-            LaunchMode::Controls(None)
+            LaunchMode::Controls {
+                target: MonitorTarget::Missing,
+                start_hidden: false,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn standalone_queue_monitor_requires_a_loopback_origin() {
+        let launch = |url: &str| {
+            launch_mode(
+                [
+                    OsString::from("--job-monitor"),
+                    OsString::from("--comfy-url"),
+                    OsString::from(url),
+                ]
+                .into_iter(),
+            )
+        };
+        assert!(matches!(launch("http://127.0.0.1:8188/"),
+            LaunchMode::Controls { target: MonitorTarget::ComfyUrl(url), .. } if url == "http://127.0.0.1:8188"));
+        assert!(matches!(
+            launch("http://example.test:8188"),
+            LaunchMode::Controls {
+                target: MonitorTarget::Missing,
+                start_hidden: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn hidden_start_requires_a_valid_monitor_target() {
+        let mode = |url: &str| {
+            launch_mode(
+                ["--job-monitor", "--comfy-url", url, "--start-in-tray"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+        };
+        assert!(matches!(
+            mode("http://127.0.0.1:8188"),
+            LaunchMode::Controls {
+                start_hidden: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mode("https://example.test"),
+            LaunchMode::Controls {
+                start_hidden: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_preserves_the_selected_installation() {
+        let folder = std::env::current_dir()
+            .unwrap()
+            .join("Render Bridge fixture");
+        let arguments = vec![
+            OsString::from("--job-monitor"),
+            OsString::from("--data-dir"),
+            folder.clone().into_os_string(),
+            OsString::from("--start-in-tray"),
+        ];
+        let mode = launch_mode(arguments.clone().into_iter());
+        assert!(matches!(
+            &mode,
+            LaunchMode::Controls { target: MonitorTarget::Installation(path), start_hidden: true } if path == &folder
+        ));
+        assert_eq!(startup_setting(&mode).unwrap().arguments, arguments);
     }
 }
 
 fn main() -> eframe::Result {
-    let mode = launch_mode(std::env::args_os().skip(1));
-    let (title, size, minimum) = match &mode {
+    let args = std::env::args_os().skip(1);
+    #[cfg(windows)]
+    let mode = {
+        let mut args = args.peekable();
+        match args.peek().and_then(|value| value.to_str()) {
+            Some("--apply-update") => {
+                args.next();
+                return update_ui::apply(update_handoff::UpdateRequest::parse(args));
+            }
+            Some("--finish-update") => {
+                args.next();
+                let request = match update_handoff::FinishRequest::parse(args) {
+                    Ok(request) => request,
+                    Err(error) => return update_ui::apply(Err(error)),
+                };
+                let _ = request.cleanup_after_helper();
+                LaunchMode::Controls {
+                    target: MonitorTarget::Installation(request.data_dir),
+                    start_hidden: false,
+                }
+            }
+            _ => launch_mode(args),
+        }
+    };
+    #[cfg(not(windows))]
+    let mode = launch_mode(args);
+    let (title, size, minimum, start_hidden) = match &mode {
         LaunchMode::Setup => (
             "Render Bridge Installer",
             Vec2::new(990.0, 670.0),
             Vec2::new(760.0, 540.0),
+            false,
         ),
-        LaunchMode::Controls(_) => (
-            "Render Bridge Controls",
-            Vec2::new(590.0, 535.0),
-            Vec2::new(420.0, 400.0),
+        LaunchMode::Controls { start_hidden, .. } => (
+            "Render Bridge",
+            Vec2::new(480.0, 365.0),
+            Vec2::new(408.0, 330.0),
+            cfg!(windows) && *start_hidden,
         ),
     };
+    #[cfg(windows)]
+    let key = tray_key(&mode);
+    #[cfg(windows)]
+    let startup_setting = startup_setting(&mode);
+    #[cfg(windows)]
+    if key
+        .as_deref()
+        .is_some_and(|key| tray::activate_existing(key, !start_hidden))
+    {
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(size)
             .with_min_inner_size(minimum)
+            .with_visible(!start_hidden)
+            .with_active(!start_hidden)
             .with_resizable(true),
         ..Default::default()
     };
     eframe::run_native(
         title,
         options,
-        Box::new(move |creation| Ok(Box::new(Installer::new(&creation.egui_ctx, mode)))),
+        Box::new(move |creation| {
+            let installer = Installer::new(&creation.egui_ctx, mode);
+            #[cfg(windows)]
+            let installer = {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                let mut installer = installer;
+                installer.startup_setting = startup_setting;
+                if let Some(key) = key {
+                    let server_controls = installer
+                        .controls
+                        .as_ref()
+                        .is_some_and(|controls| controls.data_dir.is_some());
+                    let root =
+                        creation
+                            .window_handle()
+                            .ok()
+                            .and_then(|window| match window.as_raw() {
+                                RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+                                _ => None,
+                            });
+                    let tray = root
+                        .ok_or_else(|| {
+                            "Windows did not provide the Render Bridge window handle.".to_owned()
+                        })
+                        .and_then(|window| {
+                            tray::Tray::start(
+                                creation.egui_ctx.clone(),
+                                &key,
+                                window,
+                                server_controls,
+                            )
+                        });
+                    match tray {
+                        Ok(icon) => {
+                            installer.tray_panel = Some(TrayPanel {
+                                icon,
+                                hidden: start_hidden,
+                                first_frame: true,
+                                exiting: false,
+                                server_action: None,
+                            });
+                        }
+                        Err(message) => {
+                            installer.tray_error = Some(message);
+                            creation
+                                .egui_ctx
+                                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        }
+                    }
+                }
+                installer
+            };
+            Ok(Box::new(installer))
+        }),
     )
 }

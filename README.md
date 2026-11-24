@@ -2,7 +2,7 @@
 
 A self-hosted image MCP server that lets your agents do the work in ComfyUI. Your agent can pick a preset, run a workflow, track the queue, and return the result as a signed download link. ComfyUI runs the pipeline on your own machine. Render Bridge is an independent integration by BlackRune LLC.
 
-[Download for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to install it](#ask-your-agent-to-set-it-up)
+[Download v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Windows control panel](#windows-control-panel) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to set it up](#ask-your-agent-to-set-it-up)
 
 ## Install and run
 
@@ -32,18 +32,28 @@ Install [Claude Code](https://code.claude.com/docs/en/quickstart) or [Codex](htt
 
 [Download Render Bridge Setup v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe). The executable is unsigned and uses the Microsoft Visual C++ x64 runtime. If the runtime is missing, install the [x64 Redistributable from Microsoft](https://aka.ms/vc14/vc_redist.x64.exe) before opening setup. [Release notes, checksum, and third-party notices](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/tag/v0.1.0)
 
-The Windows v0.1.0 download uses the original wizard. Complete the prerequisites above before opening it. The following flow is for a wizard built from the current source.
+The Windows v0.1.0 download uses the original wizard. Complete the prerequisites above before opening it. Build the installer from current source for the following setup flow and the compact Windows control panel.
 
 1. Open the wizard. On **Prerequisites**, check Python or follow the official download links. After installing Python, choose **Check Python again**. If it still isn't detected, use **Select Python executable** or reopen the wizard so it sees your updated PATH. Install and start a local ComfyUI build, then continue. On the **ComfyUI** screen, choose your build if several are detected. If its paths cannot be confirmed from its launch settings, copy the port from the build's **Overview** and its input and output locations from **Folders**. [Comfy Desktop build settings](https://docs.comfy.org/installation/desktop/usage/instance-management)
 2. Select **Check ComfyUI**. The wizard compares reported folders and checks starter model files. If the API cannot report absolute paths, as with a typical Windows portable launch, browse to the inner `ComfyUI` folder. Setup checks whether ComfyUI can read a temporary marker in each selected folder and removes the markers afterward. Open **Separate input and output folders** when your build uses different locations. If the wizard still cannot confirm the pairing, verify the paths manually or explicitly continue offline.
 3. Review the starter pipelines. The Models screen groups the files for Z-Image Turbo and NetaYume, shows which are available, and links to each download and its ComfyUI folder. You can add weights later. Select **Install Render Bridge** to set up the server and its Python environment. Setup checks a new runtime in its own directory before activating it. If an update fails or is cancelled, the previous runtime stays usable with the same token. Select **Create a Gaming Mode shortcut** before installing if you want one.
 4. Select **Start & Verify** with **Claude Code**, **Codex**, or both checked. The wizard starts a local Bridge and makes an authenticated `server_status` call without rendering. It also checks the saved user settings for the selected clients. If you run Codex with a named profile, enter its name to check that file too. If an entry is missing, add it using the displayed endpoint and private token file, following [the client instructions](#connect-an-mcp-client). Select **Verify again**, then open a fresh client session to test that client's effective configuration.
 
-Use **Open existing setup** on **Prerequisites** to return to **Connect** with your installed Bridge runtime. Open **ComfyUI Jobs** from **ComfyUI** or **Connect** to see live running and queued counts for your selected local build. Select **Refresh** to check again.
+Use **Open existing setup** on **Prerequisites** to return to **Connect** with your installed Bridge runtime. If that button is unavailable after a v0.1.0 installation, go through **Install Render Bridge** again with the same user data directory and ComfyUI build. The installer prepares the updated runtime and keeps your existing token. Open **ComfyUI Jobs** from **ComfyUI** or **Connect** to check the selected build's queue inside the wizard.
 
 When you choose **Stop Bridge** or close a wizard that started the Bridge, review the queue before confirming. Choose **Keep Bridge running** to wait or **Stop Bridge** to confirm. The confirmation reads **Stop Bridge anyway** when work is running or queued, or when the queue is unavailable. ComfyUI runs separately and has its own shutdown controls.
 
 To keep the Bridge running after closing setup, use **Shutdown and terminal commands** to copy the start command. Press **Ctrl+C** in that terminal when you want to stop it.
+
+#### Windows control panel
+
+In the installer built from current source, choose **Open Render Bridge** on **Connect** to launch the compact panel. It also has a per-user **Render Bridge** entry in the Windows Start menu. You can use the panel with the separate Gaming Mode shortcut left off.
+
+- **Jobs** shows running and queued jobs for the local ComfyUI address selected in setup. When ComfyUI sends progress for a running stage, the panel shows its step count and percentage.
+- **Start server** starts the Render Bridge MCP server using your saved installation. The red **Stop server** button stops the Render Bridge session started by this panel after you review the queue and confirm. If a wizard or terminal session already runs Render Bridge, stop it there before starting a session from the panel. Manage ComfyUI in its own app or through its launch command.
+- **Hide to tray** keeps Render Bridge in the Windows notification area. Click its icon to reopen the panel. If the icon is in the overflow, open **Show hidden icons** first.
+- In **Settings**, turn on **Start hidden when I sign in** to open Render Bridge in the notification area after you sign in to Windows. Use **Start server** in the panel when you want the Render Bridge MCP server to run.
+- Select **Update** to check for a newer stable Windows release on the official GitHub repository. If that release has a signed installer, choose **Install update** to download and verify it from the panel. Render Bridge checks for active jobs and any server session the panel owns before replacing the installed version. The update keeps your saved settings, ComfyUI address, and token on this PC.
 
 #### Build the desktop installer
 
@@ -157,9 +167,9 @@ After installing the [Z-Image Turbo starter files](docs/pipelines.md#recommended
 
 The [pipeline guide](docs/pipelines.md#what-each-pipeline-does) covers editing, background removal, animation, 3D, and workflows you export from ComfyUI. Use `start_job` and `get_job` for the generation tools that support background jobs.
 
-## AI server gaming mode
+## Render Bridge Gaming Mode
 
-Toggle the **Gaming Mode** checkbox on **Connect**. If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu. The shortcut opens a controls window with the queue and a **Gaming Mode** checkbox. If you have an older shortcut that toggles Gaming Mode immediately, rename or remove it before creating the new shortcut.
+Toggle the **Gaming Mode** checkbox on **Connect**, or expand **Gaming Mode** in the Render Bridge panel for a saved installation. If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu. If you have an older shortcut that toggles Gaming Mode immediately, rename or remove it before creating the new shortcut.
 
 For terminal control, go to **Connect → Shutdown and terminal commands → Turn Gaming Mode off** and run the copied command. Use **Copy status command** to check it in a terminal or replace the final `off` with `on` to enable it. In the v0.1.0 download, copy the start command and replace the final `start` with `gaming-mode off`.
 

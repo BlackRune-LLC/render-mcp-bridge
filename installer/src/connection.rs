@@ -115,6 +115,21 @@ fn origin(installed: &Installed) -> Result<&str, String> {
         .ok_or_else(|| "The Bridge MCP URL is invalid.".into())
 }
 
+#[cfg(windows)]
+pub fn bridge_is_listening(installed: &Installed) -> bool {
+    let Ok(origin) = origin(installed).and_then(setup::validate_comfy_url) else {
+        return false;
+    };
+    let agent = setup::loopback_agent(Duration::from_secs(4));
+    setup::fetch_json(&agent, &origin, "/health").is_some_and(|health| {
+        health["mcp"] == "ok"
+            && matches!(
+                health["comfyui"].as_str(),
+                Some("ok" | "stopped" | "paused")
+            )
+    })
+}
+
 pub fn start_and_verify(
     installed: &Installed,
     running: &mut Option<RunningBridge>,
