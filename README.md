@@ -2,7 +2,7 @@
 
 A self-hosted image MCP server that lets your agents do the work in ComfyUI. Your agent can pick a preset, run a workflow, track the queue, and return the result as a signed download link. ComfyUI runs the pipeline on your own machine. Render Bridge is an independent integration by BlackRune LLC.
 
-[Run the desktop installer](#desktop-installer) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to install it](#ask-your-agent-to-set-it-up)
+[Download for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to install it](#ask-your-agent-to-set-it-up)
 
 ## Install and run
 
@@ -16,17 +16,25 @@ cd render-mcp-bridge
 
 ### Desktop installer
 
-The Rust wizard checks your local ComfyUI connection and shows which starter files ComfyUI can see. Select **Install** to set up the bundled Render Bridge server and its Python dependencies in a per-user virtual environment. Copy the start command from the final screen into a terminal (PowerShell on Windows). Then use the displayed MCP URL and private token file path to [connect your client](#connect-an-mcp-client). ComfyUI and Python 3.11 or later should already be installed.
+[Download Render Bridge Setup v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe). Open the downloaded executable after installing ComfyUI and Python 3.11 or later. The executable is unsigned. [Release notes, checksum, and third-party notices](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/tag/v0.1.0)
+
+The Rust wizard checks your local ComfyUI connection and shows which starter files ComfyUI can see. Select **Install** to set up the bundled Render Bridge server and its Python dependencies in a per-user virtual environment. Copy the start command from the final screen into a terminal (PowerShell on Windows). Then use the displayed MCP URL and private token file path to [connect your client](#connect-an-mcp-client).
 
 The desktop installer places the server and virtual environment in the `app` folder inside your Render Bridge user data directory. It saves the chosen ComfyUI folder and local API URL for subsequent launches.
 
-From a checkout with [Rust](https://www.rust-lang.org/tools/install) and your platform's native build tools, start the wizard with:
+#### Build the desktop installer
+
+Install a current [Rust toolchain](https://www.rust-lang.org/tools/install) and your platform's native build tools. Start the wizard from your checkout.
 
 ```sh
 cargo run --locked --manifest-path installer/Cargo.toml
 ```
 
 To build the standalone setup executable for the current platform, run `cargo build --release --locked --manifest-path installer/Cargo.toml`. The binary is in `installer/target/release/`. The packaged binary includes the bridge source and the pinned requirements. Installing those Python dependencies needs access to your configured package index.
+
+**macOS.** Build on the target Mac using its native Rust toolchain. Install the Xcode Command Line Tools with `xcode-select --install` if needed. Launch the installer from Terminal so it inherits your Python path. If setup cannot find your Python, set `RENDER_BRIDGE_PYTHON` to the absolute executable path in that terminal before launching. For ComfyUI Desktop, choose the shared directory that contains `input` and `output`, typically `~/ComfyUI-Shared`. [Rust macOS requirements](https://doc.rust-lang.org/rustc/platform-support/apple-darwin.html) · [ComfyUI Desktop on macOS](https://docs.comfy.org/installation/desktop/macos)
+
+**Linux.** Use your distro's native build packages. On Debian or Ubuntu, follow the [eframe build prerequisites](https://github.com/emilk/egui/blob/0.33.3/crates/eframe/README.md), install `libxcursor1` and `libxkbcommon-x11-0` for X11, and install `python3-venv` if you use the distro's Python and need virtual environment support. Run the wizard in an X11 or Wayland desktop session with OpenGL. The Browse button uses the desktop's file chooser portal. Install the portal backend for your desktop session if you need it, or enter the ComfyUI path directly. [Linux native dialogs](https://docs.rs/rfd/0.16.0/rfd/#xdg-desktop-portal-backend)
 
 ### Terminal installer
 
