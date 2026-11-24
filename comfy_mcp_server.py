@@ -1120,6 +1120,10 @@ async def collect_images(entry: dict[str, Any], primary_node: str | None = None)
     return out
 
 
+def _saved_as(file: dict[str, Any], extension: str) -> bool:
+    return file["type"] == "output" and file["filename"].lower().endswith(f".{extension}")
+
+
 async def preview_content(img: dict[str, Any], max_side: int = 512) -> ImageContent | None:
     try:
         r = await _http.get(comfy_view_url(img))
@@ -1233,10 +1237,16 @@ def log_asset(tool: str, summary: dict[str, Any], files: list[dict[str, Any]]) -
 
 
 async def build_result(summary: dict[str, Any], images: list[dict[str, Any]], preview: bool, max_previews: int = 4,
-                       tool: str = "") -> CallToolResult:
+                       tool: str = "", *, expected_extension: str = "") -> CallToolResult:
     import sys
+    missing_output = expected_extension and not any(
+        img["role"] == "primary" and _saved_as(img, expected_extension) for img in images
+    )
     if images:
-        log_asset(tool or sys._getframe(1).f_code.co_name, summary, images)
+        record = {**summary, "incomplete": True} if missing_output else summary
+        log_asset(tool or sys._getframe(1).f_code.co_name, record, images)
+    if missing_output:
+        raise ToolError(f"ComfyUI finished without a saved {expected_extension.upper()} from the main save node.")
     content: list[Any] = []
     previews = []
     if preview:
@@ -1302,6 +1312,11 @@ async def list_models() -> str:
             item["presets"] = [n for n, q in PRESETS.items() if q["family"] == fam]
     stats = (await _http.get("/system_stats")).json()
     dev = stats.get("devices", [{}])[0]
+    workflow_error = None
+    try:
+        await asyncio.to_thread(load_3d_workflow)
+    except ToolError as error:
+        workflow_error = str(error)
     return json.dumps({
         "presets": presets,
         "loras": loras,
@@ -1312,7 +1327,8 @@ async def list_models() -> str:
                 "vram_free_gb": round(dev.get("vram_free", 0) / 2**30, 1)},
         "comfyui_version": stats.get("system", {}).get("comfyui_version"),
         "download_bases": PUBLIC_URLS,
-        "image_to_3d_configured": bool(THREE_D_WORKFLOW),
+        "image_to_3d_configured": workflow_error is None,
+        "image_to_3d_error": workflow_error,
     }, indent=2)
 
 
@@ -1430,7 +1446,7 @@ async def generate_image(
         summary["loras"] = [{"name": lo["name"], "file": lo["file"].replace("\\", "/"), "strength": lo["strength"],
                              "sha256": sha} for lo, sha in zip(p["user_loras"], hashes)]
         summary["lora_triggers_added"] = triggers
-    return await build_result(summary, images, preview)
+    return await build_result(summary, images, preview, expected_extension="png")
 
 
 async def input_image_ref(filename: str, subfolder: str, source: str, image_base64: str) -> str:
@@ -1887,18 +1903,23 @@ async def _frames_result(tool: str, summary: dict[str, Any], entry: dict[str, An
     """Record one animation call and build its result: the frames by number, the video, one contact strip."""
     by_node: dict[str, dict[str, Any]] = {}
     for im in await collect_images(entry):
-        by_node.setdefault(im["node"], im)
+        extension = "mp4" if im["node"] == "save_video" else "png"
+        if _saved_as(im, extension):
+            by_node.setdefault(im["node"], im)
     frames = [by_node[s] for s in saves if s in by_node]
     video = by_node.get("save_video")
-    if len(frames) != len(saves):
-        if frames or video:
-            log_asset(tool, {**summary, "incomplete": True}, frames + ([video] if video else []))
-        raise ToolError(f"ComfyUI saved {len(frames)} of {len(saves)} frames; they are recorded as an incomplete run.")
-    log_asset(tool, summary, frames + ([video] if video else []))  # stamps the project into summary
+    files = frames + ([video] if video else [])
+    if len(frames) != len(saves) or video is None:
+        if files:
+            log_asset(tool, {**summary, "incomplete": True}, files)
+        if len(frames) != len(saves):
+            raise ToolError(f"ComfyUI saved {len(frames)} of {len(saves)} requested PNG frames.")
+        raise ToolError("ComfyUI finished without a saved MP4. The PNG frames are recorded as an incomplete run.")
+    log_asset(tool, summary, files)  # stamps the project into summary
     # One address per frame keeps a long action's result short; "bases" lists the others.
     summary["frames"] = [{"frame": n, "filename": f["filename"], "subfolder": f["subfolder"], "type": f["type"], "url": f["url"]}
                          for n, f in enumerate(frames, start=1)]
-    summary["video"] = {k: video[k] for k in ("filename", "subfolder", "type", "url", "urls")} if video else None
+    summary["video"] = {k: video[k] for k in ("filename", "subfolder", "type", "url", "urls")}
     summary["bases"] = PUBLIC_URLS
     summary["download_hint"] = ('curl -o <file> "<url>" for each frame and the video ("bases" lists every address the server '
                                 "is configured to publish). Pass the frames to pack_spritesheet.")
@@ -2682,7 +2703,7 @@ def load_3d_workflow() -> dict[str, Any]:
             for node in graph.values()
         ):
             raise ValueError("invalid API-format workflow")
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         raise ToolError("COMFY_3D_WORKFLOW must be readable API-format JSON with a Save3DAdvanced viewport.") from None
     return graph
 
@@ -2734,7 +2755,7 @@ async def _hunyuan3d_to_glb(annotated: str, face_count: int, remove_background: 
     summary = {"prompt_id": prompt_id, "source_image": annotated, "model": "hunyuan3d", "seed": seed, "face_count": face_count,
                "textured": False, "seconds": round(elapsed, 1),
                "note": "Hunyuan3D 2.1 output is untextured geometry with smooth normals and a UV atlas (ready to texture)."}
-    return await build_result(summary, files, preview=False, tool="image_to_3d")
+    return await build_result(summary, files, preview=False, tool="image_to_3d", expected_extension="glb")
 
 
 @mcp.tool(structured_output=False)
@@ -2808,7 +2829,7 @@ async def image_to_3d(
         "prompt_id": prompt_id, "source_image": annotated, "model": model, "seed": seed, "face_count": face_count,
         "texture_size": texture_size, "seconds": round(elapsed, 1),
     }
-    return await build_result(summary, files, preview=False)
+    return await build_result(summary, files, preview=False, expected_extension="glb")
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True), structured_output=False)

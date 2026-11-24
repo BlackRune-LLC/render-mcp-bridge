@@ -2825,7 +2825,19 @@ fn gaming_mode_button(ui: &mut Ui, on: bool, enabled: bool) -> egui::Response {
 fn model_paths(folder: &Path) -> String {
     let path = serde_json::Value::String(folder.to_string_lossy().into_owned());
     format!(
-        "render_bridge_models:\n    base_path: {path}\n    checkpoints: checkpoints/\n    diffusion_models: diffusion_models/\n    text_encoders: text_encoders/\n    vae: vae/\n    loras: loras/\n"
+        concat!(
+            "render_bridge_models:\n",
+            "    base_path: {path}\n",
+            "    checkpoints: checkpoints/\n",
+            "    diffusion_models: diffusion_models/\n",
+            "    text_encoders: text_encoders/\n",
+            "    vae: vae/\n",
+            "    loras: loras/\n",
+            "    clip_vision: clip_vision/\n",
+            "    background_removal: background_removal/\n",
+            "    geometry_estimation: geometry_estimation/\n",
+        ),
+        path = path,
     )
 }
 
@@ -2952,6 +2964,14 @@ fn startup_setting(mode: &LaunchMode) -> Option<StartupSetting> {
 mod launch_tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn model_paths_include_the_categories_used_by_animation_and_3d() {
+        let paths = model_paths(Path::new("Models"));
+        for category in ["clip_vision", "background_removal", "geometry_estimation"] {
+            assert!(paths.contains(&format!("    {category}: {category}/\n")));
+        }
+    }
 
     #[cfg(windows)]
     #[test]

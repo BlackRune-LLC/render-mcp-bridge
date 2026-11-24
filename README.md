@@ -43,7 +43,7 @@ The Windows v0.1.0 download uses the original wizard. Complete the prerequisites
 3. Review the starter pipelines on **Models**. You can choose a separate model drive and copy the settings ComfyUI needs to find it. On **Install**, keep the default Render Bridge installation folder or choose another one. Select **Install Render Bridge** to set up the server and its Python environment. Setup checks a new runtime before activating it. If an update fails or is cancelled, the previous runtime stays usable with the same token. Select **Create a Gaming Mode shortcut** before installing if you want one. [Store models on another drive](docs/pipelines.md#store-models-on-another-drive)
 4. On **Connect**, select **Start & Verify**, then **Copy agent setup prompt**. Paste it into the AI agent that will connect on this device. The prompt gives the agent the exact local address and the path to the private token file. Approve any requested user configuration edits, then let the agent verify the connection with `server_status`. Open a fresh client session if it needs to reload the configuration. [Connect an MCP client](#connect-an-mcp-client)
 
-**Start & Verify** also checks saved configuration for selected Claude Code or Codex clients. Enter your named Codex profile if you use one.
+**Start & Verify** checks the authenticated MCP connection, the selected ComfyUI build, and saved settings for selected Claude Code or Codex clients. Enter your named Codex profile if you use one. Setup installs the Bridge runtime. You choose and download model weights separately, then verify that your agent can call the tools and retrieve an output.
 
 Use **Open existing setup** on **Prerequisites** to return to **Connect**. If you installed in a custom location, use **Browse for an installation** and select its Render Bridge installation folder. To upgrade a v0.1.0 installation, go through **Install Render Bridge** again with the same user data directory and ComfyUI build. The installer prepares the updated runtime and keeps your existing token. Open **ComfyUI Jobs** from **ComfyUI** or **Connect** to check the selected build's queue inside the wizard.
 
@@ -152,11 +152,16 @@ For manual setup, follow the [client examples](docs/connections.md#configure-the
 
 ## Make your first render
 
-After installing the [Z-Image Turbo starter files](docs/pipelines.md#recommended-first-pipeline), try this in your MCP client.
+After installing the [Z-Image Turbo starter files](docs/pipelines.md#recommended-first-pipeline), refresh the model list in ComfyUI and try this in your connected MCP client. The starter files are public. Sign in to a service only if the model you choose requires access or your workflow uses a paid provider. [Accounts and credentials](docs/pipelines.md#accounts-and-credentials)
 
-> Call `server_status`, `list_jobs`, and `list_models` on Render Bridge. If the server is available and the `z_image_turbo` preset is installed, generate one 512 × 512 image of a small watercolor lighthouse and give me its signed download link. If a prerequisite is missing, tell me which one.
+> Call `server_status`, `list_jobs`, and `list_models` on Render Bridge. If ComfyUI is reachable, Gaming Mode is off, and the `z_image_turbo` preset is available, use `generate_image` to make one 512 × 512 PNG of a small watercolor lighthouse with transparency off. Give me its signed download link. If a prerequisite is missing, tell me which one.
 
-The [pipeline guide](docs/pipelines.md#what-each-pipeline-does) covers editing, background removal, animation, 3D, and workflows you export from ComfyUI. Use `start_job` and `get_job` for the generation tools that support background jobs.
+Open the downloaded PNG. Then try either of these with the same image or with a file you upload through `upload_link`.
+
+- **Video.** Install the Wan loop weights and nodes, then run `animate_loop` with `transparent=false` for the first test. Download the returned MP4 and play it. [Animation setup](docs/pipelines.md#animation)
+- **3D.** Configure a compatible image-to-3D workflow and its weights. Give `image_to_3d` an image of one centered object and import the returned GLB into a 3D viewer. [Image-to-3D setup](docs/pipelines.md#image-to-3d)
+
+For longer jobs, submit through `start_job` and use `get_job` to retrieve the signed file links. If the agent is on another device, open the file using a link reachable from that device. [Remote connections and file transfer](docs/connections.md#connect-from-another-device)
 
 ## Render Bridge Gaming Mode
 

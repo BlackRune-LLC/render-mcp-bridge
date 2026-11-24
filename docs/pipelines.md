@@ -41,6 +41,14 @@ Choose **Model storage folder** on Render Bridge's **Models** screen, then selec
 - **ComfyUI portable or manual install.** Merge the copied entry into `extra_model_paths.yaml` in the ComfyUI directory. If you only have `extra_model_paths.yaml.example`, use it as a starting point for the new file. Keep existing entries and use a unique name for the new block. [ComfyUI extra model paths](https://docs.comfy.org/installation/manual_install#adding-extra-model-paths) · [Upstream YAML example](https://github.com/Comfy-Org/ComfyUI/blob/master/extra_model_paths.yaml.example)
 - **Comfy Desktop.** Open the build's **Folders** tab and use **Add models folder** to select the external model folder. A build with a YAML entry also offers **Show extra_model_paths.yaml** to locate its file. Merge any YAML entries alongside the build's existing settings. [Comfy Desktop build folders](https://docs.comfy.org/installation/desktop/usage/instance-management#choose-which-folders-the-build-uses)
 
+The current installer includes the advanced categories below. If you copied YAML from an earlier build, add any missing lines under the same `base_path` entry to store those weights on the external drive.
+
+```yaml
+    clip_vision: clip_vision/
+    background_removal: background_removal/
+    geometry_estimation: geometry_estimation/
+```
+
 Restart the selected ComfyUI build after saving the paths. Use **Check again** in the installer or call `list_models` from your agent to confirm the model filenames are available.
 
 ## Check and install nodes
@@ -114,8 +122,14 @@ The default fast mode needs both LoRAs. `quality=true` skips them. The product o
 ### Image to 3D
 
 1. Download the official [Pixal3D and TRELLIS.2 template JSON](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/3d_pixal3d_trellis2_image_to_model.json) and open it in current ComfyUI. Install the models specified by the template for the branches you intend to run.
-2. Save its API export locally. Keep the graph's expected node IDs and `viewport_state` on the `Save3DAdvanced` node. Set `COMFY_3D_WORKFLOW` to that JSON file's path in the environment that starts Render Bridge.
-3. Restart Render Bridge. `list_models` reports whether the workflow path is configured. Confirm the chosen branch can run in ComfyUI before calling `image_to_3d`.
+2. Test the chosen branch in ComfyUI, then save its **Export (API)** JSON locally. Use a `Save3DAdvanced` node with its `viewport_state` intact and a workflow that saves a GLB.
+3. Stop Render Bridge and set `COMFY_3D_WORKFLOW` to the export's absolute path in the environment that starts the Bridge. On Windows, use **Connect → Shutdown and terminal commands → Copy start command** in Setup. Set the variable in PowerShell, then run the copied start command in that same PowerShell window and leave it running.
+
+```powershell
+$env:COMFY_3D_WORKFLOW = (Resolve-Path -LiteralPath 'C:\RenderBridge\workflows\image-to-3d-api.json').Path
+```
+
+Replace the example path with your saved export. In the connected agent, call `list_models` and check `image_to_3d_configured`. If it is false, read `image_to_3d_error` for guidance. That check covers loading the graph. Test the actual render with `image_to_3d` to verify the installed nodes, weights, and hardware.
 
 For the full two-model template, use the file links in the template to install the following weights.
 
@@ -136,4 +150,4 @@ Pixal3D and TRELLIS.2 produce textured GLBs. The optional Hunyuan 3D 2.1 path us
 1. Open a trusted workflow in ComfyUI. Resolve any missing nodes and weights, set its inputs, and run it once in the UI. Include a save node such as `SaveImage` so the bridge has a persisted file to return.
 2. Use **Export (API)** in ComfyUI. The result should be an object keyed by node ID, with `class_type` and `inputs` for each node.
 3. If the graph uses local images and your agent is on another machine, use `upload_link` to stage them on the Render Bridge host. Use the returned filenames and subfolders in the graph inputs.
-4. Ask your agent to pass the API graph object to `run_workflow`. It can return the saved image links, or use `start_job` and `get_job` if the workflow will take a while.
+4. Ask your agent to pass the API graph object to `run_workflow`. It can return links to saved images, videos, or models reported by the workflow. Use `start_job` and `get_job` if the workflow will take a while.

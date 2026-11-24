@@ -94,6 +94,62 @@ class ModelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queue.await_args.args[0]["save"]["class_type"], "PreviewImage")
 
 
+class MediaOutputTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generate_image_requires_the_primary_png(self):
+        queue = AsyncMock(return_value=("test-prompt", {
+            "outputs": {"original": {"images": [{"filename": "secondary.png"}]}},
+        }, 1.2))
+        with (
+            patch.object(server, "use_project", return_value=(None, None)),
+            patch.object(server, "resolve_preset", AsyncMock(return_value={
+                "size": (512, 512), "steps": 9, "cfg": 1, "family": "z_image", "negative": "",
+            })),
+            patch.object(server, "build_graph", return_value={}),
+            patch.object(server, "queue_and_wait", queue),
+            patch.object(server, "log_asset") as log,
+        ):
+            with self.assertRaisesRegex(server.ToolError, "without a saved PNG"):
+                await server.generate_image("A simple fixture", preview=False)
+        self.assertTrue(log.call_args.args[1]["incomplete"])
+        self.assertEqual(log.call_args.args[2][0]["filename"], "secondary.png")
+
+    async def test_animation_records_partial_frames_and_fails_when_mp4_is_missing(self):
+        entry = {"outputs": {"save1": {"images": [{"filename": "frame.png"}]}}}
+        with patch.object(server, "log_asset") as log:
+            with self.assertRaisesRegex(server.ToolError, "without a saved MP4"):
+                await server._frames_result("animate_loop", {}, entry, ["save1"], preview=False)
+        self.assertTrue(log.call_args.args[1]["incomplete"])
+        self.assertEqual(log.call_args.args[2][0]["filename"], "frame.png")
+
+    async def test_image_to_3d_requires_a_glb_from_the_model_save_node(self):
+        queue = AsyncMock(return_value=("test-prompt", {
+            "outputs": {"save": {"images": [{"filename": "preview.png"}]}},
+        }, 1.2))
+        with (
+            patch.object(server, "use_project"),
+            patch.object(server, "load_3d_workflow", return_value={
+                "save": {"class_type": "Save3DAdvanced", "inputs": {"viewport_state": "{}"}},
+            }),
+            patch.object(server, "input_image_ref", AsyncMock(return_value="fixture.png")),
+            patch.object(server, "queue_and_wait", queue),
+        ):
+            with self.assertRaisesRegex(server.ToolError, "without a saved GLB"):
+                await server.image_to_3d(filename="fixture.png")
+
+    async def test_model_list_explains_an_invalid_3d_workflow_file(self):
+        with (
+            patch.object(server, "THREE_D_WORKFLOW", "unreadable-workflow.json"),
+            patch.object(server, "ensure_comfy", AsyncMock()),
+            patch.object(server, "model_lists", AsyncMock(return_value={})),
+            patch.object(server, "resolve_preset", AsyncMock()),
+            patch.object(server, "_http", AsyncMock()),
+        ):
+            server._http.get.return_value = response(devices=[{}])
+            status = json.loads(await server.list_models())
+        self.assertFalse(status["image_to_3d_configured"])
+        self.assertIn("Save3DAdvanced", status["image_to_3d_error"])
+
+
 class JobTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
