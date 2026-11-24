@@ -1,12 +1,42 @@
-# Black Rune Render Bridge
+# Render Bridge
 
-Connect an MCP client to your own ComfyUI installation. Render Bridge exposes the queue, background jobs, image generation and editing, and project asset records over authenticated Streamable HTTP. Tool availability depends on the models and nodes you install in ComfyUI. Render Bridge is an independent ComfyUI integration by BlackRune LLC.
+A self-hosted image MCP server that lets your agents do the work in ComfyUI. Your agent can pick a preset, run a workflow, track the queue, and return the result as a signed download link. ComfyUI runs the pipeline on your own machine. Render Bridge is an independent integration by BlackRune LLC.
+
+[Run the guided installer](#guided-installer) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to install it](#ask-your-agent-to-set-it-up)
 
 ## Install and run
 
 1. Install and start [ComfyUI](https://docs.comfy.org/installation/manual_install) on the same host. Confirm its API responds at `http://127.0.0.1:8188/system_stats`. Find the ComfyUI directory that contains its `input` and `output` folders. For a Windows portable install, this is usually the inner `ComfyUI` directory.
 2. Install Python 3.11 or later. Clone this repository or download its source, then open a terminal in that directory.
-3. Set `COMFY_ROOT` to your ComfyUI directory and start the MCP server in a virtual environment.
+
+```sh
+git clone https://github.com/BlackRune-LLC/render-mcp-bridge.git
+cd render-mcp-bridge
+```
+
+### Guided installer
+
+Use the wizard for a bridge and a ComfyUI API running on the same machine. It checks the data directory, the local API, and the starter model filenames. With your confirmation, it creates or updates the bridge's Python virtual environment and saves the ComfyUI path and URL in your user data directory. Use the model guide for any weights or nodes it flags as missing.
+
+**Windows PowerShell**
+
+```powershell
+py -3 setup_render_bridge.py
+py -3 setup_render_bridge.py start
+```
+
+**macOS or Linux**
+
+```sh
+python3 setup_render_bridge.py
+python3 setup_render_bridge.py start
+```
+
+The `start` command uses the saved settings and runs the bridge in your terminal. Leave it running and follow [Connect an MCP client](#connect-an-mcp-client). The wizard prints the token file path so you can add the new entry while preserving your existing client settings.
+
+### Manual setup
+
+Follow the [model and node guide](docs/pipelines.md) to install the files for one pipeline. The [accounts section](docs/pipelines.md#accounts-and-credentials) explains when Hugging Face or a provider login is needed. Set `COMFY_ROOT` to the directory that owns the `input` and `output` folders, including for ComfyUI Desktop or a custom data location.
 
 **Windows PowerShell**
 
@@ -26,6 +56,8 @@ export COMFY_ROOT="/path/to/ComfyUI"
 .venv/bin/python comfy_mcp_server.py
 ```
 
+### Verify the server
+
 Leave both processes running and check `http://127.0.0.1:8189/health`. Both `mcp` and `comfyui` should report `ok`. On first run, Render Bridge creates a bearer token. Its default path is `%LOCALAPPDATA%\comfy-mcp\token.txt` on Windows or `${XDG_DATA_HOME:-$HOME/.local/share}/comfy-mcp/token.txt` on macOS and Linux. Keep the token in the server's private token file and your MCP client's user-scope config.
 
 | Setting | Default and purpose |
@@ -42,7 +74,7 @@ For remote access, keep the MCP server bound to loopback and put an HTTPS revers
 
 Add a user-scope server named `comfyui` with Streamable HTTP URL `http://127.0.0.1:8189/mcp` and header `Authorization: Bearer <token>`. Replace `<token>` in your private client settings with the contents of your token file. Preserve any MCP entries you already use. Use another name if `comfyui` is taken.
 
-For Claude Code, merge this entry into the top-level `mcpServers` object in your user config.
+For Claude Code, merge this entry into the top-level `mcpServers` object in `~/.claude.json` (`%USERPROFILE%\.claude.json` on Windows). Use your active profile's user config if you configured a custom directory. [Claude Code MCP scopes](https://code.claude.com/docs/en/mcp#user-scope)
 
 ```json
 {
@@ -54,7 +86,7 @@ For Claude Code, merge this entry into the top-level `mcpServers` object in your
 }
 ```
 
-For Codex, add these tables to your user `config.toml`.
+For Codex, add these tables to `~/.codex/config.toml` (`%USERPROFILE%\.codex\config.toml` on Windows). If you set `CODEX_HOME`, use `config.toml` in that directory. [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 
 ```toml
 [mcp_servers.comfyui]
@@ -65,21 +97,27 @@ tool_timeout_sec = 600.0
 Authorization = "Bearer <token>"
 ```
 
-Start a fresh client session and call `server_status` and `list_jobs`. Then call `list_models` and check that the preset you want is available before you send a generation job. Install models and custom nodes in ComfyUI under their respective upstream licenses. Use `start_job` and `get_job` for long-running work.
+Start a fresh client session and call `server_status` and `list_jobs`. If `/mcp` returns HTTP 401, check that this profile has the bearer token from Render Bridge's token file. If `/health` reports `comfyui: stopped`, start ComfyUI or check `COMFY_URL`.
 
-Once you have an available preset, ask your agent to generate a test image with that preset and return its signed download link.
+## Make your first render
 
-For optional image-to-3D tools, set `COMFY_3D_WORKFLOW` to your own compatible ComfyUI API-format workflow. It needs the official Pixal3D and TRELLIS.2 template layout, including `Save3DAdvanced`. For GLB optimization, install Node.js and the glTF Transform CLI, add `node` to your PATH, and set `GLTF_TRANSFORM_CLI` to the installed CLI's JavaScript entry point.
+After installing the [Z-Image Turbo starter files](docs/pipelines.md#recommended-first-pipeline), try this in your MCP client.
+
+> Call `server_status`, `list_jobs`, and `list_models` on Render Bridge. If the server is available and the `z_image_turbo` preset is installed, generate one 512 × 512 image of a small watercolor lighthouse and give me its signed download link. If a prerequisite is missing, tell me which one.
+
+The [pipeline guide](docs/pipelines.md#what-each-pipeline-does) covers editing, background removal, animation, 3D, and workflows you export from ComfyUI. Use `start_job` and `get_job` for the generation tools that support background jobs.
 
 ## AI server gaming mode
 
-From a second terminal, use the same virtual environment and settings as the running server, including `COMFY_URL` and `COMFY_MCP_DATA_DIR` if set. On Windows, replace `python` below with `.\.venv\Scripts\python.exe`. On macOS or Linux, use `.venv/bin/python`.
+If you used guided setup, open a second terminal in the repo and run these commands with the same Python launcher you used for setup (`py -3` on Windows or `python3` on macOS and Linux).
 
 ```sh
-python comfy_mcp_server.py gaming-mode on
-python comfy_mcp_server.py gaming-mode status
-python comfy_mcp_server.py gaming-mode off
+python3 setup_render_bridge.py gaming-mode on
+python3 setup_render_bridge.py gaming-mode status
+python3 setup_render_bridge.py gaming-mode off
 ```
+
+For manual setup, use `comfy_mcp_server.py gaming-mode on|off|status` with the virtual environment's Python and the same `COMFY_URL` and `COMFY_MCP_DATA_DIR` settings as the running server.
 
 Turning gaming mode on pauses new GPU work through the MCP server. If ComfyUI's queue is idle, the command asks it to unload models and free memory. If it is busy, let the existing work finish and run `gaming-mode on` again to request the unload. The pause persists across restarts. Check `server_status` from your MCP client to confirm it, then switch gaming mode off when you're ready to generate again. Keep ComfyUI running separately.
 
@@ -87,7 +125,7 @@ Turning gaming mode on pauses new GPU work through the MCP server. If ComfyUI's 
 
 Give the following prompt to an agent with terminal access on the machine where you want to run the server.
 
-> Set up Black Rune Render Bridge on this machine using the README from https://github.com/BlackRune-LLC/render-mcp-bridge. Find or help me install my own ComfyUI using its official instructions, verify its API, and identify its input/output directory. Install the MCP server's Python requirements in a virtual environment. Use loopback defaults and keep the token and runtime records in the private user data directory. Register it in the user-scope MCP config for the client I actually use, keeping all existing entries. Handle the bearer token locally and never print it, ask for it in chat, pass it as a command argument, or save it to a project file. If you cannot use it securely, ask me to add it directly to my private client settings. Verify the health endpoint and call `server_status` and `list_jobs` in a fresh MCP client session. Show me the start command and gaming-mode controls. Ask before downloading any models or running a generation job.
+> Set up Render Bridge on this machine using the README and pipeline guide at https://github.com/BlackRune-LLC/render-mcp-bridge. Find my ComfyUI installation, check its API, and identify its data directory. If ComfyUI is missing, use its official installation guide. Use the guided installer in an interactive terminal, or follow manual setup if a terminal handoff is unavailable. Register the server in the user-scope MCP config for the client I actually use. Preserve existing entries and keep tokens in private user settings. Never display tokens, put them on a command line, or ask me to send them in chat. Ask me to complete any required sign-in or gated-model agreement in my browser or terminal. Recommend one pipeline for my hardware, identify its exact model files and nodes, and ask before installing extra nodes, downloading weights, or generating anything. In a fresh client session, verify `server_status`, `list_jobs`, and `list_models`. Show me the launch, gaming-mode, and first-render commands.
 
 ## License
 

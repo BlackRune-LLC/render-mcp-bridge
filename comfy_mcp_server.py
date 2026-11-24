@@ -1208,7 +1208,7 @@ async def build_result(summary: dict[str, Any], images: list[dict[str, Any]], pr
 # ---------------------------------------------------------------------------
 mcp = MCPServer(
     name="comfyui",
-    title="MCP Bridge for ComfyUI",
+    title="Render Bridge",
     instructions=(
         "Provides tools for a locally managed ComfyUI instance. "
         "Use generate_image for game art; set transparent=true for sprites/icons/UI elements (returns RGBA PNG). "
@@ -3938,7 +3938,7 @@ async def amain() -> None:
     token = load_token()
     app = mcp.streamable_http_app(stateless_http=True, host=MCP_HOSTS[0], max_request_body_size=64 * 1024 * 1024)
     sockets = bind_listen_sockets(MCP_HOSTS, MCP_PORT)
-    log(f"ComfyUI MCP listening on {', '.join(MCP_HOSTS)} at port {MCP_PORT}.")
+    log(f"Render Bridge listening on {', '.join(MCP_HOSTS)} at port {MCP_PORT}.")
     # Signed upload and download URLs include their own credentials in query strings.
     server = uvicorn.Server(uvicorn.Config(
         BearerAuth(app, token), host=MCP_HOSTS[0], port=MCP_PORT, log_level="info", access_log=False,
@@ -3955,7 +3955,7 @@ async def amain() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ComfyUI MCP server and local controls")
+    parser = argparse.ArgumentParser(description="Render Bridge MCP server and local controls")
     commands = parser.add_subparsers(dest="command")
     game = commands.add_parser("gaming-mode", help="Pause or resume new GPU work through this MCP server")
     game.add_argument("state", choices=("on", "off", "status"))
