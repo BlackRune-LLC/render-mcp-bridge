@@ -142,7 +142,7 @@ fn resolve_path(path: &Path) -> io::Result<PathBuf> {
     absolute(path)
 }
 
-fn data_dir() -> Result<PathBuf, String> {
+pub(crate) fn data_dir() -> Result<PathBuf, String> {
     let path = if let Some(override_path) = environment_path("COMFY_MCP_DATA_DIR") {
         override_path
     } else {
@@ -711,7 +711,7 @@ pub(crate) fn venv_python(app_dir: &Path) -> PathBuf {
     })
 }
 
-fn atomic_write(destination: &Path, content: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(destination: &Path, content: &[u8]) -> io::Result<()> {
     let parent = destination
         .parent()
         .ok_or_else(|| io::Error::other("missing destination directory"))?;
@@ -728,7 +728,7 @@ fn save_settings(directory: &Path, settings: &Settings) -> io::Result<()> {
     atomic_write(&directory.join("settings.json"), &content)
 }
 
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     let mut builder = DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

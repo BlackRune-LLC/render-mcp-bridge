@@ -219,7 +219,11 @@ struct ApplyWindow {
 
 impl ApplyWindow {
     fn new(ctx: &egui::Context, request: Result<UpdateRequest, String>) -> Self {
-        theme::configure(ctx);
+        let data_dir = request
+            .as_ref()
+            .ok()
+            .map(|request| request.data_dir.as_path());
+        theme::configure(ctx, theme::load(data_dir));
         let mut app = Self {
             worker: None,
             target: None,

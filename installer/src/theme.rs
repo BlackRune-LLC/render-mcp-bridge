@@ -1,13 +1,52 @@
-use eframe::egui::{self, Color32, Stroke, Theme};
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use eframe::egui::{self, Color32, Stroke, Theme, ThemePreference};
+
+use crate::setup;
 use crate::{
     CAUTION, CREAM, ERROR, GREEN, INK, LIME, LINE, MARK_SHADE, MUTED, RAIL, RAIL_ACTIVE, RAIL_TEXT,
     SURFACE, VIOLET,
 };
 
-pub fn configure(ctx: &egui::Context) {
-    ctx.options_mut(|options| options.fallback_theme = Theme::Light);
-    ctx.set_theme(egui::ThemePreference::System);
+const PREFERENCE_FILE: &str = "appearance-theme";
+
+fn preference_directory(data_dir: Option<&Path>) -> Result<PathBuf, String> {
+    match data_dir {
+        Some(directory) if directory.is_absolute() => Ok(directory.to_path_buf()),
+        Some(_) => Err("The Render Bridge data directory must be an absolute path.".into()),
+        None => setup::data_dir(),
+    }
+}
+
+pub fn load(data_dir: Option<&Path>) -> ThemePreference {
+    let saved = preference_directory(data_dir)
+        .ok()
+        .and_then(|directory| fs::read_to_string(directory.join(PREFERENCE_FILE)).ok());
+    match saved.as_deref().map(str::trim) {
+        Some("light") => ThemePreference::Light,
+        Some("system") => ThemePreference::System,
+        _ => ThemePreference::Dark,
+    }
+}
+
+pub fn save(data_dir: Option<&Path>, preference: ThemePreference) -> Result<(), String> {
+    let directory = preference_directory(data_dir)?;
+    let content = match preference {
+        ThemePreference::Dark => b"dark\n".as_slice(),
+        ThemePreference::Light => b"light\n",
+        ThemePreference::System => b"system\n",
+    };
+    setup::create_private_dir(&directory)
+        .and_then(|()| setup::atomic_write(&directory.join(PREFERENCE_FILE), content))
+        .map_err(|_| {
+            "Could not save the appearance preference. Check the data folder permissions.".into()
+        })
+}
+
+pub fn configure(ctx: &egui::Context, preference: ThemePreference) {
+    ctx.options_mut(|options| options.fallback_theme = Theme::Dark);
+    ctx.set_theme(preference);
     for theme in [Theme::Light, Theme::Dark] {
         ctx.style_mut_of(theme, |style| {
             let color = |role| palette(theme, role);
@@ -81,10 +120,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn saves_each_theme_without_touching_the_installation_settings() {
+        let fixture = tempfile::tempdir().unwrap();
+        let data = fixture.path().join("selected-installation");
+        let other = fixture.path().join("other-installation");
+        std::fs::create_dir(&data).unwrap();
+        let settings = data.join("settings.json");
+        std::fs::write(&settings, b"fixture setup").unwrap();
+
+        assert_eq!(load(Some(&data)), egui::ThemePreference::Dark);
+        for preference in [
+            egui::ThemePreference::Light,
+            egui::ThemePreference::System,
+            egui::ThemePreference::Dark,
+        ] {
+            save(Some(&data), preference).unwrap();
+            assert_eq!(load(Some(&data)), preference);
+            assert_eq!(load(Some(&other)), egui::ThemePreference::Dark);
+            assert_eq!(std::fs::read(&settings).unwrap(), b"fixture setup");
+        }
+        std::fs::write(data.join(PREFERENCE_FILE), b"unknown").unwrap();
+        assert_eq!(load(Some(&data)), egui::ThemePreference::Dark);
+    }
+
+    #[test]
+    fn fixed_preference_takes_precedence_over_system_appearance() {
+        let ctx = egui::Context::default();
+        for (preference, system, selected) in [
+            (egui::ThemePreference::Dark, Theme::Light, Theme::Dark),
+            (egui::ThemePreference::Light, Theme::Dark, Theme::Light),
+        ] {
+            configure(&ctx, preference);
+            let input = egui::RawInput {
+                system_theme: Some(system),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| assert_eq!(ctx.theme(), selected));
+        }
+    }
+
+    #[test]
     fn follows_system_theme_without_making_the_window_background_translucent() {
         let ctx = egui::Context::default();
-        configure(&ctx);
-        assert_eq!(ctx.theme(), Theme::Light);
+        configure(&ctx, ThemePreference::System);
+        assert_eq!(ctx.theme(), Theme::Dark);
         for theme in [Theme::Dark, Theme::Light] {
             let input = egui::RawInput {
                 system_theme: Some(theme),

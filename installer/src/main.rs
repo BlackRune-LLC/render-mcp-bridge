@@ -143,6 +143,7 @@ struct StartupSetting {
     open: bool,
     enabled: Option<bool>,
     error: Option<String>,
+    appearance_error: Option<String>,
 }
 
 #[cfg(windows)]
@@ -161,13 +162,45 @@ impl StartupSetting {
         }
     }
 
-    fn show(&mut self, ctx: &egui::Context) {
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        appearance: &mut egui::ThemePreference,
+        data_dir: Option<&Path>,
+    ) {
         if !self.open {
             return;
         }
         let response = panel_modal(ctx, "render-bridge-settings").show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading("Render Bridge Settings");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Theme");
+                for (label, preference) in [
+                    ("Dark", egui::ThemePreference::Dark),
+                    ("Light", egui::ThemePreference::Light),
+                    ("System", egui::ThemePreference::System),
+                ] {
+                    let button = egui::Button::new(label)
+                        .selected(*appearance == preference)
+                        .min_size(egui::vec2(65.0, 30.0));
+                    if ui.add(button).clicked() && *appearance != preference {
+                        match theme::save(data_dir, preference) {
+                            Ok(()) => {
+                                *appearance = preference;
+                                self.appearance_error = None;
+                                ctx.set_theme(preference);
+                                ctx.request_repaint();
+                            }
+                            Err(error) => self.appearance_error = Some(error),
+                        }
+                    }
+                }
+            });
+            if let Some(error) = &self.appearance_error {
+                status(ui, "Theme setting unavailable", error, CAUTION);
+            }
+            ui.separator();
             if let Some(mut enabled) = self.enabled
                 && ui
                     .checkbox(&mut enabled, "Start hidden when I sign in")
@@ -305,6 +338,8 @@ struct Installer {
     #[cfg(windows)]
     startup_setting: Option<StartupSetting>,
     #[cfg(windows)]
+    appearance: egui::ThemePreference,
+    #[cfg(windows)]
     monitor_error: Option<String>,
     #[cfg(windows)]
     update: update_ui::UpdateDialog,
@@ -312,7 +347,15 @@ struct Installer {
 
 impl Installer {
     fn new(ctx: &egui::Context, mode: LaunchMode) -> Self {
-        theme::configure(ctx);
+        let data_dir = match &mode {
+            LaunchMode::Controls {
+                target: MonitorTarget::Installation(directory),
+                ..
+            } => Some(directory.as_path()),
+            _ => None,
+        };
+        let appearance = theme::load(data_dir);
+        theme::configure(ctx, appearance);
         let mut installer = Self {
             step: Step::Prerequisites,
             python: None,
@@ -352,6 +395,8 @@ impl Installer {
             tray_error: None,
             #[cfg(windows)]
             startup_setting: None,
+            #[cfg(windows)]
+            appearance,
             #[cfg(windows)]
             monitor_error: None,
             #[cfg(windows)]
@@ -1806,7 +1851,11 @@ impl Installer {
             });
         #[cfg(windows)]
         if let Some(setting) = &mut self.startup_setting {
-            setting.show(ctx);
+            let data_dir = self
+                .controls
+                .as_ref()
+                .and_then(|controls| controls.data_dir.as_deref());
+            setting.show(ctx, &mut self.appearance, data_dir);
         }
         #[cfg(windows)]
         {
@@ -2465,6 +2514,7 @@ fn startup_setting(mode: &LaunchMode) -> Option<StartupSetting> {
         open: false,
         enabled: None,
         error: None,
+        appearance_error: None,
     })
 }
 

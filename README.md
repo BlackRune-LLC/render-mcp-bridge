@@ -47,7 +47,7 @@ To keep the Bridge running after closing setup, use **Shutdown and terminal comm
 
 #### Windows control panel
 
-In the installer built from current source, choose **Open Render Bridge** on **Connect** to launch the compact panel. It also has a per-user **Render Bridge** entry in the Windows Start menu. The panel follows Windows light or dark appearance.
+In the installer built from current source, choose **Open Render Bridge** on **Connect** to launch the compact panel. It also has a per-user **Render Bridge** entry in the Windows Start menu. Dark is the default. In **Settings**, choose **Light**, **Dark**, or **System** to follow Windows appearance.
 
 - **Jobs** shows running and queued jobs for the local ComfyUI address selected in setup. When ComfyUI sends progress for a running stage, the panel shows its step count and percentage.
 - **Start server** starts Render Bridge using your saved installation. When the server is running, the muted button remains clickable to confirm its status. The red **Stop server** button stops the session started by this panel after you review the queue and confirm. Manage ComfyUI in its own app or through its launch command.
