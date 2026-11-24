@@ -389,7 +389,10 @@ EDIT_MODELS = {
 }
 THREE_D_WORKFLOW = os.environ.get("COMFY_3D_WORKFLOW")
 COMFY_ROOT = Path(os.environ.get("COMFY_ROOT", Path.home() / "ComfyUI")).expanduser()
-COMFY_DIRS = {"output": COMFY_ROOT / "output", "input": COMFY_ROOT / "input"}
+COMFY_DIRS = {
+    kind: Path(os.environ.get(f"COMFY_{kind.upper()}_DIR", COMFY_ROOT / kind)).expanduser()
+    for kind in ("input", "output")
+}
 GLTF_TRANSFORM_CLI = os.environ.get("GLTF_TRANSFORM_CLI")
 THREE_D_TIMEOUT_S = 2400
 BG_REMOVAL_MODEL = "birefnet.safetensors"  # BiRefNet, MIT licence
@@ -399,7 +402,11 @@ TRANSPARENT_HINT = ", isolated on a plain solid white background, centered, full
 # ---------------------------------------------------------------------------
 # ComfyUI client helpers
 # ---------------------------------------------------------------------------
-_http = httpx.AsyncClient(base_url=COMFY_URL, timeout=httpx.Timeout(60.0, connect=5.0))
+_http = httpx.AsyncClient(
+    base_url=COMFY_URL,
+    timeout=httpx.Timeout(60.0, connect=5.0),
+    trust_env=not bool(os.environ.get("RENDER_BRIDGE_MANAGED_ID")),
+)
 _model_cache: dict[str, Any] = {"t": 0.0, "lists": {}}
 
 # ---------------------------------------------------------------------------
@@ -3863,6 +3870,8 @@ class BearerAuth:
             if scope.get("path") == "/health":
                 status = "paused" if PAUSE_FLAG.exists() else "ok" if await comfy_up() else "stopped"
                 body = {"mcp": "ok", "comfyui": status}
+                if managed_id := os.environ.get("RENDER_BRIDGE_MANAGED_ID"):
+                    body["wizard_session"] = managed_id
                 await JSONResponse(body)(scope, receive, send)
                 return
             if scope.get("path", "").startswith("/files/") and scope.get("method") in ("GET", "HEAD"):
@@ -3940,9 +3949,22 @@ async def amain() -> None:
     sockets = bind_listen_sockets(MCP_HOSTS, MCP_PORT)
     log(f"Render Bridge listening on {', '.join(MCP_HOSTS)} at port {MCP_PORT}.")
     # Signed upload and download URLs include their own credentials in query strings.
+    managed = bool(os.environ.get("RENDER_BRIDGE_MANAGED_ID"))
     server = uvicorn.Server(uvicorn.Config(
         BearerAuth(app, token), host=MCP_HOSTS[0], port=MCP_PORT, log_level="info", access_log=False,
+        timeout_graceful_shutdown=1 if managed else None,
     ))
+    if managed:
+        # Closing the wizard's stdin pipe also reaches Python through the
+        # Windows venv redirector and stops the actual server process.
+        import sys
+        import threading
+
+        def stop_on_wizard_exit() -> None:
+            sys.stdin.read()
+            server.should_exit = True
+
+        threading.Thread(target=stop_on_wizard_exit, daemon=True).start()
     watcher = asyncio.create_task(idle_watcher())
     try:
         await server.serve(sockets=sockets)
@@ -3958,13 +3980,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Render Bridge MCP server and local controls")
     commands = parser.add_subparsers(dest="command")
     game = commands.add_parser("gaming-mode", help="Pause or resume new GPU work through this MCP server")
-    game.add_argument("state", choices=("on", "off", "status"))
+    game.add_argument("state", choices=("on", "off", "status", "toggle"))
     args = parser.parse_args()
     if args.command is None:
         asyncio.run(amain())
-    elif args.state == "on":
+    elif args.state == "on" or (args.state == "toggle" and not PAUSE_FLAG.exists()):
         asyncio.run(enable_gaming_mode())
-    elif args.state == "off":
+    elif args.state in ("off", "toggle"):
         set_gaming_mode(False)
         print("Gaming mode is off.")
     else:

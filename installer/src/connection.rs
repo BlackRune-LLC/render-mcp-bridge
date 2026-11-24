@@ -1,0 +1,209 @@
+use crate::setup::{self, Installed};
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, TcpListener};
+use std::process::{Child, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Client {
+    Claude,
+    Codex,
+}
+
+impl Client {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
+}
+
+pub struct RunningBridge {
+    child: Child,
+    marker: tempfile::NamedTempFile,
+    settings: setup::Settings,
+}
+
+impl RunningBridge {
+    fn start(installed: &Installed, settings: &setup::Settings) -> Result<Self, String> {
+        let origin = origin(installed)?;
+        let port = url::Url::parse(origin)
+            .ok()
+            .and_then(|url| url.port_or_known_default())
+            .ok_or("The Bridge port is missing.")?;
+        drop(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|error| {
+            if error.kind() == ErrorKind::AddrInUse {
+                format!("Port {port} is already in use. Stop the other listener or reopen setup with a different MCP_PORT.")
+            } else {
+                format!("Could not listen on port {port}. Check your permissions or reopen setup with a different MCP_PORT.")
+            }
+        })?);
+        let marker = tempfile::NamedTempFile::new_in(&installed.app_dir)
+            .map_err(|_| "Could not prepare the Bridge startup check.")?;
+        let id = marker
+            .path()
+            .file_name()
+            .ok_or("Could not prepare a Bridge session ID.")?;
+        let data_dir = installed
+            .app_dir
+            .parent()
+            .ok_or("The Bridge data directory is missing.")?;
+        let child = setup::quiet_command(setup::venv_python(&installed.app_dir))
+            .arg(installed.app_dir.join("comfy_mcp_server.py"))
+            .current_dir(&installed.app_dir)
+            .stdin(Stdio::piped())
+            .env("COMFY_MCP_DATA_DIR", data_dir)
+            .env("COMFY_ROOT", &settings.comfy_root)
+            .env("COMFY_URL", &settings.comfy_url)
+            .env("COMFY_INPUT_DIR", setup::folder(settings, "input"))
+            .env("COMFY_OUTPUT_DIR", setup::folder(settings, "output"))
+            .env("MCP_HOST", "127.0.0.1")
+            .env("MCP_PORT", port.to_string())
+            .env("MCP_TOKEN_FILE", &installed.token_path)
+            .env("PUBLIC_URLS", format!("local={origin}"))
+            .env("RENDER_BRIDGE_MANAGED_ID", id)
+            .spawn()
+            .map_err(|_| "Could not start Render Bridge. Run the copied start command in a terminal for details.")?;
+        Ok(Self {
+            child,
+            marker,
+            settings: settings.clone(),
+        })
+    }
+
+    pub fn id(&self) -> String {
+        self.marker
+            .path()
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for RunningBridge {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.is_running() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+        }
+        if self.is_running() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn origin(installed: &Installed) -> Result<&str, String> {
+    installed
+        .mcp_url
+        .strip_suffix("/mcp")
+        .ok_or_else(|| "The Bridge MCP URL is invalid.".into())
+}
+
+pub fn start_and_verify(
+    installed: &Installed,
+    running: &mut Option<RunningBridge>,
+    clients: &[Client],
+    codex_profile: &str,
+) -> Result<serde_json::Value, String> {
+    if clients.contains(&Client::Codex)
+        && (codex_profile.len() > 80
+            || !codex_profile
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-')))
+    {
+        return Err(
+            "Use letters, numbers, hyphens, or underscores in the Codex profile name.".into(),
+        );
+    }
+    let settings = setup::saved_install_settings(installed)?;
+    let paired = match setup::recheck_folders(&settings) {
+        Ok(paired) => paired,
+        Err(message) => {
+            *running = None;
+            return Err(message);
+        }
+    };
+    if !running
+        .as_mut()
+        .is_some_and(|bridge| bridge.settings == settings && bridge.is_running())
+    {
+        *running = None;
+        *running = Some(RunningBridge::start(installed, &settings)?);
+    }
+    let bridge = running.as_ref().ok_or("Render Bridge did not start.")?;
+    let mut result = verify(installed, &bridge.id(), clients, codex_profile)?;
+    result["folders"] = paired.into();
+    Ok(result)
+}
+
+fn verify(
+    installed: &Installed,
+    id: &str,
+    clients: &[Client],
+    codex_profile: &str,
+) -> Result<serde_json::Value, String> {
+    let origin = origin(installed)?;
+    let agent = setup::loopback_agent(Duration::from_secs(4));
+    let deadline = Instant::now() + Duration::from_secs(14);
+    loop {
+        let result = setup::fetch_json(&agent, origin, "/health");
+        if result
+            .as_ref()
+            .and_then(|health| health["wizard_session"].as_str())
+            == Some(id)
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("The wizard could not confirm its Bridge is listening. Check the port or run the copied start command in a terminal for details.".into());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let mut command = setup::quiet_command(setup::venv_python(&installed.app_dir));
+    command
+        .arg(installed.app_dir.join("verify_render_bridge.py"))
+        .arg(&installed.mcp_url)
+        .arg(&installed.token_path);
+    if clients.contains(&Client::Codex) && !codex_profile.is_empty() {
+        command.args(["--codex-profile", codex_profile]);
+    }
+    let output = command
+        .args(clients.iter().map(|client| client.key()))
+        .current_dir(&installed.app_dir)
+        .stdout(Stdio::piped())
+        .output()
+        .map_err(|_| "The connection check could not start.")?;
+    if !output.status.success() {
+        return Err("The connection check exited unexpectedly. Reopen setup and try again.".into());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| "The connection check did not return a result.".into())
+}
+
+pub fn profile_path(client: Client) -> Option<std::path::PathBuf> {
+    let (variable, subdir, file) = match client {
+        Client::Claude => ("CLAUDE_CONFIG_DIR", "", ".claude.json"),
+        Client::Codex => ("CODEX_HOME", ".codex", "config.toml"),
+    };
+    let root = std::env::var_os(variable)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join(subdir)))?;
+    Some(root.join(file))
+}

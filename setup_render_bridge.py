@@ -17,6 +17,7 @@ MODEL_GUIDE = "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs
 CLIENT_GUIDE = "https://github.com/BlackRune-LLC/render-mcp-bridge#connect-an-mcp-client"
 COMFY_INSTALL = "https://docs.comfy.org/installation/manual_install"
 SETTINGS_KEYS = {"COMFY_ROOT", "COMFY_URL"}
+OPTIONAL_SETTINGS = {"COMFY_INPUT_DIR", "COMFY_OUTPUT_DIR"}
 MINIMUM_PYTHON = (3, 11)
 PROBE_TIMEOUT = 3
 PROBE_LIMIT = 1024 * 1024
@@ -46,7 +47,7 @@ def load_settings(path: Path) -> dict[str, str]:
         return {}
     if (
         not isinstance(settings, dict)
-        or settings.keys() != SETTINGS_KEYS
+        or not SETTINGS_KEYS <= settings.keys() <= SETTINGS_KEYS | OPTIONAL_SETTINGS
         or any(not isinstance(value, str) or not value for value in settings.values())
     ):
         raise ValueError("Invalid setup settings.")
@@ -58,7 +59,7 @@ def save_settings(path: Path, settings: dict[str, str]) -> None:
     fd, temporary = tempfile.mkstemp(prefix=".render-bridge-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump({key: settings[key] for key in sorted(SETTINGS_KEYS)}, stream, indent=2)
+            json.dump(settings, stream, indent=2, sort_keys=True)
             stream.write("\n")
         os.replace(temporary, path)
     finally:
@@ -231,7 +232,13 @@ def launch(settings_path: Path, server_args: list[str]) -> int:
     try:
         settings["COMFY_URL"] = backend_url(settings["COMFY_URL"])
         root = settings["COMFY_ROOT"]
-        settings["COMFY_ROOT"] = str(Path(root).expanduser().resolve() if server_args else comfy_root(root))
+        settings["COMFY_ROOT"] = str(Path(root).expanduser().resolve())
+        for kind in ("input", "output"):
+            key = f"COMFY_{kind.upper()}_DIR"
+            folder = Path(settings[key]).expanduser().resolve() if key in settings else Path(settings["COMFY_ROOT"]) / kind
+            if not server_args and not folder.is_dir():
+                raise ValueError("Missing ComfyUI directory.")
+            settings[key] = str(folder)
     except (OSError, ValueError):
         print("The saved ComfyUI directory or URL is invalid. Rerun setup.", file=sys.stderr)
         return 1
@@ -242,21 +249,29 @@ def launch(settings_path: Path, server_args: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install, start, or control a local Render Bridge server.")
+    parser.add_argument("--data-dir", type=Path, help="Use the selected Render Bridge installation data directory.")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("install", help="Run guided setup (the default).")
     commands.add_parser("start", help="Run the configured server in the foreground.")
     gaming = commands.add_parser("gaming-mode", help="Pause or resume work through the configured server.")
-    gaming.add_argument("state", choices=("on", "off", "status"))
+    gaming.add_argument("state", choices=("on", "off", "status", "toggle"))
+    gaming.add_argument("--wait", action="store_true", help="Keep the shortcut's terminal open until Enter.")
     args = parser.parse_args(argv)
     if sys.version_info < MINIMUM_PYTHON:
         print("Render Bridge setup requires Python 3.11 or newer.", file=sys.stderr)
         return 1
     try:
-        settings_path = data_dir() / "settings.json"
+        settings_path = (args.data_dir.expanduser().resolve() if args.data_dir else data_dir()) / "settings.json"
         if args.command in {None, "install"}:
             return install(settings_path)
         server_args = ["gaming-mode", args.state] if args.command == "gaming-mode" else []
-        return launch(settings_path, server_args)
+        result = launch(settings_path, server_args)
+        if args.command == "gaming-mode" and args.wait and sys.stdin.isatty():
+            try:
+                input("Press Enter to close this Gaming Mode window.")
+            except EOFError:
+                pass
+        return result
     except (EOFError, KeyboardInterrupt):
         print("\nRender Bridge command stopped.", file=sys.stderr)
         return 130

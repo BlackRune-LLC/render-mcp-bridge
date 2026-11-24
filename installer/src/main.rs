@@ -1,7 +1,11 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod connection;
+mod discovery;
 mod setup;
+mod shortcuts;
 
+use connection::{Client, RunningBridge};
 use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui, Vec2};
 use setup::{Installed, ModelCheck, Settings};
 use std::path::Path;
@@ -45,12 +49,14 @@ const STEPS: [(Step, &str, &str); 4] = [
 
 enum Event {
     Checked(CheckOutcome),
+    Discovered(Vec<discovery::Instance>),
+    Verified(Option<RunningBridge>, Result<serde_json::Value, String>),
     Progress(String),
     Finished(Result<Installed, String>),
 }
 
 enum CheckOutcome {
-    Models(Vec<ModelCheck>),
+    Models(Vec<ModelCheck>, bool),
     Offline(String),
     Failed(String),
 }
@@ -64,6 +70,17 @@ struct Installer {
     install_error: Option<String>,
     installed: Option<Installed>,
     copied: Option<&'static str>,
+    instances: Vec<discovery::Instance>,
+    searching: bool,
+    discovery_done: bool,
+    manual_confirmed: bool,
+    gaming_shortcut: bool,
+    shortcut_message: Option<(String, bool)>,
+    running: Option<RunningBridge>,
+    verification: Option<Result<serde_json::Value, String>>,
+    verify_claude: bool,
+    verify_codex: bool,
+    codex_profile: String,
 }
 
 impl Installer {
@@ -90,7 +107,7 @@ impl Installer {
                 state.corner_radius = egui::CornerRadius::same(12);
             }
         });
-        Self {
+        let mut installer = Self {
             step: Step::Comfy,
             settings: setup::default_settings(),
             check: None,
@@ -99,7 +116,22 @@ impl Installer {
             install_error: None,
             installed: None,
             copied: None,
+            instances: Vec::new(),
+            searching: false,
+            discovery_done: false,
+            manual_confirmed: false,
+            gaming_shortcut: false,
+            shortcut_message: None,
+            running: None,
+            verification: None,
+            verify_claude: true,
+            verify_codex: true,
+            codex_profile: String::new(),
+        };
+        if setup::existing_install().is_none() {
+            installer.start_discovery(ctx);
         }
+        installer
     }
 
     fn change_step(&mut self, step: Step) {
@@ -110,13 +142,63 @@ impl Installer {
     fn settings_changed(&mut self) {
         self.check = None;
         self.install_error = None;
+        self.manual_confirmed = false;
     }
 
     fn can_continue(&self) -> bool {
-        matches!(
-            &self.check,
-            Some(CheckOutcome::Models(_) | CheckOutcome::Offline(_))
-        )
+        matches!(self.check, Some(CheckOutcome::Models(_, true)))
+            || (self.manual_confirmed
+                && matches!(
+                    self.check,
+                    Some(CheckOutcome::Models(_, false) | CheckOutcome::Offline(_))
+                ))
+    }
+
+    fn start_discovery(&mut self, ctx: &egui::Context) {
+        let url = self.settings.comfy_url.clone();
+        let ctx = ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.instances.clear();
+        self.searching = true;
+        self.discovery_done = false;
+        if thread::Builder::new()
+            .name("find-comfyui".into())
+            .spawn(move || {
+                let _ = sender.send(Event::Discovered(discovery::discover(&url)));
+                ctx.request_repaint();
+            })
+            .is_ok()
+        {
+            self.worker = Some(receiver);
+        } else {
+            self.searching = false;
+            self.check = Some(CheckOutcome::Failed(
+                "Could not start detection. Try again.".into(),
+            ));
+        }
+    }
+
+    fn use_instance(&mut self, index: usize) {
+        let instance = &self.instances[index];
+        self.settings.comfy_url = instance.url.clone();
+        self.settings.comfy_root = instance
+            .root
+            .as_deref()
+            .or_else(|| instance.input.parent())
+            .unwrap_or(&instance.input)
+            .to_string_lossy()
+            .into_owned();
+        self.settings.comfy_input = instance
+            .root
+            .is_none()
+            .then(|| instance.input.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.settings.comfy_output = instance
+            .root
+            .is_none()
+            .then(|| instance.output.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.settings_changed();
     }
 
     fn start_check(&mut self, ctx: &egui::Context) {
@@ -124,12 +206,18 @@ impl Installer {
         let ctx = ctx.clone();
         let (sender, receiver) = mpsc::channel();
         self.check = None;
+        self.manual_confirmed = false;
         match thread::Builder::new()
             .name("check-comfyui".into())
             .spawn(move || {
                 let result = match setup::validate_settings(&settings) {
                     Ok(settings) => match setup::probe(&settings) {
-                        Ok(models) => CheckOutcome::Models(models),
+                        Ok(result) => {
+                            match setup::verify_folders(&settings, result.reported.as_ref()) {
+                                Ok(verified) => CheckOutcome::Models(result.models, verified),
+                                Err(message) => CheckOutcome::Failed(message),
+                            }
+                        }
                         Err(message) => CheckOutcome::Offline(message),
                     },
                     Err(message) => CheckOutcome::Failed(message),
@@ -143,6 +231,44 @@ impl Installer {
                     "Could not start the ComfyUI check. Try again.".into(),
                 ));
             }
+        }
+    }
+
+    fn start_verification(&mut self, ctx: &egui::Context) {
+        let Some(installed) = self.installed.clone() else {
+            return;
+        };
+        self.verification = None;
+        let mut running = self.running.take();
+        let codex_profile = self.codex_profile.trim().to_owned();
+        let clients: Vec<_> = [
+            (Client::Claude, self.verify_claude),
+            (Client::Codex, self.verify_codex),
+        ]
+        .into_iter()
+        .filter_map(|(client, selected)| selected.then_some(client))
+        .collect();
+        let ctx = ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        if thread::Builder::new()
+            .name("verify-mcp".into())
+            .spawn(move || {
+                let result = connection::start_and_verify(
+                    &installed,
+                    &mut running,
+                    &clients,
+                    &codex_profile,
+                );
+                let _ = sender.send(Event::Verified(running, result));
+                ctx.request_repaint();
+            })
+            .is_ok()
+        {
+            self.worker = Some(receiver);
+        } else {
+            self.verification = Some(Err(
+                "Could not start the connection check. Try again.".into()
+            ));
         }
     }
 
@@ -174,11 +300,38 @@ impl Installer {
                     self.check = Some(result);
                     self.worker = None;
                 }
+                Ok(Event::Discovered(instances)) => {
+                    self.worker = None;
+                    self.searching = false;
+                    self.discovery_done = true;
+                    self.instances = instances;
+                    if self.instances.len() == 1 {
+                        self.use_instance(0);
+                    }
+                }
+                Ok(Event::Verified(running, result)) => {
+                    self.worker = None;
+                    self.running = running;
+                    self.verification = Some(result);
+                }
                 Ok(Event::Progress(message)) => self.progress = message,
                 Ok(Event::Finished(result)) => {
                     self.worker = None;
                     match result {
                         Ok(installed) => {
+                            if self.gaming_shortcut {
+                                self.shortcut_message =
+                                    Some(match shortcuts::create_gaming_shortcut(&installed) {
+                                        Ok(path) => (
+                                            format!(
+                                                "Gaming Mode shortcut created at {}.",
+                                                path.display()
+                                            ),
+                                            true,
+                                        ),
+                                        Err(message) => (message, false),
+                                    });
+                            }
                             self.installed = Some(installed);
                             self.change_step(Step::Connect);
                         }
@@ -188,9 +341,12 @@ impl Installer {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.worker = None;
+                    self.searching = false;
                     let message = "Setup stopped unexpectedly. You can try this step again.".into();
                     if self.step == Step::Install {
                         self.install_error = Some(message);
+                    } else if self.step == Step::Connect {
+                        self.verification = Some(Err(message));
                     } else {
                         self.check = Some(CheckOutcome::Failed(message));
                     }
@@ -254,16 +410,51 @@ impl Installer {
         header(
             ui,
             "Connect to ComfyUI",
-            "Choose the folder where ComfyUI saves files, then check its local API.",
+            "Find a running ComfyUI instance or enter the address and folders for its build.",
         );
         let idle = self.worker.is_none();
         let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            if secondary(ui, "Detect running ComfyUI", idle).clicked() {
+                self.start_discovery(ui.ctx());
+            }
+            if let Some(installed) = setup::existing_install()
+                && secondary(ui, "Open existing setup", idle).clicked()
+            {
+                self.installed = Some(installed);
+                self.change_step(Step::Connect);
+            }
+        });
+        if !self.instances.is_empty() {
+            let mut chosen = None;
+            card(ui, |ui| {
+                field_label(ui, "Detected ComfyUI instances");
+                for (index, instance) in self.instances.iter().enumerate() {
+                    ui.horizontal_wrapped(|ui| {
+                        if secondary(ui, &format!("Use {}", instance.url), idle).clicked() {
+                            chosen = Some(index);
+                        }
+                    });
+                    caption(ui, &format!("Input: {}", instance.input.display()));
+                    caption(ui, &format!("Output: {}", instance.output.display()));
+                }
+            });
+            if let Some(index) = chosen {
+                self.use_instance(index);
+            }
+        } else if self.discovery_done {
+            caption(
+                ui,
+                "No running instance reported its folders. Start ComfyUI or enter the build's address and folders.",
+            );
+        }
         card(ui, |ui| {
             ui.add_enabled_ui(idle, |ui| {
                 let root_label = field_label(ui, "ComfyUI folder");
                 ui.horizontal(|ui| {
                     let width = (ui.available_width() - 108.0).max(150.0);
-                    changed |= text_edit(ui, &mut self.settings.comfy_root, width, root_label);
+                    let mut root_changed =
+                        text_edit(ui, &mut self.settings.comfy_root, width, root_label);
                     if secondary(ui, "Browse…", true).clicked() {
                         let mut dialog =
                             rfd::FileDialog::new().set_title("Choose the ComfyUI folder");
@@ -273,8 +464,13 @@ impl Installer {
                         }
                         if let Some(path) = dialog.pick_folder() {
                             self.settings.comfy_root = path.to_string_lossy().into_owned();
-                            changed = true;
+                            root_changed = true;
                         }
+                    }
+                    if root_changed {
+                        self.settings.comfy_input.clear();
+                        self.settings.comfy_output.clear();
+                        changed = true;
                     }
                 });
                 caption(ui, "Select the folder that contains input and output.");
@@ -282,6 +478,26 @@ impl Installer {
                 let url_label = field_label(ui, "Local API address");
                 let url_width = ui.available_width();
                 changed |= text_edit(ui, &mut self.settings.comfy_url, url_width, url_label);
+                ui.collapsing("Separate input and output folders", |ui| {
+                    let input = field_label(ui, "Input folder override");
+                    changed |= text_edit(
+                        ui,
+                        &mut self.settings.comfy_input,
+                        ui.available_width(),
+                        input,
+                    );
+                    let output = field_label(ui, "Output folder override");
+                    changed |= text_edit(
+                        ui,
+                        &mut self.settings.comfy_output,
+                        ui.available_width(),
+                        output,
+                    );
+                    caption(
+                        ui,
+                        "Leave overrides empty to use input and output under the main folder.",
+                    );
+                });
             });
         });
         if changed {
@@ -293,23 +509,46 @@ impl Installer {
                 self.start_check(ui.ctx());
             }
             ui.hyperlink_to("Install ComfyUI", COMFY_GUIDE);
+            ui.hyperlink_to(
+                "Find your Comfy Desktop port and folders",
+                "https://docs.comfy.org/installation/desktop/usage/instance-management",
+            );
         });
         if self.worker.is_some() {
-            activity(ui, "Checking the local API and model loaders…");
+            activity(
+                ui,
+                if self.searching {
+                    "Finding running ComfyUI instances…"
+                } else {
+                    "Checking the local API and model loaders…"
+                },
+            );
         }
         if let Some(result) = &self.check {
             match result {
-                CheckOutcome::Models(_) => status(
+                CheckOutcome::Models(_, true) => status(
                     ui,
-                    "ComfyUI responded",
-                    "Continue to see which starter files it found.",
+                    "ComfyUI instance verified",
+                    "The running API matched the selected input and output folders.",
                     GREEN,
                 ),
+                CheckOutcome::Models(_, false) => {
+                    status(
+                        ui,
+                        "ComfyUI folder pairing unverified",
+                        "The API responded but did not report enough information to identify its folders.",
+                        CAUTION,
+                    );
+                    ui.checkbox(
+                        &mut self.manual_confirmed,
+                        "I checked these folders against the running ComfyUI build",
+                    );
+                }
                 CheckOutcome::Offline(message) => {
                     status(ui, "Could not verify ComfyUI", message, CAUTION);
-                    caption(
-                        ui,
-                        "You can continue setup while ComfyUI is offline. Start it before using the tools.",
+                    ui.checkbox(
+                        &mut self.manual_confirmed,
+                        "Continue with these folders while ComfyUI is offline",
                     );
                 }
                 CheckOutcome::Failed(message) => {
@@ -326,7 +565,7 @@ impl Installer {
             "Render Bridge uses model files from your ComfyUI installation.",
         );
         match &self.check {
-            Some(CheckOutcome::Models(models)) => {
+            Some(CheckOutcome::Models(models, _)) => {
                 card(ui, |ui| {
                     for (index, model) in models.iter().enumerate() {
                         if index > 0 {
@@ -379,18 +618,26 @@ impl Installer {
         });
     }
 
-    fn install_screen(&self, ui: &mut Ui) {
+    fn install_screen(&mut self, ui: &mut Ui) {
         header(
             ui,
             "Install Render Bridge",
             "Install the bridge for your user account with a dedicated Python environment.",
         );
         card(ui, |ui| {
-            field_label(ui, "ComfyUI folder");
-            code_label(ui, &self.settings.comfy_root);
-            ui.separator();
             field_label(ui, "Local API address");
             code_label(ui, &self.settings.comfy_url);
+            ui.separator();
+            field_label(ui, "ComfyUI input folder");
+            code_label(
+                ui,
+                &setup::folder(&self.settings, "input").to_string_lossy(),
+            );
+            field_label(ui, "ComfyUI output folder");
+            code_label(
+                ui,
+                &setup::folder(&self.settings, "output").to_string_lossy(),
+            );
         });
         ui.add_space(9.0);
         caption(
@@ -402,6 +649,13 @@ impl Installer {
             activity(ui, &self.progress);
             caption(ui, "Keep this window open until installation finishes.");
         }
+        ui.add_enabled_ui(self.worker.is_none(), |ui| {
+            ui.checkbox(&mut self.gaming_shortcut, "Create a Gaming Mode shortcut");
+        });
+        caption(
+            ui,
+            "The shortcut toggles whether agents can start new GPU work.",
+        );
         if let Some(message) = &self.install_error {
             status(ui, "Installation could not finish", message, ERROR);
         }
@@ -411,25 +665,45 @@ impl Installer {
         header(
             ui,
             "Connect your MCP client",
-            "Run the start command in a terminal. Use the endpoint and private token file to register Render Bridge.",
+            "Start the Bridge and check the saved MCP setup for the clients you use.",
         );
         let Some(installed) = &self.installed else {
             return;
         };
         let mut copied = None;
+        let idle = self.worker.is_none();
+        let mut selection_changed = false;
         card(ui, |ui| {
-            field_label(ui, "Installation folder");
-            code_label(ui, &installed.app_dir.to_string_lossy());
-            ui.separator();
-            if copy_row(
-                ui,
-                "Start command",
-                "Copy command",
-                &installed.start_command,
-            ) {
-                copied = Some("Start command copied");
+            ui.add_enabled_ui(idle, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    selection_changed |= ui
+                        .checkbox(&mut self.verify_claude, "Claude Code")
+                        .changed();
+                    selection_changed |= ui.checkbox(&mut self.verify_codex, "Codex").changed();
+                });
+            });
+            for (client, selected) in [
+                (Client::Claude, self.verify_claude),
+                (Client::Codex, self.verify_codex),
+            ] {
+                if selected && let Some(path) = connection::profile_path(client) {
+                    caption(
+                        ui,
+                        &format!("{} settings: {}", client.label(), path.display()),
+                    );
+                }
             }
-            ui.separator();
+            if self.verify_codex {
+                ui.add_enabled_ui(idle, |ui| {
+                    let label = field_label(ui, "Codex profile name (optional)");
+                    selection_changed |=
+                        text_edit(ui, &mut self.codex_profile, ui.available_width(), label);
+                });
+            }
+            caption(
+                ui,
+                "Setup checks these saved user settings and leaves them intact.",
+            );
             if copy_row(ui, "MCP endpoint", "Copy address", &installed.mcp_url) {
                 copied = Some("MCP endpoint copied");
             }
@@ -443,17 +717,81 @@ impl Installer {
                 copied = Some("Token file path copied");
             }
         });
+        if selection_changed {
+            self.verification = None;
+        }
+        ui.hyperlink_to("Configure Claude Code or Codex", CLIENT_GUIDE);
+        if self.worker.is_some() {
+            activity(ui, "Starting the Bridge and checking authenticated MCP…");
+        } else if let Some(verification) = &self.verification {
+            match verification {
+                Err(message) => status(ui, "Verification could not finish", message, ERROR),
+                Ok(result) => {
+                    let (message, passed) =
+                        bridge_status(result["bridge"].as_str().unwrap_or_default());
+                    status(
+                        ui,
+                        "Render Bridge",
+                        message,
+                        if passed { GREEN } else { CAUTION },
+                    );
+                    if result["folders"].as_bool() != Some(true) {
+                        status(
+                            ui,
+                            "ComfyUI folder pairing unverified",
+                            "Confirm the running build's folders before using uploads or asset records.",
+                            CAUTION,
+                        );
+                    }
+                    for client in [Client::Claude, Client::Codex] {
+                        if let Some(value) = result[client.key()].as_str() {
+                            let (message, passed) = client_status(value);
+                            status(
+                                ui,
+                                client.label(),
+                                message,
+                                if passed { GREEN } else { CAUTION },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((message, passed)) = &self.shortcut_message {
+            status(
+                ui,
+                "Gaming Mode shortcut",
+                message,
+                if *passed { GREEN } else { CAUTION },
+            );
+        }
+        caption(
+            ui,
+            "Stop Bridge or close this window to stop the Bridge started here.",
+        );
+        caption(
+            ui,
+            "You can turn Gaming Mode off from the commands below without a shortcut.",
+        );
+        ui.collapsing("Shutdown and terminal commands", |ui| {
+            caption(ui, "For a Bridge started in a terminal, press Ctrl+C in that terminal.");
+            if copy_row(ui, "Start in a terminal", "Copy start command", &installed.start_command) {
+                copied = Some("Start command copied");
+            }
+            if let Some(command) = installed.start_command.strip_suffix(" start") {
+                let gaming_off = format!("{command} gaming-mode off");
+                if copy_row(ui, "Turn Gaming Mode off", "Copy off command", &gaming_off) {
+                    copied = Some("Gaming Mode off command copied");
+                }
+                caption(ui, "Run the off command in a terminal to let agents render again. This works without the shortcut.");
+            }
+        });
         if copied.is_some() {
             self.copied = copied;
         }
         if let Some(message) = self.copied {
             ui.label(RichText::new(message).size(14.0).color(GREEN));
         }
-        caption(
-            ui,
-            "Start the server first if the token file doesn't exist. Enter the token only in your private client settings.",
-        );
-        ui.hyperlink_to("Open MCP client instructions", CLIENT_GUIDE);
     }
 
     fn actions(&mut self, ctx: &egui::Context) {
@@ -469,6 +807,21 @@ impl Installer {
             .show(ctx, |ui| {
                 let idle = self.worker.is_none();
                 ui.horizontal(|ui| {
+                    if self.step == Step::Connect && idle {
+                        if self.running.is_some() {
+                            if secondary(ui, "Stop Bridge", true).clicked() {
+                                self.running = None;
+                                self.verification = None;
+                            }
+                        } else if secondary(ui, "Close", true).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if self.running.is_none() && secondary(ui, "Change ComfyUI", true).clicked()
+                        {
+                            self.settings_changed();
+                            self.change_step(Step::Comfy);
+                        }
+                    }
                     if matches!(self.step, Step::Models | Step::Install)
                         && secondary(ui, "Back", idle).clicked()
                     {
@@ -487,7 +840,8 @@ impl Installer {
                             ),
                             Step::Models => ("Continue to install", self.can_continue() && idle),
                             Step::Install => ("Install Render Bridge", idle),
-                            Step::Connect => ("Done", true),
+                            Step::Connect if self.running.is_some() => ("Verify again", idle),
+                            Step::Connect => ("Start & Verify", idle),
                         };
                         if primary(ui, label, ready).clicked() {
                             match self.step {
@@ -497,9 +851,7 @@ impl Installer {
                                 Step::Comfy => self.start_check(ctx),
                                 Step::Models => self.change_step(Step::Install),
                                 Step::Install => self.start_install(ctx),
-                                Step::Connect => {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close)
-                                }
+                                Step::Connect => self.start_verification(ctx),
                             }
                         }
                     });
@@ -511,7 +863,7 @@ impl Installer {
 impl eframe::App for Installer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_updates();
-        if self.step == Step::Install
+        if matches!(self.step, Step::Install | Step::Connect)
             && self.worker.is_some()
             && ctx.input(|input| input.viewport().close_requested())
         {
@@ -542,6 +894,64 @@ impl eframe::App for Installer {
                         Step::Connect => self.connect_screen(ui),
                     });
             });
+    }
+}
+
+fn bridge_status(code: &str) -> (&'static str, bool) {
+    match code {
+        "ok" => (
+            "Authenticated MCP connection verified. ComfyUI is reachable.",
+            true,
+        ),
+        "comfyui_unavailable" => (
+            "Authenticated MCP connection verified. Start the selected ComfyUI instance before rendering.",
+            false,
+        ),
+        "token_unavailable" => (
+            "The private Bridge token is unavailable. Check its file path and permissions.",
+            false,
+        ),
+        "unauthorized" => (
+            "The Bridge rejected authentication. Check the private token file and try again.",
+            false,
+        ),
+        _ => (
+            "Could not verify authenticated MCP. Check the Bridge and try again.",
+            false,
+        ),
+    }
+}
+
+fn client_status(code: &str) -> (&'static str, bool) {
+    match code {
+        "config_matches" => (
+            "Saved settings match. Open a fresh client session and call server_status.",
+            true,
+        ),
+        "config_missing" | "server_missing" => (
+            "No Bridge entry found. Follow the client setup instructions and verify again.",
+            false,
+        ),
+        "config_unreadable" => (
+            "Could not read these user settings. Check the path and file format.",
+            false,
+        ),
+        "profile_missing" => ("The named Codex profile file was not found.", false),
+        "server_disabled" => ("The Bridge entry is disabled in these settings.", false),
+        "url_mismatch" => ("The saved URL differs from the MCP endpoint above.", false),
+        "token_missing" | "token_mismatch" => (
+            "Use the current token from the private token file in these client settings.",
+            false,
+        ),
+        "auth_unverified" => (
+            "These settings use dynamic authentication. Verify from a fresh client session.",
+            false,
+        ),
+        "auth_conflict" | "config_conflict" => (
+            "Several settings conflict. Choose one matching Bridge entry before verifying again.",
+            false,
+        ),
+        _ => ("Could not verify these saved client settings.", false),
     }
 }
 

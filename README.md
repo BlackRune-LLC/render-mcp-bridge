@@ -18,9 +18,14 @@ cd render-mcp-bridge
 
 [Download Render Bridge Setup v0.1.0 for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe). Open the downloaded executable after installing ComfyUI and Python 3.11 or later. The executable is unsigned. [Release notes, checksum, and third-party notices](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/tag/v0.1.0)
 
-The Rust wizard checks your local ComfyUI connection and shows which starter files ComfyUI can see. Select **Install** to set up the bundled Render Bridge server and its Python dependencies in a per-user virtual environment. Copy the start command from the final screen into a terminal (PowerShell on Windows). Then use the displayed MCP URL and private token file path to [connect your client](#connect-an-mcp-client).
+The Windows v0.1.0 download uses the original wizard. Build from the current source to use ComfyUI detection, **Start & Verify**, and the shortcut checkbox described below.
 
-The desktop installer places the server and virtual environment in the `app` folder inside your Render Bridge user data directory. It saves the chosen ComfyUI folder and local API URL for subsequent launches.
+1. Start ComfyUI, then open the wizard. It checks the selected loopback address, standard ComfyUI addresses, and port hints from current Comfy Desktop builds. Choose your build if several are detected. If its paths cannot be confirmed from its launch settings, copy the actual port from the build's **Overview** and its input and output locations from **Folders**. [Comfy Desktop build settings](https://docs.comfy.org/installation/desktop/usage/instance-management)
+2. Select **Check ComfyUI**. The wizard compares reported folders and checks starter model files. If the API cannot report absolute paths, as with a typical Windows portable launch, browse to the inner `ComfyUI` folder. Setup checks whether ComfyUI can read a temporary marker in each selected folder and removes the markers afterward. Open **Separate input and output folders** when your build uses different locations. If the wizard still cannot confirm the pairing, verify the paths manually or explicitly continue offline.
+3. Select **Install Render Bridge**. This sets up the server and Python environment in the `app` folder inside your Render Bridge user data directory. Select **Create a Gaming Mode shortcut** before installing if you want one.
+4. Select **Start & Verify** with **Claude Code**, **Codex**, or both checked. The wizard starts a local Bridge and makes an authenticated `server_status` call without rendering. It also checks the saved user settings for the selected clients. If you run Codex with a named profile, enter its name to check that file too. If an entry is missing, add it using the displayed endpoint and private token file, following [the client instructions](#connect-an-mcp-client). Select **Verify again**, then open a fresh client session to test that client's effective configuration.
+
+Use **Open existing setup** to return to Connect without reinstalling. **Stop Bridge** or closing the wizard stops its Bridge session. To keep the Bridge running after closing setup, use **Shutdown and terminal commands** to copy the start command. Press **Ctrl+C** in that terminal when you want to stop it.
 
 #### Build the desktop installer
 
@@ -85,6 +90,7 @@ Leave both processes running and check `http://127.0.0.1:8189/health`. Both `mcp
 | Setting | Default and purpose |
 | --- | --- |
 | `COMFY_ROOT` | `~/ComfyUI`. Set this to the actual ComfyUI data directory used for local file transfers. |
+| `COMFY_INPUT_DIR`, `COMFY_OUTPUT_DIR` | Optional absolute paths for builds that use separate input or output folders. The defaults are `input` and `output` under `COMFY_ROOT`. |
 | `COMFY_URL` | `http://127.0.0.1:8188`. Set this if your ComfyUI API uses a different port. |
 | `MCP_HOST`, `MCP_PORT` | `127.0.0.1` and `8189`. |
 | `COMFY_MCP_DATA_DIR` | Per-user data directory. Stores the token, gaming-mode state, and project records. |
@@ -94,9 +100,9 @@ For remote access, keep the MCP server bound to loopback and put an HTTPS revers
 
 ## Connect an MCP client
 
-Add a user-scope server named `comfyui` with Streamable HTTP URL `http://127.0.0.1:8189/mcp` and header `Authorization: Bearer <token>`. Replace `<token>` in your private client settings with the contents of your token file. Preserve any MCP entries you already use. Use another name if `comfyui` is taken.
+Add a user-scope server named `comfyui` with the Streamable HTTP endpoint displayed by setup (default `http://127.0.0.1:8189/mcp`) and header `Authorization: Bearer <token>`. Start the Bridge first to create its token file. Replace `<token>` in your private client settings with that file's contents. Preserve any MCP entries you already use. Use another name if `comfyui` is taken.
 
-For Claude Code, merge this entry into the top-level `mcpServers` object in `~/.claude.json` (`%USERPROFILE%\.claude.json` on Windows). Use your active profile's user config if you configured a custom directory. [Claude Code MCP scopes](https://code.claude.com/docs/en/mcp#user-scope)
+For Claude Code, merge this entry into the top-level `mcpServers` object in `~/.claude.json` (`%USERPROFILE%\.claude.json` on Windows). For a custom profile, launch the wizard with that profile's `CLAUDE_CONFIG_DIR`. [Claude Code MCP scopes](https://code.claude.com/docs/en/mcp#user-scope)
 
 ```json
 {
@@ -108,7 +114,7 @@ For Claude Code, merge this entry into the top-level `mcpServers` object in `~/.
 }
 ```
 
-For Codex, add these tables to `~/.codex/config.toml` (`%USERPROFILE%\.codex\config.toml` on Windows). If you set `CODEX_HOME`, use `config.toml` in that directory. [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+For Codex, add these tables to `~/.codex/config.toml` (`%USERPROFILE%\.codex\config.toml` on Windows). If you set `CODEX_HOME`, use `config.toml` in that directory and launch the wizard with the same setting. [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 
 ```toml
 [mcp_servers.comfyui]
@@ -131,7 +137,7 @@ The [pipeline guide](docs/pipelines.md#what-each-pipeline-does) covers editing, 
 
 ## AI server gaming mode
 
-If you used the desktop installer, copy the start command from its Connect screen and replace the final `start` argument with `gaming-mode on`, `gaming-mode status`, or `gaming-mode off`.
+If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu. It toggles Gaming Mode and reports the new state. If you skipped the shortcut, go to **Connect → Shutdown and terminal commands → Turn Gaming Mode off** and run the copied command in a terminal. To turn it on or check its state, replace the final `off` with `on` or `status`. In the v0.1.0 download, copy the start command and replace the final `start` with `gaming-mode off`.
 
 If you used the terminal installer, open a second terminal in the repo and use the same Python launcher you used for setup (`py -3` on Windows or `python3` on macOS and Linux).
 
