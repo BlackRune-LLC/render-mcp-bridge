@@ -10,6 +10,9 @@ mod icons;
 mod job_progress;
 mod jobs;
 mod jobs_panel;
+mod model_download;
+mod model_library;
+mod model_ui;
 mod models;
 #[cfg(windows)]
 mod python_install;
@@ -437,6 +440,8 @@ impl TrayPanel {
 
 struct ControlsState {
     data_dir: Option<PathBuf>,
+    backend_url: Option<String>,
+    model_root: PathBuf,
     queue: Option<QueueView>,
     next_load: Instant,
     #[cfg(windows)]
@@ -453,7 +458,9 @@ struct Installer {
     selected_python: Option<PathBuf>,
     installation_dir: Option<PathBuf>,
     install_assets: asset_ui::AssetEditor,
-    model_folder: Option<PathBuf>,
+    model_manager: model_ui::ModelManager,
+    models_visible: bool,
+    model_destination_error: Option<String>,
     python_check_failed: bool,
     #[cfg(windows)]
     python_install_offer: bool,
@@ -519,7 +526,9 @@ impl Installer {
             selected_python: None,
             installation_dir: None,
             install_assets: asset_ui::AssetEditor::default(),
-            model_folder: None,
+            model_manager: model_ui::ModelManager::default(),
+            models_visible: false,
+            model_destination_error: None,
             python_check_failed: false,
             #[cfg(windows)]
             python_install_offer: false,
@@ -575,6 +584,10 @@ impl Installer {
                 installer.check_python(ctx);
             }
             LaunchMode::Controls { target, .. } => {
+                let backend_url = match &target {
+                    MonitorTarget::ComfyUrl(url) => Some(url.clone()),
+                    _ => None,
+                };
                 #[cfg(windows)]
                 let update_available_here = matches!(&target, MonitorTarget::Installation(data)
                     if update_handoff::is_installed_monitor(data));
@@ -588,6 +601,8 @@ impl Installer {
                 installer.step = Step::Connect;
                 installer.controls = Some(ControlsState {
                     data_dir,
+                    backend_url,
+                    model_root: PathBuf::new(),
                     queue,
                     next_load: Instant::now(),
                     #[cfg(windows)]
@@ -654,6 +669,12 @@ impl Installer {
 
     #[cfg(windows)]
     fn request_server_action(&mut self, ctx: &egui::Context, action: ServerAction) {
+        if matches!(action, ServerAction::Exit) && self.model_manager.downloading() {
+            self.models_visible = true;
+            self.queue_dialog = None;
+            self.model_manager.cancel();
+            return;
+        }
         if self.worker.is_some() || self.update.blocks_controls() {
             return;
         }
@@ -724,10 +745,12 @@ impl Installer {
                     secondary(ui, "Keep Bridge running", true)
                 }.clicked();
                 let label_text = label.unwrap_or(stop_label);
+                let can_stop = label.is_some()
+                    && !(action == QueueAction::CloseWindow && self.model_manager.downloading());
                 stop = if in_panel {
-                    monitor_button(ui, label_text, label.is_some(), ERROR)
+                    monitor_button(ui, label_text, can_stop, ERROR)
                 } else {
-                    destructive(ui, label_text, label.is_some())
+                    destructive(ui, label_text, can_stop)
                 }.clicked();
             });
             (keep, stop)
@@ -1142,6 +1165,11 @@ impl Installer {
                     self.install_cancel = None;
                     match result {
                         Ok(installed) => {
+                            if let Some(folder) = self.model_manager.destination_change() {
+                                self.model_destination_error =
+                                    model_library::save_destination(&installed.data_dir, folder)
+                                        .err();
+                            }
                             #[cfg(windows)]
                             {
                                 self.monitor_error =
@@ -1612,23 +1640,9 @@ impl Installer {
                 caption(ui, hardware.recommendation());
             });
         }
-        card(ui, |ui| {
-            asset_ui::folder_option(
-                ui,
-                "Model storage folder",
-                &mut self.model_folder,
-                "Use your ComfyUI models folder, or select a folder on another drive.",
-            );
-            if let Some(folder) = &self.model_folder
-                && secondary(ui, "Copy ComfyUI model paths", true).clicked()
-            {
-                ui.ctx().copy_text(model_paths(folder));
-            }
-            ui.hyperlink_to(
-                "Set up a separate model drive",
-                format!("{MODEL_GUIDE}#store-models-on-another-drive"),
-            );
-        });
+        let root = Path::new(&self.settings.comfy_root).join("models");
+        self.model_manager
+            .show(ui, Some(&self.settings.comfy_url), root, None);
         let checks = match &self.check {
             Some(CheckOutcome::Models(checks, _, _)) => checks.as_slice(),
             _ => &[],
@@ -1641,51 +1655,42 @@ impl Installer {
                     .and_then(|check| check.available),
             )
         };
-        for pipeline in models::STARTER_PIPELINES {
-            card(ui, |ui| {
-                field_label(ui, pipeline.name);
-                let (label, color) = model_status(
-                    models::pipeline_status(
-                        pipeline.files.iter().map(|file| file_status(file.filename)),
-                    ),
-                    true,
-                );
-                ui.label(
-                    RichText::new(label)
-                        .strong()
-                        .color(theme::color(ui.ctx(), color)),
-                );
-                caption(ui, pipeline.description);
-                for file in pipeline.files {
-                    ui.separator();
-                    let (label, color) = model_status(file_status(file.filename), false);
+        ui.collapsing("Manual starter downloads", |ui| {
+            for pipeline in models::STARTER_PIPELINES {
+                card(ui, |ui| {
+                    field_label(ui, pipeline.name);
+                    let (label, color) = model_status(
+                        models::pipeline_status(
+                            pipeline.files.iter().map(|file| file_status(file.filename)),
+                        ),
+                        true,
+                    );
                     ui.label(
                         RichText::new(label)
                             .strong()
                             .color(theme::color(ui.ctx(), color)),
                     );
-                    ui.add(egui::Label::new(RichText::new(file.filename).monospace()).wrap());
-                    ui.horizontal_wrapped(|ui| {
+                    caption(ui, pipeline.description);
+                    for file in pipeline.files {
+                        ui.separator();
+                        let (label, color) = model_status(file_status(file.filename), false);
                         ui.label(
-                            RichText::new(file.folder)
-                                .monospace()
-                                .color(theme::color(ui.ctx(), MUTED)),
+                            RichText::new(label)
+                                .strong()
+                                .color(theme::color(ui.ctx(), color)),
                         );
-                        ui.hyperlink_to("Open Hugging Face file", file.source);
-                    });
-                }
-            });
-        }
-        ui.add_space(6.0);
-        caption(
-            ui,
-            "These starter files are public and have no account requirement. Add them to the selected ComfyUI build's model folders, refresh its model list, then check again. File checks do not measure GPU compatibility.",
-        );
-        ui.horizontal_wrapped(|ui| {
-            if secondary(ui, "Check again", self.worker.is_none()).clicked() {
-                self.start_check(ui.ctx());
+                        ui.add(egui::Label::new(RichText::new(file.filename).monospace()).wrap());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(file.folder)
+                                    .monospace()
+                                    .color(theme::color(ui.ctx(), MUTED)),
+                            );
+                            ui.hyperlink_to("Open Hugging Face file", file.source);
+                        });
+                    }
+                });
             }
-            ui.hyperlink_to("Open model and pipeline guide", MODEL_GUIDE);
         });
     }
 
@@ -1771,6 +1776,9 @@ impl Installer {
     }
 
     fn connect_screen(&mut self, ui: &mut Ui) {
+        if let Some(error) = &self.model_destination_error {
+            status(ui, "Model folder choice was not saved", error, CAUTION);
+        }
         header(
             ui,
             "Connect your MCP client",
@@ -1958,6 +1966,14 @@ impl Installer {
         let url = installed.as_ref().and_then(setup::installed_comfy_url);
         let changed = installed.as_ref().map(|current| &current.app_dir)
             != self.installed.as_ref().map(|opened| &opened.app_dir);
+        controls.backend_url = url.clone();
+        if changed || self.models_visible {
+            controls.model_root = installed
+                .as_ref()
+                .and_then(|installed| setup::saved_install_settings(installed).ok())
+                .map(|settings| Path::new(&settings.comfy_root).join("models"))
+                .unwrap_or_default();
+        }
         #[cfg(windows)]
         {
             if changed {
@@ -2034,6 +2050,24 @@ impl Installer {
                             .strong()
                             .color(CREAM),
                     );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let models_fill = if self.models_visible {
+                            RAIL_ACTIVE
+                        } else {
+                            SURFACE
+                        };
+                        if monitor_button(ui, "Models", true, models_fill).clicked() {
+                            self.models_visible = true;
+                        }
+                        let jobs_fill = if self.models_visible {
+                            SURFACE
+                        } else {
+                            RAIL_ACTIVE
+                        };
+                        if monitor_button(ui, "Jobs", true, jobs_fill).clicked() {
+                            self.models_visible = false;
+                        }
+                    });
                 });
             });
         egui::TopBottomPanel::bottom("controls-actions")
@@ -2083,6 +2117,11 @@ impl Installer {
                                 tray.hide(ctx);
                                 return;
                             }
+                            if self.model_manager.downloading() {
+                                self.models_visible = true;
+                                self.model_manager.cancel();
+                                return;
+                            }
                             if self.running.as_mut().is_some_and(RunningBridge::is_running) {
                                 self.show_jobs(QueueAction::CloseWindow);
                                 return;
@@ -2100,6 +2139,17 @@ impl Installer {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 7.0;
+                    if self.models_visible {
+                        if let Some(controls) = &self.controls {
+                            self.model_manager.show(
+                                ui,
+                                controls.backend_url.as_deref(),
+                                controls.model_root.clone(),
+                                controls.data_dir.as_deref(),
+                            );
+                        }
+                        return;
+                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("Jobs").size(23.0).strong());
                         #[cfg(windows)]
@@ -2233,7 +2283,7 @@ impl Installer {
         }
         #[cfg(windows)]
         {
-            let blocked = if self.worker.is_some() {
+            let blocked = if self.worker.is_some() || self.model_manager.downloading() {
                 Some("Wait for the current operation to finish.")
             } else if self.running.as_mut().is_some_and(RunningBridge::is_running) {
                 Some("Stop the server started by this panel before updating.")
@@ -2269,7 +2319,7 @@ impl Installer {
                     .inner_margin(egui::Margin::symmetric(38, 17)),
             )
             .show(ctx, |ui| {
-                let idle = self.worker.is_none();
+                let idle = self.worker.is_none() && !self.model_manager.downloading();
                 ui.horizontal(|ui| {
                     if let Some(cancel) = &self.install_cancel {
                         let cancellable = !cancel.load(Ordering::Relaxed);
@@ -2352,6 +2402,30 @@ impl Installer {
 impl eframe::App for Installer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_updates();
+        self.model_manager.update(ctx);
+        let can_hide = {
+            #[cfg(windows)]
+            {
+                self.tray_panel.is_some()
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        };
+        if self.model_manager.downloading()
+            && ctx.input(|input| input.viewport().close_requested())
+            && !can_hide
+        {
+            self.model_manager.cancel();
+            self.queue_dialog = None;
+            if self.controls.is_some() {
+                self.models_visible = true;
+            } else {
+                self.change_step(Step::Models);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         if self.controls.is_some() {
             #[cfg(windows)]
             {
@@ -2368,6 +2442,7 @@ impl eframe::App for Installer {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 }
                 let guard_exit = self.worker.is_some()
+                    || self.model_manager.downloading()
                     || self.update.blocks_controls()
                     || self.running.as_mut().is_some_and(RunningBridge::is_running);
                 if self
@@ -2387,7 +2462,10 @@ impl eframe::App for Installer {
             }
             #[cfg(windows)]
             if self.tray_panel.is_none() && ctx.input(|input| input.viewport().close_requested()) {
-                if self.worker.is_some() || self.update.blocks_controls() {
+                if self.model_manager.downloading()
+                    || self.worker.is_some()
+                    || self.update.blocks_controls()
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 } else if self.running.as_mut().is_some_and(RunningBridge::is_running) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2411,7 +2489,10 @@ impl eframe::App for Installer {
                 cancel.store(true, Ordering::Relaxed);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        } else if close_requested && self.running.as_mut().is_some_and(RunningBridge::is_running) {
+        } else if close_requested
+            && !self.model_manager.downloading()
+            && self.running.as_mut().is_some_and(RunningBridge::is_running)
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self
                 .queue_dialog

@@ -16,6 +16,8 @@ Run the Python commands inside an isolated virtual environment. Have the clean-m
 
 Verify generation separately on a clean render host with a supported GPU and an actual MCP client. Start without weights, confirm the connection succeeds, and verify that the selected starter reports its missing weights. Install the approved weights and nodes, then generate and download one 512 × 512 PNG with `generate_image`, one playable MP4 with `animate_loop`, and one importable GLB with `image_to_3d`. Open each file from its signed link on the client device. Record the installer version, ComfyUI version, GPU, model choices, and results. [First-render walkthrough](../README.md#make-your-first-render)
 
+Exercise **Models** in setup and after installation. Check inventory against the active backend, confirm a download recognizes the selected model folder, cancel and retry a transfer, and confirm preexisting files stay intact. Verify the library refreshes and the same ComfyUI build reports the newly downloaded weights.
+
 After installing dependencies, disconnect internet access and verify local startup, MCP authentication, queue status, and a file transfer against a simulated ComfyUI backend. Repeat the terminal check with an HTTP proxy configured and confirm the local backend still receives the requests directly. From a clean profile, check that opening the app and leaving it idle creates no internet requests from Render Bridge. Check intentional downloads and Update separately against the [privacy disclosure](../PRIVACY.md).
 
 ## Windows x64

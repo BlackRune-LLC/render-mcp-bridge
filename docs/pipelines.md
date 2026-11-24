@@ -14,6 +14,16 @@ Render Bridge turns your agent's requests into ComfyUI jobs. A **model** is a we
 
 Model weights and custom nodes have their own terms. Check the model card and node repository for the exact files you install.
 
+## Download models in Render Bridge
+
+Open **Models** in setup or in the installed panel. **Download** lists curated file sets for Z-Image Turbo stills, BiRefNet cutouts, and Wan Animate 2 video. It shows each pack's terms, missing download size, and destination before you start. **Installed** shows the files reported by the current ComfyUI build, including manually added models.
+
+Render Bridge uses the model folders the active build reports and verifies the expected size and SHA-256 of each catalog download. Existing model files are kept. Cancel stops the current transfer and keeps completed files. The library refreshes when a download finishes, so the agent can check `list_models` and start a job after the preset appears.
+
+Public catalog files download anonymously. For a file that requires access, accept its terms on Hugging Face and optionally set a read-scoped `HF_TOKEN` in the environment that launches Render Bridge. Reopen Render Bridge from that environment so it can read the token. The app uses it only when Hugging Face asks for access. [Hugging Face token configuration](https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hftoken)
+
+Use the manual pipeline steps below for models and workflows outside the catalog.
+
 ## Recommended first pipeline
 
 Start with **Z-Image Turbo**, the default `generate_image` preset (`z_image_turbo`). It uses ComfyUI core nodes and makes a good first test before adding editing, transparency, or video. The three weights below total about 15 GB of downloads. Disk size and GPU memory use are separate.
@@ -36,7 +46,7 @@ For a one-file illustration starter, choose `anime` instead. Put [`NetaYumev35_p
 
 ## Store models on another drive
 
-Choose **Model storage folder** on Render Bridge's **Models** screen, then select **Copy ComfyUI model paths**. The copied YAML uses the selected folder as the base and expects category subfolders such as `diffusion_models`, `text_encoders`, and `vae` inside it. Put the weights in those folders.
+In **Models → Model storage and Hugging Face**, automatic storage uses the model paths the active build reports. To use an already configured model drive, choose its **Model storage folder**. If you are adding a new drive to ComfyUI, use **Copy model paths** to prepare its configuration. The copied YAML uses the selected folder as the base and expects category subfolders such as `diffusion_models`, `text_encoders`, and `vae` inside it.
 
 - **ComfyUI portable or manual install.** Merge the copied entry into `extra_model_paths.yaml` in the ComfyUI directory. If you only have `extra_model_paths.yaml.example`, use it as a starting point for the new file. Keep existing entries and use a unique name for the new block. [ComfyUI extra model paths](https://docs.comfy.org/installation/manual_install#adding-extra-model-paths) · [Upstream YAML example](https://github.com/Comfy-Org/ComfyUI/blob/master/extra_model_paths.yaml.example)
 - **Comfy Desktop.** Open the build's **Folders** tab and use **Add models folder** to select the external model folder. A build with a YAML entry also offers **Show extra_model_paths.yaml** to locate its file. Merge any YAML entries alongside the build's existing settings. [Comfy Desktop build folders](https://docs.comfy.org/installation/desktop/usage/instance-management#choose-which-folders-the-build-uses)
@@ -49,7 +59,7 @@ The current installer includes the advanced categories below. If you copied YAML
     geometry_estimation: geometry_estimation/
 ```
 
-Restart the selected ComfyUI build after saving the paths. Use **Check again** in the installer or call `list_models` from your agent to confirm the model filenames are available.
+Restart the selected ComfyUI build after saving the paths. Use **Refresh** on the **Models** page or call `list_models` from your agent to confirm the model filenames are available.
 
 ## Check and install nodes
 
