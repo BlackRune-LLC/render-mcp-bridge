@@ -21,8 +21,16 @@ const GREEN: Color32 = Color32::from_rgb(39, 99, 61);
 const LIME: Color32 = Color32::from_rgb(201, 245, 109);
 const CAUTION: Color32 = Color32::from_rgb(118, 72, 25);
 const ERROR: Color32 = Color32::from_rgb(133, 46, 40);
+const MARK_TILE_SIZE: u8 = 19;
+const MARK_TILE_RADIUS: u8 = 7;
+const MARK_TILES: [(f32, f32, Color32); 3] = [
+    (2.0, 23.0, Color32::from_rgb(180, 151, 237)),
+    (13.0, 13.0, RAIL_ACTIVE),
+    (24.0, 3.0, LIME),
+];
 
 const COMFY_GUIDE: &str = "https://docs.comfy.org/installation/manual_install";
+const COMFY_DESKTOP: &str = "https://comfy.org/download";
 const MODEL_GUIDE: &str =
     "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/pipelines.md";
 const CLIENT_GUIDE: &str =
@@ -292,7 +300,8 @@ impl Installer {
             if self.can_continue() && secondary(ui, "Check again", idle).clicked() {
                 self.start_check(ui.ctx());
             }
-            ui.hyperlink_to("Install ComfyUI", COMFY_GUIDE);
+            ui.hyperlink_to("ComfyUI manual setup guide", COMFY_GUIDE);
+            ui.hyperlink_to("Get Comfy Desktop from Comfy Org", COMFY_DESKTOP);
         });
         if self.worker.is_some() {
             activity(ui, "Checking the local API and model loaders…");
@@ -553,16 +562,72 @@ fn header(ui: &mut Ui, title: &str, description: &str) {
 
 fn bridge_mark(ui: &mut Ui) {
     let (bounds, _) = ui.allocate_exact_size(egui::vec2(47.0, 44.0), egui::Sense::hover());
-    for (x, y, color) in [
-        (2.0, 23.0, Color32::from_rgb(180, 151, 237)),
-        (13.0, 13.0, RAIL_ACTIVE),
-        (24.0, 3.0, LIME),
-    ] {
+    let side = f32::from(MARK_TILE_SIZE);
+    for (x, y, color) in MARK_TILES {
         ui.painter().rect_filled(
-            egui::Rect::from_min_size(bounds.min + egui::vec2(x, y), egui::vec2(19.0, 19.0)),
-            7,
+            egui::Rect::from_min_size(bounds.min + egui::vec2(x, y), egui::vec2(side, side)),
+            MARK_TILE_RADIUS,
             color,
         );
+    }
+}
+
+fn inside_rounded_square(point: Vec2, side: f32, radius: f32) -> bool {
+    let half = 0.5 * side;
+    let straight_edge = half - radius;
+    let dx = ((point.x - half).abs() - straight_edge).max(0.0);
+    let dy = ((point.y - half).abs() - straight_edge).max(0.0);
+    dx * dx + dy * dy <= radius * radius
+}
+
+fn installer_icon() -> egui::IconData {
+    const SIZE: u32 = 64;
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    let offsets = [
+        egui::vec2(0.25, 0.25),
+        egui::vec2(0.75, 0.25),
+        egui::vec2(0.25, 0.75),
+        egui::vec2(0.75, 0.75),
+    ];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            // Four samples smooth the rounded edges when the OS scales down the icon.
+            let mut sum = [0_u16; 3];
+            let mut covered = 0_u16;
+            for offset in offsets {
+                let point = egui::vec2(x as f32, y as f32) + offset;
+                if !inside_rounded_square(point, SIZE as f32, 14.0) {
+                    continue;
+                }
+                let mark = (point - egui::vec2(5.0, 5.0)) / 1.2;
+                let color = MARK_TILES
+                    .iter()
+                    .rev()
+                    .find(|(x, y, _)| {
+                        inside_rounded_square(
+                            mark - egui::vec2(*x, *y),
+                            f32::from(MARK_TILE_SIZE),
+                            f32::from(MARK_TILE_RADIUS),
+                        )
+                    })
+                    .map_or(RAIL, |(_, _, color)| *color);
+                for (channel, component) in sum.iter_mut().zip(color.to_array()) {
+                    *channel += u16::from(component);
+                }
+                covered += 1;
+            }
+            if covered == 0 {
+                rgba.extend_from_slice(&[0; 4]);
+            } else {
+                rgba.extend(sum.map(|channel| (channel / covered) as u8));
+                rgba.push(((covered * 255 + 2) / 4) as u8);
+            }
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
     }
 }
 
@@ -654,12 +719,17 @@ fn copy_row(ui: &mut Ui, title: &str, button: &str, value: &str) -> bool {
     clicked
 }
 
+fn installer_viewport() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_inner_size(Vec2::new(990.0, 670.0))
+        .with_min_inner_size(Vec2::new(760.0, 540.0))
+        .with_resizable(true)
+        .with_icon(installer_icon())
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(Vec2::new(990.0, 670.0))
-            .with_min_inner_size(Vec2::new(760.0, 540.0))
-            .with_resizable(true),
+        viewport: installer_viewport(),
         ..Default::default()
     };
     eframe::run_native(
@@ -667,4 +737,24 @@ fn main() -> eframe::Result {
         options,
         Box::new(|creation| Ok(Box::new(Installer::new(&creation.egui_ctx)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_uses_an_explicit_render_bridge_icon() {
+        let icon = installer_viewport().icon.expect("Render Bridge icon");
+        assert_eq!((icon.width, icon.height), (64, 64));
+        assert_eq!(icon.rgba.len(), (64 * 64 * 4) as usize);
+        assert_eq!(&icon.rgba[..4], &[0; 4]);
+        for color in [RAIL, MARK_TILES[0].2, RAIL_ACTIVE, LIME] {
+            assert!(
+                icon.rgba
+                    .chunks_exact(4)
+                    .any(|pixel| pixel == color.to_array())
+            );
+        }
+    }
 }
