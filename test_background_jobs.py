@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import os
 import subprocess
@@ -70,6 +71,22 @@ class ModelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(self.state["models_loaded"])
         self.assertTrue(self.state["last_unload_reason"].startswith("idle "))
+
+    async def test_health_proof_is_bound_to_a_valid_per_request_challenge(self):
+        key = "test_installation_token_fixture_0123456789"
+        challenge = "ab" * 16
+        message = f"rb-health-v2:{challenge}:0:{server.COMFY_URL}".encode()
+        expected = hmac.new(key.encode(), message, "sha256").hexdigest()
+        transport = httpx.ASGITransport(app=server.BearerAuth(None, key))
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            proof = await client.get("/health", headers={"X-Render-Bridge-Challenge": challenge})
+            invalid = await client.get("/health", headers={"X-Render-Bridge-Challenge": "invalid"})
+        self.assertEqual(proof.json()["installation_proof"], expected)
+        self.assertIs(proof.json()["panel_managed"], False)
+        self.assertNotIn("installation_proof", invalid.json())
+        self.assertNotIn("comfyui_url", invalid.json())
+        self.assertNotIn(str(server.COMFY_DIRS["output"]), proof.text)
+        self.assertNotIn(key, proof.text)
 
     async def test_pending_jobs_or_unknown_queue_never_trigger_idle_unload(self):
         for queue in [response(queue_running=[], queue_pending=[{}]), response(state="unknown")]:

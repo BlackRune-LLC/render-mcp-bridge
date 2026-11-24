@@ -100,10 +100,21 @@ pub fn create_monitor_shortcut(installed: &Installed) -> Result<PathBuf, String>
 
 #[cfg(windows)]
 pub fn open_monitor(installed: &Installed) -> Result<(), String> {
+    launch_monitor(installed, None)
+}
+
+#[cfg(windows)]
+pub fn start_monitor(installed: &Installed) -> Result<(), String> {
+    launch_monitor(installed, Some("--start-bridge-in-tray"))
+}
+
+#[cfg(windows)]
+fn launch_monitor(installed: &Installed, option: Option<&str>) -> Result<(), String> {
     let executable = install_current_monitor(&installed.data_dir)?;
     crate::setup::quiet_command(&executable)
         .args(["--job-monitor", "--data-dir"])
         .arg(&installed.data_dir)
+        .args(option)
         .current_dir(&installed.data_dir)
         .spawn()
         .map_err(|_| "Could not open Render Bridge. Try again from setup.".to_owned())?;

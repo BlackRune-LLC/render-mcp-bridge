@@ -5,6 +5,7 @@ mod asset_ui;
 mod connection;
 mod diagnostics;
 mod discovery;
+mod first_render;
 mod icons;
 #[cfg(windows)]
 mod job_progress;
@@ -137,6 +138,7 @@ enum LaunchMode {
     Controls {
         target: MonitorTarget,
         start_hidden: bool,
+        start_server: bool,
     },
 }
 
@@ -144,6 +146,7 @@ enum LaunchMode {
 #[derive(Clone, Copy)]
 enum ServerAction {
     Start,
+    StartSilently,
     Stop,
     Exit,
 }
@@ -401,6 +404,9 @@ impl TrayPanel {
                         _ => self.server_action,
                     };
                 }
+                tray::TrayEvent::StartSilently if !self.exiting && self.server_action.is_none() => {
+                    self.server_action = Some(ServerAction::StartSilently);
+                }
                 tray::TrayEvent::Exit if guard_exit => {
                     self.hidden = false;
                     self.server_action = Some(ServerAction::Exit);
@@ -488,6 +494,9 @@ struct Installer {
     shortcut_message: Option<(String, bool)>,
     running: Option<RunningBridge>,
     verification: Option<Result<serde_json::Value, String>>,
+    first_render: first_render::FirstRender,
+    #[cfg(windows)]
+    finish_requested: bool,
     verify_claude: bool,
     verify_codex: bool,
     codex_profile: String,
@@ -556,6 +565,9 @@ impl Installer {
             shortcut_message: None,
             running: None,
             verification: None,
+            first_render: first_render::FirstRender::default(),
+            #[cfg(windows)]
+            finish_requested: false,
             verify_claude: true,
             verify_codex: true,
             codex_profile: String::new(),
@@ -678,13 +690,15 @@ impl Installer {
         if self.worker.is_some() || self.update.blocks_controls() {
             return;
         }
-        if let Some(setting) = &mut self.startup_setting {
+        if !matches!(action, ServerAction::StartSilently)
+            && let Some(setting) = &mut self.startup_setting
+        {
             setting.open = false;
         }
         match action {
-            ServerAction::Start => {
+            ServerAction::Start | ServerAction::StartSilently => {
                 self.queue_dialog = None;
-                self.start_panel_server(ctx);
+                self.start_panel_server(ctx, matches!(action, ServerAction::StartSilently));
             }
             action @ (ServerAction::Stop | ServerAction::Exit) => {
                 if self.running.as_mut().is_some_and(RunningBridge::is_running) {
@@ -913,7 +927,7 @@ impl Installer {
         };
         self.verification = None;
         self.progress = "Starting the Bridge and checking authenticated MCP…".into();
-        let mut running = self.running.take();
+        let running = self.running.take();
         let codex_profile = self.codex_profile.trim().to_owned();
         let clients: Vec<_> = [
             (Client::Claude, self.verify_claude),
@@ -927,12 +941,22 @@ impl Installer {
         if thread::Builder::new()
             .name("verify-mcp".into())
             .spawn(move || {
-                let result = connection::start_and_verify(
-                    &installed,
-                    &mut running,
-                    &clients,
-                    &codex_profile,
+                #[cfg(windows)]
+                let (running, result) = (
+                    running,
+                    connection::start_installed_and_verify(&installed, &clients, &codex_profile),
                 );
+                #[cfg(not(windows))]
+                let (running, result) = {
+                    let mut running = running;
+                    let result = connection::start_and_verify(
+                        &installed,
+                        &mut running,
+                        &clients,
+                        &codex_profile,
+                    );
+                    (running, result)
+                };
                 let _ = sender.send(Event::Verified(running, result));
                 ctx.request_repaint();
             })
@@ -944,6 +968,32 @@ impl Installer {
                 "Could not start the connection check. Try again.".into()
             ));
         }
+    }
+
+    #[cfg(windows)]
+    fn finish_ready(&self) -> bool {
+        self.verification.as_ref().is_some_and(|result| {
+            result.as_ref().is_ok_and(|result| {
+                matches!(
+                    result["bridge"].as_str(),
+                    Some("ok" | "comfyui_unavailable")
+                )
+            })
+        })
+    }
+
+    #[cfg(windows)]
+    fn panel_manages_listener(&self) -> Option<bool> {
+        self.verification.as_ref()?.as_ref().ok()?["panel_managed"].as_bool()
+    }
+
+    fn server_ready_for_render(&self) -> bool {
+        self.verification.as_ref().is_some_and(|result| {
+            result.as_ref().is_ok_and(|result| {
+                matches!(result["bridge"].as_str(), Some("ok" | "already_running"))
+                    && result["folders"].as_bool() == Some(true)
+            })
+        })
     }
 
     fn rotate_token(&mut self, ctx: &egui::Context, installed: Installed) {
@@ -1015,19 +1065,22 @@ impl Installer {
     }
 
     #[cfg(windows)]
-    fn start_panel_server(&mut self, ctx: &egui::Context) {
+    fn start_panel_server(&mut self, ctx: &egui::Context, force_start: bool) {
         let Some(installed) = self.installed.clone() else {
             return;
         };
         let already_running = || serde_json::json!({ "bridge": "already_running" });
         if self.running.as_mut().is_some_and(RunningBridge::is_running) {
-            self.verification = Some(Ok(already_running()));
+            if self.verification.is_none() {
+                self.verification = Some(Ok(already_running()));
+            }
             return;
         }
-        let confirm_only = self
-            .controls
-            .as_ref()
-            .is_some_and(|controls| controls.bridge_online);
+        let confirm_only = !force_start
+            && self
+                .controls
+                .as_ref()
+                .is_some_and(|controls| controls.bridge_online);
         self.verification = None;
         self.progress = "Checking the Render Bridge server…".into();
         self.running = None;
@@ -1038,7 +1091,14 @@ impl Installer {
             .spawn(move || {
                 let mut running = None;
                 let result = if connection::bridge_is_listening(&installed) {
-                    Ok(already_running())
+                    connection::verify_listener(&installed, &[], "").and_then(|mut result| {
+                        if result["bridge"] == "ok" {
+                            let settings = setup::saved_install_settings(&installed)?;
+                            result["folders"] = setup::recheck_folders(&settings)?.into();
+                            result["bridge"] = "already_running".into();
+                        }
+                        Ok(result)
+                    })
                 } else if confirm_only {
                     Err("The server no longer responds. Check the status and try again.".into())
                 } else {
@@ -1878,6 +1938,8 @@ impl Installer {
                 }
             }
         }
+        let server_verified = self.server_ready_for_render();
+        self.first_render.show(ui, &installed, server_verified);
         if let Some((message, passed)) = &self.shortcut_message {
             status(
                 ui,
@@ -1899,6 +1961,22 @@ impl Installer {
         if secondary(ui, "ComfyUI Jobs", idle).clicked() {
             self.show_jobs(QueueAction::Inspect);
         }
+        #[cfg(windows)]
+        caption(
+            ui,
+            match self.panel_manages_listener() {
+                Some(true) => {
+                    "The installed panel keeps the server running when setup closes. Open Render Bridge to manage it."
+                }
+                Some(false) => {
+                    "The existing server runs outside the panel. Keep its original launcher running to stay connected."
+                }
+                None => {
+                    "Start & Verify starts the server in the installed panel or checks an existing server."
+                }
+            },
+        );
+        #[cfg(not(windows))]
         caption(
             ui,
             "Stop Bridge or close this window to review the queue and stop the Bridge started here.",
@@ -2217,6 +2295,7 @@ impl Installer {
                 #[cfg(not(windows))]
                 let online = self.running.as_mut().is_some_and(RunningBridge::is_running);
                 let can_rotate = self.worker.is_none() && !online;
+                let server_verified = self.server_ready_for_render();
                 let mut rotate = false;
                 let response = panel_modal(ctx, "connect-installed-bridge").show(ctx, |ui| {
                     ui.set_width(360.0);
@@ -2256,6 +2335,9 @@ impl Installer {
                     } else if self.worker.is_some() {
                         caption(ui, &self.progress);
                     }
+                    ui.collapsing("First render test", |ui| {
+                        self.first_render.show(ui, &installed, server_verified);
+                    });
                         });
                     secondary(ui, "Done", true).clicked()
                 });
@@ -2372,6 +2454,15 @@ impl Installer {
                                 ("Retry installation", idle)
                             }
                             Step::Install => ("Install Render Bridge", idle),
+                            #[cfg(windows)]
+                            Step::Connect if self.finish_ready() => (
+                                if self.panel_manages_listener() == Some(true) {
+                                    "Finish and keep running"
+                                } else {
+                                    "Finish setup"
+                                },
+                                idle,
+                            ),
                             Step::Connect if self.running.is_some() => ("Verify again", idle),
                             Step::Connect => ("Start & Verify", idle),
                         };
@@ -2390,7 +2481,13 @@ impl Installer {
                                 Step::Comfy => self.start_check(ctx),
                                 Step::Models => self.change_step(Step::Install),
                                 Step::Install => self.start_install(ctx),
-                                Step::Connect => self.start_verification(ctx),
+                                Step::Connect => {
+                                    #[cfg(windows)]
+                                    {
+                                        self.finish_requested = self.finish_ready();
+                                    }
+                                    self.start_verification(ctx);
+                                }
                             }
                         }
                     });
@@ -2402,6 +2499,14 @@ impl Installer {
 impl eframe::App for Installer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_updates();
+        #[cfg(windows)]
+        if self.finish_requested && self.worker.is_none() {
+            self.finish_requested = false;
+            if self.finish_ready() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+        }
         self.model_manager.update(ctx);
         let can_hide = {
             #[cfg(windows)]
@@ -2445,19 +2550,22 @@ impl eframe::App for Installer {
                     || self.model_manager.downloading()
                     || self.update.blocks_controls()
                     || self.running.as_mut().is_some_and(RunningBridge::is_running);
-                if self
+                let hidden = self
                     .tray_panel
                     .as_mut()
-                    .is_some_and(|tray| tray.update(ctx, guard_exit))
-                {
-                    return;
-                }
-                if let Some(action) = self
-                    .tray_panel
-                    .as_mut()
-                    .and_then(|tray| tray.server_action.take())
-                {
+                    .is_some_and(|tray| tray.update(ctx, guard_exit));
+                let busy = self.worker.is_some() || self.update.blocks_controls();
+                let action = self.tray_panel.as_mut().and_then(|tray| {
+                    if busy && matches!(tray.server_action, Some(ServerAction::StartSilently)) {
+                        return None;
+                    }
+                    tray.server_action.take()
+                });
+                if let Some(action) = action {
                     self.request_server_action(ctx, action);
+                }
+                if hidden {
+                    return;
                 }
             }
             #[cfg(windows)]
@@ -2579,6 +2687,14 @@ fn bridge_status(code: &str) -> (&'static str, bool) {
         ),
         "unauthorized" => (
             "The Bridge rejected authentication. Check the private token file and try again.",
+            false,
+        ),
+        "owner_unverified" => (
+            "The listener on this port could not prove it belongs to this installation. If you just repaired Render Bridge, exit its previous panel or terminal and retry. For another service, choose a free MCP port.",
+            false,
+        ),
+        "backend_mismatch" => (
+            "The existing server uses a different ComfyUI address or asset folders. Stop it from its launcher before starting Render Bridge with the selected settings.",
             false,
         ),
         _ => (
@@ -2969,9 +3085,15 @@ fn launch_mode(mut args: impl Iterator<Item = std::ffi::OsString>) -> LaunchMode
     let flag = args.next();
     let value = args.next();
     let option = args.next();
-    let start_hidden = option
-        .as_deref()
-        .is_some_and(|value| value == "--start-in-tray");
+    let start_server = cfg!(windows)
+        && flag.as_deref().is_some_and(|value| value == "--data-dir")
+        && option
+            .as_deref()
+            .is_some_and(|value| value == "--start-bridge-in-tray");
+    let start_hidden = start_server
+        || option
+            .as_deref()
+            .is_some_and(|value| value == "--start-in-tray");
     let valid_options = (option.is_none() || start_hidden) && args.next().is_none();
     let target = match (
         valid_options,
@@ -2989,6 +3111,7 @@ fn launch_mode(mut args: impl Iterator<Item = std::ffi::OsString>) -> LaunchMode
     };
     LaunchMode::Controls {
         start_hidden: start_hidden && !matches!(&target, MonitorTarget::Missing),
+        start_server: start_server && matches!(&target, MonitorTarget::Installation(_)),
         target,
     }
 }
@@ -3143,6 +3266,45 @@ mod launch_tests {
 
     #[cfg(windows)]
     #[test]
+    fn setup_starts_the_selected_installation_in_the_tray() {
+        let folder = std::env::current_dir()
+            .unwrap()
+            .join("Render Bridge fixture");
+        let arguments = [
+            OsString::from("--job-monitor"),
+            OsString::from("--data-dir"),
+            folder.clone().into_os_string(),
+            OsString::from("--start-bridge-in-tray"),
+        ];
+        assert!(matches!(
+            launch_mode(arguments.into_iter()),
+            LaunchMode::Controls {
+                target: MonitorTarget::Installation(path),
+                start_hidden: true,
+                start_server: true,
+            } if path == folder
+        ));
+        assert!(matches!(
+            launch_mode(
+                [
+                    "--job-monitor",
+                    "--comfy-url",
+                    "http://127.0.0.1:8188",
+                    "--start-bridge-in-tray"
+                ]
+                .into_iter()
+                .map(OsString::from)
+            ),
+            LaunchMode::Controls {
+                target: MonitorTarget::Missing,
+                start_server: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn startup_preserves_the_selected_installation() {
         let folder = std::env::current_dir()
             .unwrap()
@@ -3156,7 +3318,7 @@ mod launch_tests {
         let mode = launch_mode(arguments.clone().into_iter());
         assert!(matches!(
             &mode,
-            LaunchMode::Controls { target: MonitorTarget::Installation(path), start_hidden: true } if path == &folder
+            LaunchMode::Controls { target: MonitorTarget::Installation(path), start_hidden: true, start_server: false } if path == &folder
         ));
         assert_eq!(startup_setting(&mode).unwrap().arguments, arguments);
     }
@@ -3192,6 +3354,7 @@ fn open_app() -> eframe::Result {
                 LaunchMode::Controls {
                     target: MonitorTarget::Installation(request.data_dir),
                     start_hidden: false,
+                    start_server: false,
                 }
             }
             _ => launch_mode(args),
@@ -3199,6 +3362,13 @@ fn open_app() -> eframe::Result {
     };
     #[cfg(not(windows))]
     let mode = launch_mode(args);
+    let start_server = matches!(
+        &mode,
+        LaunchMode::Controls {
+            start_server: true,
+            ..
+        }
+    );
     let (title, size, minimum, start_hidden) = match &mode {
         LaunchMode::Setup => (
             "Render Bridge Installer",
@@ -3218,10 +3388,13 @@ fn open_app() -> eframe::Result {
     #[cfg(windows)]
     let startup_setting = startup_setting(&mode);
     #[cfg(windows)]
-    if key
-        .as_deref()
-        .is_some_and(|key| tray::activate_existing(key, !start_hidden))
-    {
+    if key.as_deref().is_some_and(|key| {
+        if start_server {
+            tray::start_existing(key)
+        } else {
+            tray::activate_existing(key, !start_hidden)
+        }
+    }) {
         return Ok(());
     }
     let options = eframe::NativeOptions {
@@ -3230,7 +3403,7 @@ fn open_app() -> eframe::Result {
             .with_inner_size(size)
             .with_min_inner_size(minimum)
             .with_visible(!start_hidden)
-            .with_active(!start_hidden)
+            .with_active(!start_hidden && !start_server)
             .with_resizable(true),
         ..Default::default()
     };
@@ -3286,6 +3459,10 @@ fn open_app() -> eframe::Result {
                                 .send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         }
                     }
+                }
+                if start_server {
+                    installer.load_controls(&creation.egui_ctx);
+                    installer.start_panel_server(&creation.egui_ctx, true);
                 }
                 installer
             };

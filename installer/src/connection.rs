@@ -35,18 +35,7 @@ pub struct RunningBridge {
 
 impl RunningBridge {
     fn start(installed: &Installed, settings: &setup::Settings) -> Result<Self, String> {
-        let origin = origin(installed)?;
-        let port = url::Url::parse(origin)
-            .ok()
-            .and_then(|url| url.port_or_known_default())
-            .ok_or("The Bridge port is missing.")?;
-        drop(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|error| {
-            if error.kind() == ErrorKind::AddrInUse {
-                format!("Port {port} is already in use. Stop the other listener or reopen setup with a different MCP_PORT.")
-            } else {
-                format!("Could not listen on port {port}. Check your permissions or reopen setup with a different MCP_PORT.")
-            }
-        })?);
+        let port = available_port(installed)?;
         let marker = tempfile::NamedTempFile::new_in(&installed.app_dir)
             .map_err(|_| "Could not prepare the Bridge startup check.")?;
         let id = marker
@@ -66,6 +55,7 @@ impl RunningBridge {
             .env("MCP_PORT", port.to_string())
             .env("MCP_TOKEN_FILE", &installed.token_path)
             .env("RENDER_BRIDGE_MANAGED_ID", id)
+            .env("RENDER_BRIDGE_PANEL_MANAGED", if cfg!(windows) { "1" } else { "0" })
             .spawn()
             .map_err(|_| "Could not start Render Bridge. Run the copied start command in a terminal for details.")?;
         Ok(Self {
@@ -114,6 +104,21 @@ fn origin(installed: &Installed) -> Result<&str, String> {
         .ok_or_else(|| "The Bridge MCP URL is invalid.".into())
 }
 
+fn available_port(installed: &Installed) -> Result<u16, String> {
+    let port = url::Url::parse(origin(installed)?)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+        .ok_or("The Bridge port is missing.")?;
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|error| {
+        if error.kind() == ErrorKind::AddrInUse {
+            format!("Port {port} is already in use. Stop the other listener or reopen setup with a different MCP_PORT.")
+        } else {
+            format!("Could not listen on port {port}. Check your permissions or reopen setup with a different MCP_PORT.")
+        }
+    })?;
+    Ok(port)
+}
+
 #[cfg(windows)]
 pub fn bridge_is_listening(installed: &Installed) -> bool {
     let Ok(origin) = origin(installed).and_then(setup::validate_comfy_url) else {
@@ -135,16 +140,7 @@ pub fn start_and_verify(
     clients: &[Client],
     codex_profile: &str,
 ) -> Result<serde_json::Value, String> {
-    if clients.contains(&Client::Codex)
-        && (codex_profile.len() > 80
-            || !codex_profile
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-')))
-    {
-        return Err(
-            "Use letters, numbers, hyphens, or underscores in the Codex profile name.".into(),
-        );
-    }
+    validate_client_options(clients, codex_profile)?;
     let settings = setup::saved_install_settings(installed)?;
     let paired = match setup::recheck_folders(&settings) {
         Ok(paired) => paired,
@@ -161,13 +157,56 @@ pub fn start_and_verify(
         *running = Some(RunningBridge::start(installed, &settings)?);
     }
     let bridge = running.as_ref().ok_or("Render Bridge did not start.")?;
-    let mut result = verify(installed, &bridge.id(), clients, codex_profile)?;
+    let mut result =
+        verify_started_child(installed, &settings, &bridge.id(), clients, codex_profile)?;
     result["folders"] = paired.into();
     Ok(result)
 }
 
-fn verify(
+#[cfg(windows)]
+pub fn start_installed_and_verify(
     installed: &Installed,
+    clients: &[Client],
+    codex_profile: &str,
+) -> Result<serde_json::Value, String> {
+    validate_client_options(clients, codex_profile)?;
+    let settings = setup::saved_install_settings(installed)?;
+    let paired = setup::recheck_folders(&settings)?;
+    if !bridge_is_listening(installed) {
+        available_port(installed)?;
+        // Detect old verifier arguments before starting an outdated runtime in the tray.
+        run_verifier(installed, &settings, &[], "")?;
+        crate::shortcuts::start_monitor(installed)?;
+        let deadline = Instant::now() + Duration::from_secs(24);
+        while !bridge_is_listening(installed) {
+            if Instant::now() >= deadline {
+                return Err("The installed panel could not start Render Bridge. Open the panel to check the server status.".into());
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let mut result = verify_listener(installed, clients, codex_profile)?;
+    result["folders"] = paired.into();
+    Ok(result)
+}
+
+fn validate_client_options(clients: &[Client], codex_profile: &str) -> Result<(), String> {
+    if clients.contains(&Client::Codex)
+        && (codex_profile.len() > 80
+            || !codex_profile
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-')))
+    {
+        return Err(
+            "Use letters, numbers, hyphens, or underscores in the Codex profile name.".into(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_started_child(
+    installed: &Installed,
+    settings: &setup::Settings,
     id: &str,
     clients: &[Client],
     codex_profile: &str,
@@ -189,11 +228,34 @@ fn verify(
         }
         thread::sleep(Duration::from_millis(200));
     }
+    run_verifier(installed, settings, clients, codex_profile)
+}
+
+pub fn verify_listener(
+    installed: &Installed,
+    clients: &[Client],
+    codex_profile: &str,
+) -> Result<serde_json::Value, String> {
+    let settings = setup::saved_install_settings(installed)?;
+    run_verifier(installed, &settings, clients, codex_profile)
+}
+
+fn run_verifier(
+    installed: &Installed,
+    settings: &setup::Settings,
+    clients: &[Client],
+    codex_profile: &str,
+) -> Result<serde_json::Value, String> {
+    let backend = setup::validate_comfy_url(&settings.comfy_url)?;
     let mut command = setup::quiet_command(setup::venv_python(&installed.app_dir));
     command
         .arg(installed.app_dir.join("verify_render_bridge.py"))
         .arg(&installed.mcp_url)
-        .arg(&installed.token_path);
+        .arg(&installed.token_path)
+        .args(["--require-owner", "--expected-backend", &backend])
+        .arg("--expected-folders")
+        .arg(setup::folder(settings, "input"))
+        .arg(setup::folder(settings, "output"));
     if clients.contains(&Client::Codex) && !codex_profile.is_empty() {
         command.args(["--codex-profile", codex_profile]);
     }
@@ -204,6 +266,9 @@ fn verify(
         .output()
         .map_err(|_| "The connection check could not start.")?;
     if !output.status.success() {
+        if output.status.code() == Some(2) {
+            return Err("Repair this installation with the current setup before comparing server ownership.".into());
+        }
         return Err("The connection check exited unexpectedly. Reopen setup and try again.".into());
     }
     serde_json::from_slice(&output.stdout)

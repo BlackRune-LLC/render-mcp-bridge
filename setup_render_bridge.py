@@ -2,6 +2,7 @@
 
 import argparse
 import builtins
+import hmac
 import http.client
 import ipaddress
 import json
@@ -49,6 +50,12 @@ STARTER_MODELS = (
 )
 CRASH_COMPONENTS = {"server", "terminal-installer"}
 CRASH_SOURCE_FILES = {"comfy_mcp_server.py", "setup_render_bridge.py"}
+
+
+def asset_folders_proof(key: bytes, challenge: bytes, input_dir, output_dir) -> str:
+    paths = [os.path.normcase(os.path.realpath(path)) for path in (input_dir, output_dir)]
+    message = b"rb-health-folders-v1:" + challenge + b":" + json.dumps(paths).encode()
+    return hmac.new(key, message, "sha256").hexdigest()
 
 
 def default_data_dir() -> Path:

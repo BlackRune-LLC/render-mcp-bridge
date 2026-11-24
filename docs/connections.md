@@ -9,12 +9,13 @@ Run Render Bridge and ComfyUI on the render host. Run your MCP client on that ma
 1. In the current Windows installer, open **Connect**. Select **Start & Verify**, then **Copy agent setup prompt**.
 2. Paste the prompt into the client you want to configure on that PC. It includes the exact local MCP URL and the path to the private token file. The agent can use the file to authenticate through its private client settings.
 3. Approve any requested edit to your user-scope client config. If the client needs to reload its configuration, reopen it and ask it to call `server_status`.
+4. Optionally use **First render** to copy a test prompt to the connected agent and verify its signed PNG in setup. Select **Finish and keep running** to close setup with the server running under the installed Windows panel.
 
 ### Connect after installation
 
 1. Open **Render Bridge** from Windows Start or its notification-area icon. Select **Start server** if the server is offline.
 2. Select **Connect** to open **Connect an agent**. Use **Copy agent setup prompt** and paste it into the client on the render host. For manual configuration, use **Copy address** and the private token file path from the prompt. For a client on another device, use the generic prompt with that device's own connection details. [Connect from another device](#connect-from-another-device)
-3. Verify the connection with `server_status` in the client. Open a fresh session if it needs to reload its MCP configuration.
+3. Verify the connection with `server_status` in the client. Open a fresh session if it needs to reload its MCP configuration. For a PNG check, verify the server with **Start server** and open **Connect → First render test**.
 
 To return to **Connect** in the setup wizard, reopen the wizard and choose **Open existing setup** on **Prerequisites**. For a custom installation folder, choose **Browse for an installation** and select that folder.
 

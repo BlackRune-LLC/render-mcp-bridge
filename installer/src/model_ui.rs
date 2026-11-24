@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -7,8 +8,9 @@ use std::time::Duration;
 
 use eframe::egui::{self, Ui};
 
+use crate::model_download::{self, InstallOutcome, Target, Verification};
 use crate::model_library::{self, Library};
-use crate::models::{DOWNLOAD_PIPELINES, ModelFile};
+use crate::models::DOWNLOAD_PIPELINES;
 use crate::{
     CAUTION, MODEL_GUIDE, activity, asset_ui, caption, card, field_label, primary, secondary,
     status,
@@ -22,11 +24,17 @@ struct Connection {
 }
 
 struct Transfer {
-    result: Receiver<Result<usize, String>>,
+    result: Receiver<Result<Work, String>>,
     cancel: Arc<AtomicBool>,
     bytes: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
     name: &'static str,
+    verifying: bool,
+}
+
+enum Work {
+    Installed(InstallOutcome),
+    Verified(Verification),
 }
 
 #[derive(Default)]
@@ -40,6 +48,8 @@ pub struct ModelManager {
     notice: Option<(String, bool)>,
     installed_only: bool,
     search: String,
+    verification: Option<(&'static str, Verification)>,
+    confirm_repair: bool,
 }
 
 impl ModelManager {
@@ -98,40 +108,52 @@ impl ModelManager {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        let outcome = match self
-            .transfer
-            .as_ref()
-            .map(|transfer| transfer.result.try_recv())
-        {
-            Some(Ok(result)) => result,
-            Some(Err(TryRecvError::Disconnected)) => {
-                Err("The model download stopped unexpectedly.".into())
+        let Some(transfer) = &self.transfer else {
+            return;
+        };
+        let outcome = match transfer.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Disconnected) => {
+                Err("The model operation stopped unexpectedly.".into())
             }
             _ => return,
         };
+        let name = transfer.name;
+        let verifying = transfer.verifying;
         self.transfer = None;
-        self.notice = Some(match outcome {
-            Ok(0) => (
-                "The model files are already on disk. Checking the render backend.".into(),
-                true,
-            ),
-            Ok(count) => (
-                format!("Saved {count} model file(s). Checking the render backend."),
-                true,
-            ),
-            Err(error) => (error, false),
-        });
-        self.refresh(ctx);
+        match outcome {
+            Ok(Work::Verified(report)) => self.verification = Some((name, report)),
+            Ok(Work::Installed(result)) => {
+                self.verification = None;
+                let mut message = if result.files == 0 {
+                    "The model files are already on disk. Checking the render backend.".into()
+                } else {
+                    format!(
+                        "Saved {} model file(s). Checking the render backend.",
+                        result.files
+                    )
+                };
+                for backup in result.backups {
+                    message.push_str(&format!("\nOriginal kept at {}", backup.display()));
+                }
+                self.notice = Some((message, true));
+            }
+            Err(error) => self.notice = Some((error, false)),
+        }
+        if !verifying {
+            self.refresh(ctx);
+        }
     }
 
-    fn start_download(
+    fn start_work(
         &mut self,
         name: &'static str,
-        files: Vec<ModelFile>,
-        root: PathBuf,
+        targets: Vec<Target>,
+        verifying: bool,
         ctx: &egui::Context,
     ) {
-        let total = Arc::new(AtomicU64::new(files.iter().map(|file| file.size).sum()));
+        let repairing = targets.iter().any(Target::is_repair);
+        let total = Arc::new(AtomicU64::new(targets.iter().map(Target::bytes).sum()));
         let cancel = Arc::new(AtomicBool::new(false));
         let bytes = Arc::new(AtomicU64::new(0));
         let worker_cancel = Arc::clone(&cancel);
@@ -142,11 +164,15 @@ impl ModelManager {
         if thread::Builder::new()
             .name("download-model-files".into())
             .spawn(move || {
-                let outcome =
-                    crate::model_download::install(&root, &files, &worker_cancel, |done, size| {
-                        worker_total.store(size, Ordering::Relaxed);
-                        worker_bytes.store(done, Ordering::Relaxed);
-                    });
+                let progress = |done, size| {
+                    worker_total.store(size, Ordering::Relaxed);
+                    worker_bytes.store(done, Ordering::Relaxed);
+                };
+                let outcome = if verifying {
+                    model_download::verify(&targets, &worker_cancel, progress).map(Work::Verified)
+                } else {
+                    model_download::install(&targets, &worker_cancel, progress).map(Work::Installed)
+                };
                 let _ = sender.send(outcome);
                 ctx.request_repaint();
             })
@@ -158,8 +184,13 @@ impl ModelManager {
                 bytes,
                 total,
                 name,
+                verifying,
             });
             self.notice = None;
+            if !repairing {
+                self.verification = None;
+            }
+            self.confirm_repair = false;
         } else {
             self.notice = Some((
                 "Could not start the model download. Try again.".into(),
@@ -187,6 +218,8 @@ impl ModelManager {
             self.library = None;
             self.scan = None;
             self.notice = None;
+            self.verification = None;
+            self.confirm_repair = false;
             self.refresh(ui.ctx());
         }
         if self.connection.is_none() {
@@ -201,6 +234,8 @@ impl ModelManager {
             ui.selectable_value(&mut self.installed_only, true, "Installed");
             if secondary(ui, "Refresh", self.scan.is_none() && !self.downloading()).clicked() {
                 self.notice = None;
+                self.verification = None;
+                self.confirm_repair = false;
                 self.refresh(ui.ctx());
             }
         });
@@ -212,22 +247,41 @@ impl ModelManager {
             } else {
                 (done as f64 / total as f64).clamp(0.0, 1.0) as f32
             };
-            field_label(ui, transfer.name);
+            field_label(
+                ui,
+                &format!(
+                    "{} {}",
+                    if transfer.verifying {
+                        "Verifying"
+                    } else {
+                        "Downloading"
+                    },
+                    transfer.name
+                ),
+            );
             ui.add(egui::ProgressBar::new(ratio).show_percentage());
             caption(ui, &format!("{} of {}", file_size(done), file_size(total)));
             let cancelling = transfer.cancel.load(Ordering::Relaxed);
             if secondary(
                 ui,
                 if cancelling {
-                    "Cancelling…"
+                    "Stopping…"
+                } else if transfer.verifying {
+                    "Stop verification"
                 } else {
-                    "Cancel download"
+                    "Pause download"
                 },
                 !cancelling,
             )
             .clicked()
             {
                 self.cancel();
+            }
+            if !transfer.verifying {
+                caption(
+                    ui,
+                    "Select Download missing files or repair again to resume a stopped transfer.",
+                );
             }
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
@@ -298,6 +352,10 @@ impl ModelManager {
                         "Automatic. Use folders registered by the active ComfyUI build.",
                     );
                     self.destination_changed |= changed;
+                    if changed {
+                        self.verification = None;
+                        self.confirm_repair = false;
+                    }
                     if changed && let Some(data_dir) = &connection.data_dir
                         && let Err(error) = model_library::save_destination(data_dir, self.selected.as_deref())
                     {
@@ -318,6 +376,8 @@ impl ModelManager {
             });
         }
         let mut selection = None;
+        let mut verify_pack = None;
+        let idle = !downloading && self.scan.is_none();
         for pipeline in DOWNLOAD_PIPELINES {
             let library = self.library.as_ref();
             let missing: Vec<_> = pipeline
@@ -327,14 +387,20 @@ impl ModelManager {
                 .cloned()
                 .collect();
             let missing_bytes: u64 = missing.iter().map(|file| file.size).sum();
-            let destination = match (&self.connection, library) {
+            let targets = match (&self.connection, library) {
                 (Some(connection), Some(library)) if !missing.is_empty() => {
                     if missing.iter().all(|file| library.reports_category(file)) {
-                        library.destination(
-                            self.selected.as_deref(),
-                            &connection.default_root,
-                            &missing,
-                        )
+                        missing
+                            .iter()
+                            .map(|file| {
+                                let directory = library.destination(
+                                    self.selected.as_deref(),
+                                    &connection.default_root,
+                                    file,
+                                )?;
+                                Ok(Target::new(file.clone(), directory.join(file.filename)))
+                            })
+                            .collect::<Result<Vec<_>, String>>()
                     } else {
                         Err("This build did not report all model categories for this pack. Refresh, or update ComfyUI if the category is unsupported.".into())
                     }
@@ -346,34 +412,113 @@ impl ModelManager {
                 caption(ui, pipeline.description);
                 caption(ui, pipeline.license);
                 if missing_bytes == 0 {
-                    caption(ui, "Installed in the active library.");
-                } else if let Ok(root) = &destination {
-                    caption(
-                        ui,
-                        &format!("{} to {}", file_size(missing_bytes), root.display()),
-                    );
+                    caption(ui, "All files appear in the active library.");
+                } else if let Ok(targets) = &targets {
+                    let directories = targets
+                        .iter()
+                        .filter_map(|target| target.path.parent())
+                        .collect::<BTreeSet<_>>();
+                    if directories.len() == 1 {
+                        if let Some(folder) = directories.first() {
+                            caption(
+                                ui,
+                                &format!("{} to {}", file_size(missing_bytes), folder.display()),
+                            );
+                        }
+                    } else {
+                        caption(
+                            ui,
+                            &format!(
+                                "{} across {} registered model folders:",
+                                file_size(missing_bytes),
+                                directories.len()
+                            ),
+                        );
+                        for folder in directories {
+                            caption(ui, &folder.display().to_string());
+                        }
+                    }
                     if library.is_some_and(|library| !library.paths_reported()) {
                         caption(
                             ui,
                             "Confirm this is the model folder used by the active ComfyUI build.",
                         );
                     }
-                    if primary(
-                        ui,
-                        "Download missing files",
-                        !downloading && self.scan.is_none(),
-                    )
-                    .clicked()
-                    {
-                        selection = Some((pipeline.name, missing, root.clone()));
+                    if primary(ui, "Download missing files", idle).clicked() {
+                        selection = Some((pipeline.name, targets.clone()));
                     }
-                } else if let Err(error) = &destination {
+                } else if let Err(error) = &targets {
                     caption(ui, error);
+                }
+                if library
+                    .is_some_and(|library| pipeline.files.iter().any(|file| library.has(file)))
+                    && secondary(ui, "Verify installed files", idle).clicked()
+                {
+                    verify_pack = Some(pipeline);
+                }
+                if let Some((name, report)) = &self.verification
+                    && *name == pipeline.name
+                {
+                    caption(
+                        ui,
+                        &format!("{} installed file(s) matched the catalog.", report.verified),
+                    );
+                    if !report.repair.is_empty() {
+                        caption(
+                            ui,
+                            &format!(
+                                "{} file(s) differ from the pinned downloads. Manual variants can differ.",
+                                report.repair.len()
+                            ),
+                        );
+                        if self.confirm_repair {
+                            caption(
+                                ui,
+                                "Repair downloads the catalog copies and keeps the originals as backups.",
+                            );
+                            for target in &report.repair {
+                                caption(ui, &target.path.display().to_string());
+                            }
+                            let bytes = report.repair.iter().map(Target::bytes).sum();
+                            ui.horizontal_wrapped(|ui| {
+                                if primary(ui, &format!("Repair ({})", file_size(bytes)), idle)
+                                    .clicked()
+                                {
+                                    selection = Some((pipeline.name, report.repair.clone()));
+                                }
+                                if secondary(ui, "Cancel", idle).clicked() {
+                                    self.confirm_repair = false;
+                                }
+                            });
+                        } else if secondary(ui, "Review repair", idle).clicked() {
+                            self.confirm_repair = true;
+                        }
+                    }
                 }
             });
         }
-        if let Some((name, files, root)) = selection {
-            self.start_download(name, files, root, ui.ctx());
+        if let Some((name, targets)) = selection {
+            self.start_work(name, targets, false, ui.ctx());
+        } else if let Some(pipeline) = verify_pack
+            && let (Some(connection), Some(library)) = (&self.connection, &self.library)
+        {
+            let targets = pipeline
+                .files
+                .iter()
+                .filter(|file| library.has(file))
+                .map(|file| {
+                    library
+                        .installed_path(self.selected.as_deref(), &connection.default_root, file)?
+                        .map(|path| Target::new(file.clone(), path))
+                        .ok_or(
+                            "Refresh the active model library and try verifying again.".to_owned(),
+                        )
+                })
+                .collect::<Result<Vec<_>, String>>();
+            match targets {
+                Ok(targets) => self.start_work(pipeline.name, targets, true, ui.ctx()),
+                Err(error) => self.notice = Some((error, false)),
+            }
         }
         ui.hyperlink_to("Model and pipeline guide", MODEL_GUIDE);
     }

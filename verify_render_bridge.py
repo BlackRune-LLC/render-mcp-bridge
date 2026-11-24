@@ -3,19 +3,29 @@
 import argparse
 import hmac
 import http.client
+import io
 import json
 import os
 from pathlib import Path
 import re
+import secrets
+import sys
+import time
 import tomllib
+from urllib.parse import parse_qs, urlsplit
+
+from setup_render_bridge import asset_folders_proof
 
 
 LOOPBACK_URL = re.compile(r"http://(127\.0\.0\.1|\[::1\]):([0-9]{1,5})/mcp")
 NAME = re.compile(r"[A-Za-z0-9_-]{1,80}")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{32,}")
+FIRST_RENDER_PREFIX = re.compile(r"rb-first-render-[0-9a-f]{24}")
 PROTOCOL_VERSION = "2025-11-25"
 MAX_RESPONSE = 128 * 1024
 MAX_CONFIG = 16 * 1024 * 1024
+MAX_LINK = 4096
+MAX_TEST_PNG = 8 * 1024 * 1024
 
 
 class VerificationError(Exception):
@@ -58,26 +68,27 @@ def read_object(response, request_id):
     return None
 
 
-def post_mcp(host, port, headers, method, *, request_id=None, params=None):
+def post_mcp(connection, headers, method, *, request_id=None, params=None):
     request = {"jsonrpc": "2.0", "method": method}
     if request_id is not None:
         request["id"] = request_id
     if params is not None:
         request["params"] = params
 
-    # HTTPConnection connects to the literal loopback IP and neither reads proxy
-    # settings nor follows redirects. Do not substitute a URL from client config.
-    connection = http.client.HTTPConnection(host, port, timeout=12)
     try:
         connection.request("POST", "/mcp", json.dumps(request), headers)
         response = connection.getresponse()
         if response.status in (401, 403):
             raise VerificationError("unauthorized")
         if request_id is None and response.status == 202:
+            if len(response.read(MAX_RESPONSE + 1)) > MAX_RESPONSE:
+                raise VerificationError("unexpected_response")
             return {}, None
         if response.status != 200 or request_id is None:
             raise VerificationError("unexpected_response")
         message = read_object(response, request_id)
+        if len(response.read(MAX_RESPONSE + 1)) > MAX_RESPONSE:
+            raise VerificationError("unexpected_response")
         if not message or message.get("jsonrpc") != "2.0":
             raise VerificationError("unexpected_response")
         result = message.get("result")
@@ -89,17 +100,51 @@ def post_mcp(host, port, headers, method, *, request_id=None, params=None):
         raise VerificationError("unreachable") from None
     except (http.client.HTTPException, ValueError, RecursionError):
         raise VerificationError("unexpected_response") from None
-    finally:
-        connection.close()
 
 
-def verify_bridge(host, port, token):
+def prove_listener(connection, token, expected_backend, expected_folders):
+    challenge = secrets.token_hex(16)
+    try:
+        connection.request("GET", "/health", headers={"X-Render-Bridge-Challenge": challenge})
+        response = connection.getresponse()
+        body = response.read(MAX_RESPONSE + 1)
+        if response.status != 200 or len(body) > MAX_RESPONSE:
+            raise VerificationError("owner_unverified")
+        health = json.loads(body)
+        if not isinstance(health, dict):
+            raise VerificationError("owner_unverified")
+        supplied = health.get("installation_proof")
+        managed = health.get("panel_managed")
+        backend = health.get("comfyui_url")
+        if type(managed) is not bool or not isinstance(backend, str) or not backend.isascii():
+            raise VerificationError("owner_unverified")
+        message = f"rb-health-v2:{challenge}:{int(managed)}:{backend}".encode()
+        expected = hmac.new(token.encode(), message, "sha256").hexdigest()
+        if not isinstance(supplied, str) or not supplied.isascii() or not hmac.compare_digest(supplied, expected):
+            raise VerificationError("owner_unverified")
+        if expected_backend is not None and backend != expected_backend:
+            raise VerificationError("backend_mismatch")
+        if expected_folders is not None:
+            supplied = health.get("asset_folders_proof")
+            expected = asset_folders_proof(token.encode(), challenge.encode(), *expected_folders)
+            if not isinstance(supplied, str) or not supplied.isascii() or not hmac.compare_digest(supplied, expected):
+                raise VerificationError("backend_mismatch")
+        if connection.sock is None:
+            raise VerificationError("owner_unverified")
+        # Authorize only the socket that answered the installation challenge.
+        connection.auto_open = False
+        return managed
+    except (OSError, http.client.HTTPException, ValueError, RecursionError):
+        raise VerificationError("owner_unverified") from None
+
+
+def verify_bridge(connection, token):
     headers = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
     }
-    result, session_id = post_mcp(host, port, headers, "initialize", request_id=1, params={
+    result, session_id = post_mcp(connection, headers, "initialize", request_id=1, params={
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {},
         "clientInfo": {"name": "render-bridge-verify", "version": "1"},
@@ -114,8 +159,8 @@ def verify_bridge(host, port, token):
         if not re.fullmatch(r"[\x21-\x7e]{1,256}", session_id):
             raise VerificationError("unexpected_response")
         headers["Mcp-Session-Id"] = session_id
-    post_mcp(host, port, headers, "notifications/initialized")
-    result, _ = post_mcp(host, port, headers, "tools/call", request_id=2, params={
+    post_mcp(connection, headers, "notifications/initialized")
+    result, _ = post_mcp(connection, headers, "tools/call", request_id=2, params={
         "name": "server_status",
         "arguments": {},
     })
@@ -133,6 +178,64 @@ def verify_bridge(host, port, token):
     if type(running) is not bool:
         return "server_status_failed"
     return "ok" if running else "comfyui_unavailable"
+
+
+def first_render_path(origin, prefix, link, token):
+    if not link.isascii() or any(ord(char) < 33 or ord(char) == 127 for char in link):
+        return None
+    try:
+        parsed = urlsplit(link)
+        fields = parse_qs(parsed.query, strict_parsing=True, max_num_fields=4)
+    except ValueError:
+        return None
+    if parsed.scheme != "http" or parsed.netloc != urlsplit(origin).netloc or parsed.fragment:
+        return None
+    filename = parsed.path.removeprefix("/files/")
+    if not parsed.path.startswith("/files/") or not re.fullmatch(rf"{re.escape(prefix)}_[0-9]+_\.png", filename):
+        return None
+    if set(fields) != {"subfolder", "type", "exp", "sig"} or any(len(values) != 1 for values in fields.values()):
+        return None
+    subfolder, kind, expires, signature = (fields[key][0] for key in ("subfolder", "type", "exp", "sig"))
+    if subfolder != "mcp" or kind != "output" or not re.fullmatch(r"[0-9]{1,12}", expires):
+        return None
+    if int(expires) < time.time() or not re.fullmatch(r"[0-9a-f]{40}", signature):
+        return None
+    message = f"output|mcp|{filename}|{int(expires)}".encode()
+    expected = hmac.digest(token.encode(), message, "sha256").hex()[:40]
+    if not hmac.compare_digest(expected, signature):
+        return None
+    return f"{parsed.path}?{parsed.query}"
+
+
+def verify_first_render(endpoint, origin, prefix, link, token):
+    path = first_render_path(origin, prefix, link, token)
+    if path is None:
+        return "wrong_link"
+    connection = http.client.HTTPConnection(endpoint[1].strip("[]"), int(endpoint[2]), timeout=8)
+    try:
+        connection.request("GET", path, headers={"Accept-Encoding": "identity"})
+        with connection.getresponse() as response:
+            if response.status != 200:
+                return "download_failed"
+            data = response.read(MAX_TEST_PNG + 1)
+    except (OSError, http.client.HTTPException):
+        return "download_failed"
+    finally:
+        connection.close()
+    if len(data) > MAX_TEST_PNG:
+        return "invalid_png"
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(data), formats=("PNG",)) as image:
+            if image.size != (512, 512):
+                return "invalid_png"
+            image.verify()
+        with Image.open(io.BytesIO(data), formats=("PNG",)) as image:
+            image.load()
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        return "invalid_png"
+    return "ok"
 
 
 def load_config(path, server_table, parse):
@@ -241,10 +344,16 @@ def arguments(argv):
     parser.add_argument("--claude-config-dir", help="Selected CLAUDE_CONFIG_DIR")
     parser.add_argument("--codex-home", help="Selected CODEX_HOME")
     parser.add_argument("--codex-profile", help="Named Codex --profile layer, if used")
+    parser.add_argument("--first-render", help="Check the test PNG link passed through standard input")
+    parser.add_argument("--require-owner", action="store_true", help="Prove the listener owns this installation's token")
+    parser.add_argument("--expected-backend", help="Check the proven listener uses this backend URL")
+    parser.add_argument("--expected-folders", nargs=2, metavar=("INPUT", "OUTPUT"),
+                        help="Check the proven listener uses these asset folders")
     args = parser.parse_intermixed_args(argv)
     if (any(client not in {"claude", "codex"} for client in args.clients)
             or (args.server_name is not None and not NAME.fullmatch(args.server_name))
-            or (args.codex_profile is not None and not NAME.fullmatch(args.codex_profile))):
+            or (args.codex_profile is not None and not NAME.fullmatch(args.codex_profile))
+            or (args.first_render is not None and (args.clients or not FIRST_RENDER_PREFIX.fullmatch(args.first_render)))):
         raise VerificationError("invalid_arguments")
     return args
 
@@ -268,14 +377,34 @@ def main(argv=None):
         if len(contents) > 4096 or not TOKEN.fullmatch(token):
             raise ValueError
     except (OSError, ValueError):
-        print(json.dumps({"bridge": "token_unavailable"}))
+        print(json.dumps({"first_render" if args.first_render else "bridge": "token_unavailable"}))
         return 0
 
+    if args.first_render:
+        data = sys.stdin.buffer.read(MAX_LINK + 1)
+        if len(data) > MAX_LINK:
+            status = "wrong_link"
+        else:
+            try:
+                link = data.decode("ascii").strip()
+            except UnicodeError:
+                status = "wrong_link"
+            else:
+                status = verify_first_render(endpoint, args.url.removesuffix("/mcp"), args.first_render, link, token)
+        print(json.dumps({"first_render": status}))
+        return 0
+
+    # Use the literal loopback address without redirects or proxy settings.
+    connection = http.client.HTTPConnection(endpoint[1].strip("[]"), int(endpoint[2]), timeout=12)
+    result = {}
     try:
-        bridge = verify_bridge(endpoint[1].strip("[]"), int(endpoint[2]), token)
+        if args.require_owner:
+            result["panel_managed"] = prove_listener(connection, token, args.expected_backend, args.expected_folders)
+        result["bridge"] = verify_bridge(connection, token)
     except VerificationError as error:
-        bridge = str(error)
-    result = {"bridge": bridge}
+        result["bridge"] = str(error)
+    finally:
+        connection.close()
     for client in dict.fromkeys(args.clients):
         try:
             result[client] = verify_client(client, args, token)

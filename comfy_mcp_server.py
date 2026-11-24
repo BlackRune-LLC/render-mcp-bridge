@@ -31,7 +31,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
-from setup_render_bridge import DEFAULT_URL, atomic_text, backend_url, default_data_dir, enable_crash_reports
+from setup_render_bridge import (
+    DEFAULT_URL, asset_folders_proof, atomic_text, backend_url, default_data_dir, enable_crash_reports,
+)
 
 if __name__ == "__main__":
     enable_crash_reports("server")
@@ -4240,6 +4242,7 @@ async def receive_signed_upload(scope: dict[str, Any], receive: Any, send: Any) 
 class BearerAuth:
     def __init__(self, app: Any, token: str):
         self.app = app
+        self.installation_key = token.encode()
         self.expected = f"Bearer {token}".encode()
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -4249,6 +4252,17 @@ class BearerAuth:
                 body = {"mcp": "ok", "comfyui": status}
                 if managed_id := os.environ.get("RENDER_BRIDGE_MANAGED_ID"):
                     body["wizard_session"] = managed_id
+                challenge = dict(scope.get("headers") or []).get(b"x-render-bridge-challenge", b"")
+                if re.fullmatch(rb"[0-9a-f]{32}", challenge):
+                    panel_managed = bool(managed_id) and os.environ.get("RENDER_BRIDGE_PANEL_MANAGED") == "1"
+                    message = b"rb-health-v2:" + challenge + f":{int(panel_managed)}:{COMFY_URL}".encode()
+                    body.update(panel_managed=panel_managed, comfyui_url=COMFY_URL)
+                    body["installation_proof"] = hmac.new(
+                        self.installation_key, message, "sha256",
+                    ).hexdigest()
+                    body["asset_folders_proof"] = asset_folders_proof(
+                        self.installation_key, challenge, COMFY_DIRS["input"], COMFY_DIRS["output"],
+                    )
                 await JSONResponse(body)(scope, receive, send)
                 return
             if scope.get("path", "").startswith("/files/") and scope.get("method") in ("GET", "HEAD"):

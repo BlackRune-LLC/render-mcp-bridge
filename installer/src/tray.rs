@@ -27,6 +27,7 @@ const WINDOW_CLASS: PCWSTR = w!("BlackRune.RenderBridge.Jobs.Tray");
 const ICON_ID: u32 = 1;
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const OPEN_MESSAGE: u32 = WM_APP + 2;
+const START_SILENT_MESSAGE: u32 = WM_APP + 3;
 const IN_MENU_OPEN: usize = 1;
 const IN_MENU_EXIT: usize = 2;
 const IN_MENU_START_SERVER: usize = 3;
@@ -38,6 +39,7 @@ const KEY_SELECT: u32 = NIN_SELECT + 1;
 pub enum TrayEvent {
     Open,
     StartServer,
+    StartSilently,
     StopServer,
     Exit,
 }
@@ -150,6 +152,15 @@ pub fn activate_existing(key: &str, show: bool) -> bool {
     }
 }
 
+pub fn start_existing(key: &str) -> bool {
+    let title = window_title(key);
+    unsafe {
+        FindWindowW(WINDOW_CLASS, &title).is_ok_and(|window| {
+            PostMessageW(Some(window), START_SILENT_MESSAGE, WPARAM(0), LPARAM(0)).is_ok()
+        })
+    }
+}
+
 fn owned_panel(raw: isize) -> Option<HWND> {
     let window = HWND(raw as *mut _);
     let mut owner = 0;
@@ -169,7 +180,8 @@ struct WindowState {
 
 impl WindowState {
     fn emit(&self, event: TrayEvent) {
-        let show_panel = event != TrayEvent::Exit;
+        let show_panel = !matches!(event, TrayEvent::Exit | TrayEvent::StartSilently);
+        let close = event == TrayEvent::Exit;
         if self.events.send(event).is_ok() {
             if let Some(panel) = owned_panel(self.panel_hwnd) {
                 // Restore through the native message queue before asking eframe
@@ -184,9 +196,10 @@ impl WindowState {
                         let _ = ShowWindowAsync(panel, command);
                         let _ = SetForegroundWindow(panel);
                     } else {
-                        // Queue Exit first so the ordinary close handler cannot
-                        // interpret this as another request to hide the panel.
-                        let _ = PostMessageW(Some(panel), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        if close {
+                            // Queue Exit first so the close handler cannot hide the panel.
+                            let _ = PostMessageW(Some(panel), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
                         // Winit handles a queued WM_PAINT as RedrawRequested,
                         // even when Windows would not redraw the hidden window.
                         let _ = PostMessageW(Some(panel), WM_PAINT, WPARAM(0), LPARAM(0));
@@ -366,6 +379,12 @@ unsafe extern "system" fn window_proc(
             state.emit(TrayEvent::Open);
             return LRESULT(0);
         }
+        if message == START_SILENT_MESSAGE {
+            if state.server_controls {
+                state.emit(TrayEvent::StartSilently);
+            }
+            return LRESULT(0);
+        }
         if message == state.taskbar_created && state.taskbar_created != 0 {
             if !add_icon(window, state.icon) {
                 // Keep the panel accessible if Explorer rejects the replacement icon.
@@ -475,6 +494,8 @@ fn show_menu(
 mod tests {
     use super::*;
 
+    static CALLBACK_CLASS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn native_icon_can_be_loaded_without_a_tray() {
         let icon = crate::icons::tray_icon().unwrap();
@@ -522,8 +543,43 @@ mod tests {
     }
 
     #[test]
+    fn silent_setup_start_reaches_only_the_matching_installation() {
+        use windows::Win32::UI::WindowsAndMessaging::{PM_REMOVE, PeekMessageW};
+
+        let _registration = CALLBACK_CLASS.lock().unwrap();
+        let key = format!("setup-start-fixture-{}", std::process::id());
+        let (sender, events) = mpsc::channel();
+        let tray = NativeTray::new(
+            &window_title(&key),
+            egui::Context::default(),
+            sender,
+            0,
+            true,
+        )
+        .unwrap();
+        assert!(!start_existing("setup-start-fixture-wrong-target"));
+        assert!(start_existing(&key));
+        let mut message = MSG::default();
+        unsafe {
+            assert!(
+                PeekMessageW(
+                    &mut message,
+                    Some(tray.window),
+                    START_SILENT_MESSAGE,
+                    START_SILENT_MESSAGE,
+                    PM_REMOVE,
+                )
+                .as_bool()
+            );
+            DispatchMessageW(&message);
+        }
+        assert_eq!(events.try_recv(), Ok(TrayEvent::StartSilently));
+    }
+
+    #[test]
     fn native_activation_accepts_shortcut_and_version_four_notifications() {
         use windows::Win32::UI::WindowsAndMessaging::{PM_REMOVE, PeekMessageW, SendMessageW};
+        let _registration = CALLBACK_CLASS.lock().unwrap();
         let key = format!("open-fixture-{}", std::process::id());
         let (sender, events) = mpsc::channel();
         // NativeTray::new creates a hidden window but does not register an icon.
