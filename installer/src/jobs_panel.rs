@@ -4,6 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::jobs::{self, QueueStatus};
+use crate::theme;
 use crate::{
     CAUTION, GREEN, INK, MUTED, RAIL_ACTIVE, SURFACE, VIOLET, activity, caption, card,
     monitor_button, status,
@@ -50,6 +51,11 @@ impl QueueView {
 
     pub fn is_for(&self, url: &str) -> bool {
         self.url == url
+    }
+
+    #[cfg(windows)]
+    pub fn has_active_work(&self) -> bool {
+        matches!(&self.result, Some(Ok(queue)) if !queue.is_idle())
     }
 
     fn refresh(&mut self, ctx: &egui::Context) {
@@ -100,7 +106,12 @@ impl QueueView {
                             (_, false, true) => ("Waiting to run", VIOLET),
                             _ => ("Queue is idle", GREEN),
                         };
-                    ui.label(RichText::new(label).size(17.0).strong().color(color));
+                    ui.label(
+                        RichText::new(label)
+                            .size(17.0)
+                            .strong()
+                            .color(theme::color(ui.ctx(), color)),
+                    );
                     ui.horizontal_wrapped(|ui| {
                         for (label, count) in [("Running", queue.running), ("Queued", queue.queued)]
                         {
@@ -108,9 +119,9 @@ impl QueueView {
                                 RichText::new(count.to_string())
                                     .size(19.0)
                                     .strong()
-                                    .color(INK),
+                                    .color(theme::color(ui.ctx(), INK)),
                             );
-                            ui.label(RichText::new(label).color(MUTED));
+                            ui.label(RichText::new(label).color(theme::color(ui.ctx(), MUTED)));
                             ui.add_space(9.0);
                         }
                     });
@@ -129,9 +140,9 @@ impl QueueView {
             caption(
                 ui,
                 if self.worker.is_some() {
-                    "Checking for updates"
+                    "Checking queue…"
                 } else {
-                    "Updates automatically"
+                    "Queue refreshes automatically"
                 },
             );
         });
@@ -160,16 +171,16 @@ impl QueueView {
                     ui.label(
                         RichText::new(format!("{percent:.0}%"))
                             .strong()
-                            .color(VIOLET),
+                            .color(theme::color(ui.ctx(), VIOLET)),
                     );
                 });
             });
             ui.scope(|ui| {
-                ui.visuals_mut().extreme_bg_color = RAIL_ACTIVE;
+                ui.visuals_mut().extreme_bg_color = theme::color(ui.ctx(), RAIL_ACTIVE);
                 ui.add(
                     egui::ProgressBar::new(fraction as f32)
                         .desired_height(10.0)
-                        .fill(VIOLET),
+                        .fill(theme::color(ui.ctx(), VIOLET)),
                 );
             });
             return;
@@ -192,8 +203,10 @@ impl QueueView {
                 egui::pos2(left, track.top()),
                 egui::vec2(width, track.height()),
             );
-            ui.painter().rect_filled(track, 5, RAIL_ACTIVE);
-            ui.painter().rect_filled(segment, 5, VIOLET);
+            ui.painter()
+                .rect_filled(track, 5, theme::color(ui.ctx(), RAIL_ACTIVE));
+            ui.painter()
+                .rect_filled(segment, 5, theme::color(ui.ctx(), VIOLET));
             ui.ctx().request_repaint_after(Duration::from_millis(32));
         }
         caption(ui, "Step updates appear when available.");

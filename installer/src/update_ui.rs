@@ -7,9 +7,12 @@ use std::{process, thread};
 use eframe::egui;
 
 use crate::setup::{self, Installed};
+use crate::theme;
 use crate::update_handoff::{self, UpdateRequest};
 use crate::updates::{self, Release, StagedInstaller};
-use crate::{CAUTION, CREAM, RAIL, activity, bridge_mark, caption, primary, secondary, status};
+use crate::{
+    CAUTION, CREAM, RAIL, activity, bridge_mark, caption, panel_modal, primary, secondary, status,
+};
 
 enum UpdateEvent {
     Checked(Result<Option<Release>, String>),
@@ -30,6 +33,10 @@ impl UpdateDialog {
             return;
         }
         self.open = true;
+        self.start_check(ctx);
+    }
+
+    fn start_check(&mut self, ctx: &egui::Context) {
         self.result = None;
         self.run(ctx, || UpdateEvent::Checked(updates::check()));
     }
@@ -61,7 +68,7 @@ impl UpdateDialog {
         &mut self,
         ctx: &egui::Context,
         installed: Option<&Installed>,
-        can_replace: bool,
+        blocked: Option<&str>,
     ) -> bool {
         if !self.open {
             return false;
@@ -79,11 +86,13 @@ impl UpdateDialog {
                         Ok((release, staging)) => {
                             let launched = installed
                                 .filter(|installed| {
-                                    can_replace
+                                    blocked.is_none()
                                         && update_handoff::is_installed_monitor(&installed.data_dir)
                                 })
                                 .ok_or_else(|| {
-                                    "Finish using the server before updating.".to_owned()
+                                    blocked
+                                        .unwrap_or("Open the installed panel before updating.")
+                                        .to_owned()
                                 })
                                 .and_then(|installed| {
                                     start_installer(&installed.data_dir, &release, staging)
@@ -103,7 +112,7 @@ impl UpdateDialog {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        let response = egui::Modal::new(egui::Id::new("render-bridge-update")).show(ctx, |ui| {
+        let response = panel_modal(ctx, "render-bridge-update").show(ctx, |ui| {
             ui.set_width(350.0);
             ui.heading("Render Bridge Update");
             caption(
@@ -118,29 +127,40 @@ impl UpdateDialog {
                     Some(Ok(None)) => caption(ui, "Render Bridge is up to date."),
                     Some(Ok(Some(release))) => {
                         ui.label(format!("Version {} is available.", release.version));
-                        if !can_replace {
-                            caption(ui, "Stop the server started by this panel before updating.");
+                        if let Some(reason) = blocked {
+                            caption(ui, reason);
+                        } else {
+                            caption(
+                                ui,
+                                "The update keeps your settings and reopens Render Bridge.",
+                            );
                         }
                     }
                     Some(Err(error)) => status(ui, "Update unavailable", error, CAUTION),
                 }
             }
             let mut install = false;
+            let mut retry = false;
             let mut close = false;
             ui.horizontal_wrapped(|ui| {
                 if !self.downloading && matches!(self.result, Some(Ok(Some(_)))) {
-                    install = primary(ui, "Install update", can_replace).clicked();
+                    install = primary(ui, "Install update", blocked.is_none()).clicked();
+                } else if matches!(self.result, Some(Err(_))) {
+                    retry = primary(ui, "Check again", true).clicked();
                 }
                 close = secondary(ui, if self.downloading { "Cancel" } else { "Close" }, true)
                     .clicked();
             });
-            (install, close)
+            (install, retry, close)
         });
-        if response.inner.1 || response.should_close() {
+        let (install, retry, close) = response.inner;
+        if close || (!self.downloading && response.should_close()) {
             self.open = false;
             self.worker = None;
             self.downloading = false;
-        } else if response.inner.0
+        } else if retry {
+            self.start_check(ctx);
+        } else if install
             && let Some(Ok(Some(release))) = self.result.take()
             && let Some(installed) = installed
         {
@@ -199,7 +219,7 @@ struct ApplyWindow {
 
 impl ApplyWindow {
     fn new(ctx: &egui::Context, request: Result<UpdateRequest, String>) -> Self {
-        ctx.set_theme(egui::Theme::Light);
+        theme::configure(ctx);
         let mut app = Self {
             worker: None,
             target: None,
@@ -283,7 +303,7 @@ impl eframe::App for ApplyWindow {
             .show_separator_line(false)
             .frame(
                 egui::Frame::new()
-                    .fill(RAIL)
+                    .fill(theme::color(ctx, RAIL))
                     .inner_margin(egui::Margin::symmetric(16, 5)),
             )
             .show(ctx, |ui| {
@@ -300,7 +320,7 @@ impl eframe::App for ApplyWindow {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(CREAM)
+                    .fill(theme::color(ctx, CREAM))
                     .inner_margin(egui::Margin::same(20)),
             )
             .show(ctx, |ui| {
@@ -312,7 +332,18 @@ impl eframe::App for ApplyWindow {
                         self.reopen(ctx);
                     }
                 } else {
-                    activity(ui, &self.progress);
+                    let cancelling = self.cancel.load(Ordering::Relaxed);
+                    activity(
+                        ui,
+                        if cancelling {
+                            "Cancelling the update…"
+                        } else {
+                            &self.progress
+                        },
+                    );
+                    if secondary(ui, "Cancel", !cancelling).clicked() {
+                        self.cancel.store(true, Ordering::Relaxed);
+                    }
                 }
             });
     }

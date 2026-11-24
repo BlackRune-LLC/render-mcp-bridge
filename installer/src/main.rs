@@ -13,6 +13,7 @@ mod setup;
 mod shortcuts;
 #[cfg(windows)]
 mod startup;
+mod theme;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
@@ -163,7 +164,7 @@ impl StartupSetting {
         if !self.open {
             return;
         }
-        let response = egui::Modal::new(egui::Id::new("render-bridge-settings")).show(ctx, |ui| {
+        let response = panel_modal(ctx, "render-bridge-settings").show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading("Render Bridge Settings");
             if let Some(mut enabled) = self.enabled
@@ -310,28 +311,7 @@ struct Installer {
 
 impl Installer {
     fn new(ctx: &egui::Context, mode: LaunchMode) -> Self {
-        ctx.set_theme(egui::Theme::Light);
-        ctx.style_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-            style.spacing.button_padding = egui::vec2(13.0, 8.0);
-            style.visuals.override_text_color = Some(INK);
-            style.visuals.hyperlink_color = VIOLET;
-            style.visuals.extreme_bg_color = SURFACE;
-            style.visuals.selection.bg_fill = RAIL_ACTIVE;
-            style.visuals.selection.stroke = Stroke::new(1.0_f32, VIOLET);
-            style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, LINE);
-            style.visuals.widgets.inactive.bg_fill = SURFACE;
-            style.visuals.widgets.inactive.weak_bg_fill = SURFACE;
-            style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, VIOLET);
-            style.visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, VIOLET);
-            for state in [
-                &mut style.visuals.widgets.inactive,
-                &mut style.visuals.widgets.hovered,
-                &mut style.visuals.widgets.active,
-            ] {
-                state.corner_radius = egui::CornerRadius::same(12);
-            }
-        });
+        theme::configure(ctx);
         let mut installer = Self {
             step: Step::Prerequisites,
             python: None,
@@ -475,15 +455,29 @@ impl Installer {
             return;
         };
         let action = dialog.action;
-        let response = egui::Modal::new(egui::Id::new("comfyui-jobs")).show(ctx, |ui| {
+        let exiting_panel = in_panel && action == QueueAction::CloseWindow;
+        let response = panel_modal(ctx, "comfyui-jobs").show(ctx, |ui| {
+            if in_panel {
+                ui.spacing_mut().item_spacing.y = 6.0;
+            }
             ui.set_width((ctx.content_rect().width() - 32.0).clamp(120.0, 420.0));
-            ui.heading(RichText::new("Jobs").size(28.0).strong());
+            let title = match action {
+                QueueAction::Inspect => "Jobs",
+                _ => "Check jobs",
+            };
+            ui.heading(RichText::new(title).size(25.0).strong());
             dialog.queue.show(ui);
             if action == QueueAction::Inspect {
                 return (secondary(ui, "Close", true).clicked(), false);
             }
-            caption(ui, "Stopping Render Bridge can interrupt job tracking. ComfyUI and its queue keep running.");
-            let (stop_label, force_label) = if in_panel {
+            caption(ui, if exiting_panel {
+                "Exiting stops the server started by this panel. ComfyUI and its queue keep running."
+            } else {
+                "Stopping Render Bridge can interrupt job tracking. ComfyUI and its queue keep running."
+            });
+            let (stop_label, force_label) = if exiting_panel {
+                ("Stop and exit", "Stop and exit anyway")
+            } else if in_panel {
                 ("Stop server", "Stop server anyway")
             } else {
                 ("Stop Bridge", "Stop Bridge anyway")
@@ -492,7 +486,11 @@ impl Installer {
             let mut keep = false;
             let mut stop = false;
             ui.horizontal_wrapped(|ui| {
-                keep = secondary(ui, "Keep Bridge running", true).clicked();
+                keep = if in_panel {
+                    monitor_button(ui, "Keep running", true, SURFACE)
+                } else {
+                    secondary(ui, "Keep Bridge running", true)
+                }.clicked();
                 let label_text = label.unwrap_or(stop_label);
                 stop = if in_panel {
                     monitor_button(ui, label_text, label.is_some(), ERROR)
@@ -925,7 +923,7 @@ impl Installer {
             .resizable(false)
             .frame(
                 Frame::new()
-                    .fill(RAIL)
+                    .fill(theme::color(ctx, RAIL))
                     .inner_margin(egui::Margin::symmetric(24, 31)),
             )
             .show(ctx, |ui| {
@@ -942,11 +940,15 @@ impl Installer {
                 for (step, number, label) in STEPS {
                     let selected = step == self.step;
                     let background = if selected {
-                        RAIL_ACTIVE
+                        theme::color(ctx, RAIL_ACTIVE)
                     } else {
                         Color32::TRANSPARENT
                     };
-                    let foreground = if selected { INK } else { RAIL_TEXT };
+                    let foreground = if selected {
+                        theme::color(ctx, INK)
+                    } else {
+                        RAIL_TEXT
+                    };
                     Frame::new()
                         .fill(background)
                         .corner_radius(13)
@@ -1004,7 +1006,7 @@ impl Installer {
                         ui.label(
                             RichText::new(format!("Python {version} is ready"))
                                 .strong()
-                                .color(GREEN),
+                                .color(theme::color(ui.ctx(), GREEN)),
                         );
                         code_label(ui, &executable.to_string_lossy());
                     }
@@ -1012,7 +1014,7 @@ impl Installer {
                         ui.label(
                             RichText::new(format!("Python {version} is too old"))
                                 .strong()
-                                .color(CAUTION),
+                                .color(theme::color(ui.ctx(), CAUTION)),
                         );
                         caption(ui, "Install Python 3.11 or newer, then check again.");
                     }
@@ -1022,7 +1024,7 @@ impl Installer {
                                 "Python {version} needs virtual environment support"
                             ))
                             .strong()
-                            .color(CAUTION),
+                            .color(theme::color(ui.ctx(), CAUTION)),
                         );
                         caption(ui, python_venv_help());
                     }
@@ -1030,7 +1032,7 @@ impl Installer {
                         ui.label(
                             RichText::new("Python was not found")
                                 .strong()
-                                .color(CAUTION),
+                                .color(theme::color(ui.ctx(), CAUTION)),
                         );
                         caption(ui, "Install Python 3.11 or newer, then check again.");
                     }
@@ -1038,7 +1040,7 @@ impl Installer {
                         ui.label(
                             RichText::new("This file could not be verified as Python")
                                 .strong()
-                                .color(CAUTION),
+                                .color(theme::color(ui.ctx(), CAUTION)),
                         );
                         caption(
                             ui,
@@ -1332,15 +1334,27 @@ impl Installer {
                     ),
                     true,
                 );
-                ui.label(RichText::new(label).strong().color(color));
+                ui.label(
+                    RichText::new(label)
+                        .strong()
+                        .color(theme::color(ui.ctx(), color)),
+                );
                 caption(ui, pipeline.description);
                 for file in pipeline.files {
                     ui.separator();
                     let (label, color) = model_status(file_status(file.filename), false);
-                    ui.label(RichText::new(label).strong().color(color));
+                    ui.label(
+                        RichText::new(label)
+                            .strong()
+                            .color(theme::color(ui.ctx(), color)),
+                    );
                     ui.add(egui::Label::new(RichText::new(file.filename).monospace()).wrap());
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(file.folder).monospace().color(MUTED));
+                        ui.label(
+                            RichText::new(file.folder)
+                                .monospace()
+                                .color(theme::color(ui.ctx(), MUTED)),
+                        );
                         ui.hyperlink_to("Open Hugging Face file", file.source);
                     });
                 }
@@ -1562,7 +1576,11 @@ impl Installer {
             self.copied = copied;
         }
         if let Some(message) = self.copied {
-            ui.label(RichText::new(message).size(14.0).color(GREEN));
+            ui.label(
+                RichText::new(message)
+                    .size(14.0)
+                    .color(theme::color(ui.ctx(), GREEN)),
+            );
         }
     }
 
@@ -1676,7 +1694,7 @@ impl Installer {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(RAIL)
+                    .fill(theme::color(ctx, RAIL))
                     .inner_margin(egui::Margin::symmetric(16, 5)),
             )
             .show(ctx, |ui| {
@@ -1694,7 +1712,7 @@ impl Installer {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(CREAM)
+                    .fill(theme::color(ctx, CREAM))
                     .inner_margin(egui::Margin::symmetric(16, 8)),
             )
             .show(ctx, |ui| {
@@ -1743,7 +1761,7 @@ impl Installer {
                 });
             });
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(CREAM).inner_margin(egui::Margin::symmetric(16, 12)))
+            .frame(Frame::new().fill(theme::color(ctx, CREAM)).inner_margin(egui::Margin::symmetric(16, 12)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 7.0;
@@ -1766,6 +1784,12 @@ impl Installer {
                                 .clicked() {
                                 self.request_server_action(ctx, ServerAction::Stop);
                             }
+                            let server = match (online, owned) {
+                                (true, false) => "Server started elsewhere",
+                                (true, true) => "Render Bridge running",
+                                _ => "Render Bridge server",
+                            };
+                            ui.label(RichText::new(server).size(13.0).color(theme::color(ui.ctx(), MUTED)));
                         }
                     });
                     if let Some(queue) = self.controls.as_mut().and_then(|controls| controls.queue.as_mut()) {
@@ -1802,9 +1826,23 @@ impl Installer {
         }
         #[cfg(windows)]
         {
-            let can_replace = self.worker.is_none()
-                && !self.running.as_mut().is_some_and(RunningBridge::is_running);
-            if self.update.show(ctx, self.installed.as_ref(), can_replace) {
+            let blocked = if self.worker.is_some() {
+                Some("Wait for the current operation to finish.")
+            } else if self.running.as_mut().is_some_and(RunningBridge::is_running) {
+                Some("Stop the server started by this panel before updating.")
+            } else if self
+                .controls
+                .as_ref()
+                .and_then(|controls| controls.queue.as_ref())
+                .is_some_and(QueueView::has_active_work)
+            {
+                Some("Wait for running and queued jobs to finish before updating.")
+            } else if self.installed.is_none() {
+                Some("Open a saved Render Bridge installation to update.")
+            } else {
+                None
+            };
+            if self.update.show(ctx, self.installed.as_ref(), blocked) {
                 if let Some(tray) = &mut self.tray_panel {
                     tray.exiting = true;
                 }
@@ -1819,8 +1857,8 @@ impl Installer {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(CREAM)
-                    .stroke(Stroke::new(1.0_f32, LINE))
+                    .fill(theme::color(ctx, CREAM))
+                    .stroke(Stroke::new(1.0_f32, theme::color(ctx, LINE)))
                     .inner_margin(egui::Margin::symmetric(38, 17)),
             )
             .show(ctx, |ui| {
@@ -1977,7 +2015,7 @@ impl eframe::App for Installer {
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
-                    .fill(CREAM)
+                    .fill(theme::color(ctx, CREAM))
                     .inner_margin(egui::Margin::symmetric(38, 34)),
             )
             .show(ctx, |ui| {
@@ -2118,7 +2156,14 @@ fn client_status(code: &str) -> (&'static str, bool) {
 
 fn header(ui: &mut Ui, title: &str, description: &str) {
     ui.add(egui::Label::new(RichText::new(title).size(36.0).strong()).wrap());
-    ui.add(egui::Label::new(RichText::new(description).size(17.0).color(MUTED)).wrap());
+    ui.add(
+        egui::Label::new(
+            RichText::new(description)
+                .size(17.0)
+                .color(theme::color(ui.ctx(), MUTED)),
+        )
+        .wrap(),
+    );
     ui.add_space(19.0);
 }
 
@@ -2139,14 +2184,23 @@ fn bridge_mark(ui: &mut Ui) {
 
 fn card(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
     Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0_f32, LINE))
+        .fill(theme::color(ui.ctx(), SURFACE))
+        .stroke(Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
         .corner_radius(16)
         .inner_margin(egui::Margin::same(18))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             content(ui);
         });
+}
+
+fn panel_modal(ctx: &egui::Context, id: &'static str) -> egui::Modal {
+    egui::Modal::new(egui::Id::new(id)).frame(
+        Frame::popup(&ctx.style())
+            .fill(theme::color(ctx, SURFACE))
+            .stroke(Stroke::new(1.0_f32, theme::color(ctx, LINE)))
+            .inner_margin(egui::Margin::same(12)),
+    )
 }
 
 fn field_label(ui: &mut Ui, label: &str) -> egui::Id {
@@ -2173,21 +2227,41 @@ fn text_edit(ui: &mut Ui, value: &mut String, width: f32, label: egui::Id) -> bo
 }
 
 fn caption(ui: &mut Ui, message: &str) {
-    ui.add(egui::Label::new(RichText::new(message).size(14.0).color(MUTED)).wrap());
+    ui.add(
+        egui::Label::new(
+            RichText::new(message)
+                .size(14.0)
+                .color(theme::color(ui.ctx(), MUTED)),
+        )
+        .wrap(),
+    );
 }
 
 fn status(ui: &mut Ui, title: &str, detail: &str, color: Color32) {
     ui.add_space(5.0);
     card(ui, |ui| {
-        ui.label(RichText::new(title).size(15.0).strong().color(color));
+        ui.label(
+            RichText::new(title)
+                .size(15.0)
+                .strong()
+                .color(theme::color(ui.ctx(), color)),
+        );
         caption(ui, detail);
     });
 }
 
 fn activity(ui: &mut Ui, message: &str) {
     ui.horizontal_wrapped(|ui| {
-        ui.add(egui::Spinner::new().size(18.0).color(VIOLET));
-        ui.label(RichText::new(message).size(15.0).color(MUTED));
+        ui.add(
+            egui::Spinner::new()
+                .size(18.0)
+                .color(theme::color(ui.ctx(), VIOLET)),
+        );
+        ui.label(
+            RichText::new(message)
+                .size(15.0)
+                .color(theme::color(ui.ctx(), MUTED)),
+        );
     });
 }
 
@@ -2211,10 +2285,17 @@ fn secondary(ui: &mut Ui, title: &str, enabled: bool) -> egui::Response {
 }
 
 fn monitor_button(ui: &mut Ui, title: &str, enabled: bool, fill: Color32) -> egui::Response {
+    let ctx = ui.ctx();
     let text = match fill {
         ERROR => CREAM,
-        LINE => MUTED,
-        _ => INK,
+        LIME => INK,
+        LINE => theme::color(ctx, MUTED),
+        _ => theme::color(ctx, INK),
+    };
+    let fill = if fill == ERROR && ctx.theme() == egui::Theme::Dark {
+        Color32::from_rgb(148, 53, 67)
+    } else {
+        theme::color(ctx, fill)
     };
     ui.add_enabled(
         enabled,

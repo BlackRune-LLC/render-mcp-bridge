@@ -47,10 +47,10 @@ To keep the Bridge running after closing setup, use **Shutdown and terminal comm
 
 #### Windows control panel
 
-In the installer built from current source, choose **Open Render Bridge** on **Connect** to launch the compact panel. It also has a per-user **Render Bridge** entry in the Windows Start menu. You can use the panel with the separate Gaming Mode shortcut left off.
+In the installer built from current source, choose **Open Render Bridge** on **Connect** to launch the compact panel. It also has a per-user **Render Bridge** entry in the Windows Start menu. The panel follows Windows light or dark appearance.
 
 - **Jobs** shows running and queued jobs for the local ComfyUI address selected in setup. When ComfyUI sends progress for a running stage, the panel shows its step count and percentage.
-- **Start server** starts the Render Bridge MCP server using your saved installation. The red **Stop server** button stops the Render Bridge session started by this panel after you review the queue and confirm. If a wizard or terminal session already runs Render Bridge, stop it there before starting a session from the panel. Manage ComfyUI in its own app or through its launch command.
+- **Start server** starts Render Bridge using your saved installation. When the server is running, the muted button remains clickable to confirm its status. The red **Stop server** button stops the session started by this panel after you review the queue and confirm. Manage ComfyUI in its own app or through its launch command.
 - **Hide to tray** keeps Render Bridge in the Windows notification area. Click its icon to reopen the panel. If the icon is in the overflow, open **Show hidden icons** first.
 - In **Settings**, turn on **Start hidden when I sign in** to open Render Bridge in the notification area after you sign in to Windows. Use **Start server** in the panel when you want the Render Bridge MCP server to run.
 - Select **Update** to check for a newer stable Windows release on the official GitHub repository. If that release has a signed installer, choose **Install update** to download and verify it from the panel. Render Bridge checks for active jobs and any server session the panel owns before replacing the installed version. The update keeps your saved settings, ComfyUI address, and token on this PC.
