@@ -53,15 +53,11 @@ impl RunningBridge {
             .path()
             .file_name()
             .ok_or("Could not prepare a Bridge session ID.")?;
-        let data_dir = installed
-            .app_dir
-            .parent()
-            .ok_or("The Bridge data directory is missing.")?;
         let child = setup::quiet_command(setup::venv_python(&installed.app_dir))
             .arg(installed.app_dir.join("comfy_mcp_server.py"))
             .current_dir(&installed.app_dir)
             .stdin(Stdio::piped())
-            .env("COMFY_MCP_DATA_DIR", data_dir)
+            .env("COMFY_MCP_DATA_DIR", &installed.data_dir)
             .env("COMFY_ROOT", &settings.comfy_root)
             .env("COMFY_URL", &settings.comfy_url)
             .env("COMFY_INPUT_DIR", setup::folder(settings, "input"))

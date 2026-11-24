@@ -38,7 +38,7 @@ from PIL import ImageChops, ImageFilter, ImageOps
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, ImageContent, TextContent, ToolAnnotations
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 if os.name == "nt":
     USER_DATA_ROOT = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
@@ -421,10 +421,14 @@ _state: dict[str, Any] = {
     "last_unload_reason": None,
 }
 
-# Background jobs (start_job / get_job). Kept in memory; lost if this server restarts.
+# Background job tasks and full results live in memory. A private journal retains status and file references.
 _jobs: dict[str, dict[str, Any]] = {}
 _current_job: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("current_job", default=None)
 JOB_RETENTION_S = 24 * 3600
+JOB_HISTORY_LIMIT = 256
+JOB_OUTPUT_LIMIT = 512
+JOB_ACTIVE = {"queued", "running", "recovering", "cancel_requested", "cancel_unknown"}
+JOB_PROMPT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 # The project (name, context version) the current tool call works for; set by use_project().
 _call_project: contextvars.ContextVar[tuple[str, int] | None] = contextvars.ContextVar("call_project", default=None)
 
@@ -517,6 +521,7 @@ async def idle_watcher() -> None:
     while True:
         await asyncio.sleep(15)
         try:
+            _prune_jobs()
             if PAUSE_FLAG.exists():
                 continue
             if not await comfy_up():
@@ -964,17 +969,31 @@ async def _queue_and_wait(graph: dict[str, Any], timeout_s: int) -> tuple[str, d
     if PAUSE_FLAG.exists():
         raise ToolError(PAUSED_MSG)
     t0 = time.time()
+    job = _current_job.get()
+    if job is not None:
+        if job["status"] != "running":
+            raise asyncio.CancelledError
+        job["submission_pending"] = True
+        if not _remember_job(job):
+            job["submission_pending"] = False
+            raise ToolError("Could not record the background job before submitting to ComfyUI.")
     try:
         r = await _http.post("/prompt", json={"prompt": graph, "client_id": f"mcp-{uuid.uuid4().hex[:8]}"})
     except httpx.HTTPError as e:
         raise _comfy_lost(e) from None
     if r.status_code != 200:
+        if job is not None and 400 <= r.status_code < 500:
+            job["submission_pending"] = False
+            _remember_job(job)
         raise ToolError(f"ComfyUI rejected the workflow ({r.status_code}): {r.text[:2000]}")
     prompt_id = r.json()["prompt_id"]
+    if not isinstance(prompt_id, str) or not JOB_PROMPT_ID.fullmatch(prompt_id):
+        raise ToolError("ComfyUI did not return a usable prompt ID. Its submission may still be active.")
     _last_prompt.set(prompt_id)
-    job = _current_job.get()
     if job is not None:
         job["prompt_ids"].append(prompt_id)
+        job["submission_pending"] = False
+        _remember_job(job)
     started: float | None = None  # when ComfyUI began running it: the run timeout counts from here
     next_check, missing = 0.0, 0
     try:
@@ -992,10 +1011,13 @@ async def _queue_and_wait(graph: dict[str, Any], timeout_s: int) -> tuple[str, d
             if started is not None and now - started > timeout_s:
                 raise ToolError(f"Timed out after {timeout_s}s of running prompt {prompt_id} (it may still be running).")
             if started is None and now - t0 > QUEUE_WAIT_MAX_S:
-                await _dequeue(prompt_id)
+                removed = await _dequeue(prompt_id)
+                queue = await _upstream_queue() if removed else None
+                outcome = ("The prompt is no longer in the queue."
+                           if queue is not None and prompt_id not in queue
+                           else "Its removal could not be confirmed. It may still be queued or running.")
                 raise ToolError(f"Gave up after {QUEUE_WAIT_MAX_S / 60:g} min waiting in ComfyUI's queue behind other "
-                                "jobs, and took this request out of the queue. Nothing was generated; server_status shows "
-                                "the queue, so try again when it is shorter.")
+                                f"jobs. {outcome}")
             try:
                 h = await _http.get(f"/history/{prompt_id}")
             except httpx.HTTPError as e:
@@ -1014,7 +1036,7 @@ async def _queue_and_wait(graph: dict[str, Any], timeout_s: int) -> tuple[str, d
                     return prompt_id, entry, time.time() - (started or t0)
             await asyncio.sleep(0.5)
     except asyncio.CancelledError:
-        if started is None:  # don't leave work for the GPU that nobody will collect
+        if started is None and job is None:
             await _dequeue(prompt_id)
         raise
 
@@ -1032,11 +1054,12 @@ async def _prompt_state(prompt_id: str) -> str:
         return "unknown"
 
 
-async def _dequeue(prompt_id: str) -> None:
+async def _dequeue(*prompt_ids: str) -> bool:
     try:
-        await _http.post("/queue", json={"delete": [prompt_id]}, timeout=5)
-    except Exception as e:  # noqa: BLE001
-        log(f"could not remove prompt {prompt_id} from the queue: {e!r}")
+        response = await _http.post("/queue", json={"delete": list(prompt_ids)}, timeout=5)
+        return response.is_success
+    except httpx.HTTPError:
+        return False
 
 
 def comfy_view_url(img: dict[str, Any]) -> str:
@@ -1166,9 +1189,11 @@ def log_asset(tool: str, summary: dict[str, Any], files: list[dict[str, Any]]) -
     Returns (project, context version)."""
     project, version = _log_project()
     summary["project"], summary["project_context_version"] = project, version
+    job = _current_job.get()
+    if job is not None:
+        _remember_job_outputs(job, files)
     try:
         ensure_record_dir()
-        job = _current_job.get()
         skip = {"images", "files", "download_hint", "godot_hint", "preview", "files_in_zip", "project",
                 "project_context_version"}
         rec = {
@@ -1818,9 +1843,12 @@ async def run_animation(tool: str, g: dict[str, Any], summary: dict[str, Any]) -
         prompt_id = _last_prompt.get()
         try:
             if prompt_id:
-                # A cancelled or timed-out prompt may still be running: stop it, so it saves nothing after this record.
-                await _http.post("/interrupt", json={"prompt_id": prompt_id}, timeout=5)
-                await _dequeue(prompt_id)
+                # A background cancellation owns upstream requests; a direct tool call may
+                # still request a targeted stop without using ComfyUI's global interrupt.
+                job = _current_job.get()
+                if job is None or job["status"] != "cancel_requested":
+                    if await _request_prompt_cancel(prompt_id) == "unsupported":
+                        await _dequeue(prompt_id)
             entry = None
             for _ in range(8 if prompt_id else 0):
                 entry = (await _http.get(f"/history/{prompt_id}", timeout=5)).json().get(prompt_id)
@@ -3500,14 +3528,308 @@ JOB_TOOLS = {
 }
 
 
+def _job_directory() -> Path:
+    identity = [COMFY_URL, MCP_PORT, *(os.path.normcase(os.path.realpath(COMFY_DIRS[kind]))
+                                    for kind in ("input", "output"))]
+    backend = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
+    return DATA_DIR / "jobs" / backend
+
+
+def _remember_job(job: dict[str, Any]) -> bool:
+    """Record only recovery metadata. URLs, prompts, previews and errors stay in memory."""
+    from tempfile import NamedTemporaryFile
+
+    directory = _job_directory()
+    fields = ("id", "tool", "status", "created", "started", "finished", "prompt_ids",
+              "submission_pending", "outputs", "cancel_targets", "cancel_acknowledged")
+    metadata = {key: job[key] for key in fields if key in job}
+    temporary = None
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with NamedTemporaryFile(dir=directory, encoding="utf-8", mode="w", delete=False) as file:
+            temporary = Path(file.name)
+            json.dump(metadata, file, ensure_ascii=True, separators=(",", ":"))
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.replace(directory / f"{job['id']}.json")
+        return True
+    except OSError as error:
+        log(f"could not save job metadata ({type(error).__name__})")
+        return False
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _job_output_reference(item: Any) -> dict[str, str] | None:
+    if not isinstance(item, dict) or item.get("type", "output") != "output":
+        return None
+    filename, subfolder = item.get("filename"), item.get("subfolder", "")
+    if (not isinstance(filename, str) or not 0 < len(filename) <= 255
+            or filename in {".", ".."} or any(c in filename for c in ("/", "\\", ":"))
+            or not isinstance(subfolder, str) or len(subfolder) > 512
+            or any(c in subfolder for c in ("\\", ":")) or subfolder.startswith("/")
+            or ".." in subfolder.split("/") or any(ord(c) < 32 for c in filename + subfolder)):
+        return None
+    ref = {"filename": filename, "subfolder": subfolder, "type": "output"}
+    for key in ("kind", "role"):
+        value = item.get(key)
+        if isinstance(value, str) and 0 < len(value) < 40 and all(c.isalnum() or c in "_-" for c in value):
+            ref[key] = value
+    return ref
+
+
+def _remember_job_outputs(job: dict[str, Any], outputs: list[dict[str, Any]]) -> None:
+    known = job.setdefault("outputs", [])
+    before = len(known)
+    seen = {(item["subfolder"], item["filename"]) for item in known}
+    for item in outputs:
+        if len(known) >= JOB_OUTPUT_LIMIT:
+            break
+        ref = _job_output_reference(item)
+        if ref is None:
+            continue
+        key = ref["subfolder"], ref["filename"]
+        if key not in seen:
+            known.append(ref)
+            seen.add(key)
+    if len(known) != before:
+        _remember_job(job)
+
+
+def _restore_jobs() -> None:
+    for path in _job_directory().glob("*.json"):
+        try:
+            if not re.fullmatch(r"[0-9a-f]{12}", path.stem) or path.stat().st_size > 2 * 1024 * 1024:
+                continue
+            job = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(job, dict) or job.get("id") != path.stem or job.get("tool") not in JOB_TOOLS
+                    or job.get("status") not in JOB_ACTIVE | {"done", "cancelled", "interrupted", "error"}
+                    or not isinstance(job.get("created"), (int, float)) or not math.isfinite(job["created"])
+                    or not isinstance(job.get("prompt_ids"), list)
+                    or not all(isinstance(pid, str) and JOB_PROMPT_ID.fullmatch(pid) for pid in job["prompt_ids"])):
+                continue
+            if any(key in job and (not isinstance(job[key], (int, float)) or not math.isfinite(job[key]))
+                   for key in ("started", "finished")):
+                continue
+            refs = job.get("outputs", [])
+            targets = job.get("cancel_targets", {})
+            acknowledged = job.get("cancel_acknowledged", [])
+            if (not isinstance(refs, list) or not isinstance(targets, dict) or not isinstance(acknowledged, list)
+                    or any(pid not in job["prompt_ids"] or state not in ("pending", "running")
+                           for pid, state in targets.items())
+                    or any(not isinstance(pid, str) or pid not in targets for pid in acknowledged)):
+                continue
+            job["outputs"] = [ref for item in refs[:JOB_OUTPUT_LIMIT] if (ref := _job_output_reference(item))]
+            if job["status"] in {"queued", "running"}:
+                job["status"] = "recovering"
+            job.update(label="", recovered=True)
+            if job["status"] == "error":
+                job["error"] = "The job failed before Render Bridge restarted."
+            _jobs[path.stem] = job
+        except (OSError, ValueError, TypeError, RecursionError):
+            continue
+    _prune_jobs()
+
+
+def _prune_jobs() -> None:
+    now = time.time()
+    inactive = []
+    for job in _jobs.values():
+        if any(task is not None and not task.done() for task in (job.get("task"), job.get("cancel_task"))):
+            continue
+        inactive.append(job)
+    inactive.sort(key=lambda job: job.get("finished", job["created"]), reverse=True)
+    for index, job in enumerate(inactive):
+        if index >= JOB_HISTORY_LIMIT or now - job.get("finished", job["created"]) > JOB_RETENTION_S:
+            try:
+                (_job_directory() / f"{job['id']}.json").unlink(missing_ok=True)
+            except OSError:
+                continue
+            del _jobs[job["id"]]
+
+
+async def _upstream_queue() -> dict[str, str] | None:
+    try:
+        response = await _http.get("/queue", timeout=5)
+        response.raise_for_status()
+        queue = response.json()
+        prompts = {}
+        for key, state in (("queue_pending", "pending"), ("queue_running", "running")):
+            rows = queue[key]
+            if not isinstance(rows, list) or any(not isinstance(row, list) or len(row) < 2
+                                                 or not isinstance(row[1], str) for row in rows):
+                return None
+            prompts.update((row[1], state) for row in rows)
+        return prompts
+    except (httpx.HTTPError, ValueError, TypeError, KeyError):
+        return None
+
+
+async def _request_prompt_cancel(prompt_id: str) -> str:
+    """Ask ComfyUI to stop this exact prompt, never fall back to a global interrupt."""
+    try:
+        response = await _http.post(f"/api/jobs/{quote(prompt_id, safe='')}/cancel", timeout=5)
+        if response.status_code in (404, 405):
+            return "unsupported"
+        if response.is_success and response.json().get("cancelled") is True:
+            return "accepted"
+    except (httpx.HTTPError, ValueError, AttributeError):
+        pass
+    return "unknown"
+
+
+async def _job_history(prompt_id: str) -> dict[str, Any] | None:
+    try:
+        response = await _http.get(f"/history/{quote(prompt_id, safe='')}", timeout=5)
+        response.raise_for_status()
+        history = response.json()
+        if isinstance(history, dict):
+            entry = history.get(prompt_id, {})
+            if isinstance(entry, dict):
+                return entry
+    except (httpx.HTTPError, ValueError):
+        pass
+    return None
+
+
+def _history_outputs(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    outputs = entry.get("outputs", {})
+    return [item for node in outputs.values() if isinstance(node, dict)
+            for items in node.values() if isinstance(items, list)
+            for item in items if isinstance(item, dict)] if isinstance(outputs, dict) else []
+
+
+def _was_interrupted(entry: dict[str, Any]) -> bool:
+    status = entry.get("status", {})
+    messages = status.get("messages", []) if isinstance(status, dict) else []
+    return isinstance(messages, list) and any(
+        isinstance(message, list) and bool(message) and message[0] == "execution_interrupted"
+        for message in messages)
+
+
+def _finish_job(job: dict[str, Any], status: str, error: str | None = None) -> None:
+    job.update(status=status, error=error, finished=time.time())
+    _remember_job(job)
+
+
+async def _recover_prompt_history(job: dict[str, Any]) -> dict[str, dict[str, Any] | None]:
+    history = {}
+    prompts = job["prompt_ids"]
+    for index in range(0, len(prompts), 8):
+        group = prompts[index:index + 8]
+        entries = await asyncio.gather(*(_job_history(pid) for pid in group))
+        history.update(zip(group, entries))
+        _remember_job_outputs(job, [item for entry in entries if entry for item in _history_outputs(entry)])
+    return history
+
+
+async def _refresh_background_job(job: dict[str, Any]) -> None:
+    status = job["status"]
+    if status not in {"recovering", "cancel_requested", "cancel_unknown"}:
+        return
+    prompts = job["prompt_ids"]
+    queue = await _upstream_queue() if prompts else {}
+    if queue is None:
+        if status != "recovering" and status != "cancel_unknown":
+            job["status"] = "cancel_unknown"
+            _remember_job(job)
+        return
+    active = {prompt for prompt in prompts if prompt in queue}
+    job["gpu"] = ("running now" if any(queue[prompt] == "running" for prompt in active)
+                  else "waiting in queue") if active else None
+    if active:
+        if status == "cancel_requested" and any(
+                queue[pid] == "running" and job.get("cancel_targets", {}).get(pid) == "pending"
+                for pid in active):
+            job["status"] = "cancel_unknown"
+            _remember_job(job)
+        return
+    history = await _recover_prompt_history(job)
+    if status == "recovering":
+        if any(entry is None for entry in history.values()):
+            return
+        note = ("Render Bridge restarted before the tool finished. ComfyUI may have accepted a submission "
+                "whose prompt ID was never confirmed." if job.get("submission_pending")
+                else "Render Bridge restarted before the tool finished. Available output files may be incomplete.")
+        _finish_job(job, "interrupted", note)
+        return
+    targets, acknowledged = job.get("cancel_targets"), job.get("cancel_acknowledged", [])
+    if targets is not None and not job.get("submission_pending"):
+        if not prompts:
+            _finish_job(job, "cancelled")
+            return
+        unconfirmed = [pid for pid, kind in targets.items()
+                       if (entry := history[pid]) is None or not (_was_interrupted(entry) or
+                           (not entry and pid in acknowledged and kind == "pending"))]
+        if targets and not unconfirmed:
+            _finish_job(job, "cancelled")
+            return
+        if all(history[pid] for pid in (unconfirmed or prompts)):
+            if job.get("result") is not None:
+                _finish_job(job, "done")
+            else:
+                _finish_job(job, "interrupted", "ComfyUI finished work before cancellation was confirmed. "
+                            "Render Bridge stopped its local task. Available output files may be incomplete.")
+            return
+    if status != "cancel_unknown":
+        job["status"] = "cancel_unknown"
+        _remember_job(job)
+
+
+async def _cancel_background_job(job: dict[str, Any]) -> None:
+    prompts = job["prompt_ids"]
+    queue = await _upstream_queue() if prompts else {}
+    if queue is None:
+        job["status"] = "cancel_unknown"
+        _remember_job(job)
+        return
+    targets = {pid: queue[pid] for pid in prompts if pid in queue}
+    job["cancel_targets"] = targets
+    job["cancel_acknowledged"] = []
+    _remember_job(job)
+    acknowledged, legacy_pending = [], []
+    for pid, state in targets.items():
+        outcome = await _request_prompt_cancel(pid)
+        if outcome == "accepted":
+            acknowledged.append(pid)
+        elif outcome == "unsupported" and state == "pending":
+            legacy_pending.append(pid)
+    if legacy_pending:
+        # Older ComfyUI may accept this HTTP request without deleting a
+        # prompt that started in the meantime. Do not treat it as proof.
+        await _dequeue(*legacy_pending)
+    job["cancel_acknowledged"] = acknowledged
+    if len(acknowledged) != len(targets) or job.get("submission_pending"):
+        job["status"] = "cancel_unknown"
+    _remember_job(job)
+    await _refresh_background_job(job)
+
+
 def _job_public(job: dict[str, Any]) -> dict[str, Any]:
     end = job.get("finished") or time.time()
-    return {
-        "job_id": job["id"], "tool": job["tool"], "label": job["label"], "status": job["status"],
+    result = {
+        "job_id": job["id"], "tool": job["tool"], "label": job.get("label", ""), "status": job["status"],
         "created": time.strftime("%H:%M:%S", time.localtime(job["created"])),
         "elapsed_seconds": round(end - (job.get("started") or job["created"])),
         "error": job.get("error"),
     }
+    if job.get("recovered"):
+        result["recovered"] = True
+    if job.get("gpu"):
+        result["gpu"] = job["gpu"]
+    if job["status"] == "cancel_unknown":
+        result["note"] = "ComfyUI might still be running this work. Check its queue or try cancellation again."
+    return result
+
+
+def _recovered_outputs(job: dict[str, Any]) -> list[dict[str, Any]]:
+    return [{**ref, "url": signed_url(ref),
+             "urls": {label: signed_url(ref, base) for label, base in PUBLIC_URLS.items()}}
+            for ref in job.get("outputs", [])]
 
 
 async def _job_progress(job: dict[str, Any]) -> dict[str, Any]:
@@ -3551,26 +3873,31 @@ async def start_job(tool: str, arguments: dict[str, Any] | None = None, label: s
     except TypeError as e:
         raise ToolError(f"Bad arguments for {tool}: {e}") from None
     now = time.time()
-    for jid in [j for j, v in _jobs.items() if v.get("finished") and now - v["finished"] > JOB_RETENTION_S]:
-        _jobs.pop(jid, None)
+    _prune_jobs()
     job: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "tool": tool, "label": label, "status": "queued", "created": now,
                            "prompt_ids": [], "result": None, "error": None}
 
     async def runner() -> None:
         _current_job.set(job)
         job.update(status="running", started=time.time())
+        _remember_job(job)
         try:
             job["result"] = await fn(**arguments)
-            job["status"] = "done"
+            if job["status"] == "running":
+                _finish_job(job, "done")
         except asyncio.CancelledError:
-            job["status"] = "cancelled"
+            if job["status"] == "running":
+                job.update(status="recovering", recovered=True)
+                _remember_job(job)
             raise
         except Exception as e:  # noqa: BLE001
-            job.update(status="error", error=f"{type(e).__name__}: {e}"[:2000])
+            if job["status"] == "running":
+                _finish_job(job, "error", f"{type(e).__name__}: {e}"[:2000])
         finally:
-            job["finished"] = time.time()
             log(f"job {job['id']} ({tool}) {job['status']}")
 
+    if not _remember_job(job):
+        raise ToolError("Could not record the background job. Check the Render Bridge data directory.")
     _jobs[job["id"]] = job
     job["task"] = asyncio.create_task(runner())
     return json.dumps({"job_id": job["id"], "status": "queued", "next": f'get_job("{job["id"]}", wait_seconds=60)'})
@@ -3580,61 +3907,77 @@ async def start_job(tool: str, arguments: dict[str, Any] | None = None, label: s
 async def get_job(job_id: str, wait_seconds: int = 0) -> CallToolResult:
     """Check a background job from start_job. wait_seconds (0-120) waits for it to finish first.
 
-    When status is "done" this returns the tool's full result (download URLs + previews); "error" includes the
-    message; otherwise it shows whether the job is running or waiting in the GPU queue.
+    Returns the full live result when available. After restart, completed jobs retain downloadable file references
+    and interrupted jobs may have partial outputs. Check again for "recovering" or "cancel_requested".
     """
+    _prune_jobs()
     job = _jobs.get(job_id)
     if job is None:
-        raise ToolError(f"No job {job_id!r} (jobs are kept for 24 h and lost if the server restarts).")
-    if wait_seconds > 0 and job["status"] in ("queued", "running"):
+        raise ToolError(f"No job {job_id!r} (up to {JOB_HISTORY_LIMIT} recent jobs are kept for up to 24 h).")
+    task = job.get("task")
+    if wait_seconds > 0 and task is not None and job["status"] in ("queued", "running"):
         try:
-            await asyncio.wait_for(asyncio.shield(job["task"]), timeout=min(int(wait_seconds), 120))
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
+            await asyncio.wait_for(asyncio.shield(task), timeout=min(int(wait_seconds), 120))
+        except asyncio.TimeoutError:
             pass
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+    if job["status"] in JOB_ACTIVE - {"queued", "running"}:
+        async with job.setdefault("refresh_lock", asyncio.Lock()):
+            cancel_task = job.get("cancel_task")
+            if cancel_task is None or cancel_task.done():
+                await _refresh_background_job(job)
     pub = _job_public(job)
-    if job["status"] == "done":
-        res: CallToolResult = job["result"]
+    res = job.get("result")
+    if job["status"] == "done" and res is not None:
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(pub)), *res.content], is_error=res.is_error)
-    if job["status"] in ("error", "cancelled"):
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps(pub, indent=2))], is_error=job["status"] == "error")
-    pub.update(await _job_progress(job))
-    return CallToolResult(content=[TextContent(type="text", text=json.dumps(pub, indent=2))])
+    if job.get("outputs"):
+        pub["outputs"] = _recovered_outputs(job)
+    if job["status"] in {"queued", "running"}:
+        pub.update(await _job_progress(job))
+    return CallToolResult(content=[TextContent(type="text", text=json.dumps(pub, indent=2))], is_error=job["status"] == "error")
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True), structured_output=False)
 async def list_jobs() -> str:
     """List background jobs (newest first) with their status."""
+    _prune_jobs()
     jobs = sorted(_jobs.values(), key=lambda j: j["created"], reverse=True)
     return json.dumps([_job_public(j) for j in jobs], indent=2)
 
 
 @mcp.tool(structured_output=False)
 async def cancel_job(job_id: str) -> str:
-    """Cancel a queued or running background job (removes it from the GPU queue or interrupts it)."""
+    """Request cancellation. Poll get_job for confirmation or retry if the outcome is unknown."""
+    _prune_jobs()
     job = _jobs.get(job_id)
     if job is None:
         raise ToolError(f"No job {job_id!r}.")
-    if job["status"] not in ("queued", "running"):
+    if job["status"] not in JOB_ACTIVE:
         return json.dumps({"job_id": job_id, "status": job["status"], "note": "already finished"})
-    # Stop the job first and wait for it: a job that queues one prompt after another (repaint_frames) would otherwise
-    # queue its next one while its earlier ones are being cleared, and the GPU would run a frame nobody records.
-    job["task"].cancel()
-    await asyncio.wait({job["task"]}, timeout=10)
-    job.update(status="cancelled", finished=time.time())
-    try:
-        q = (await _http.get("/queue", timeout=5)).json()
-        running = [it[1] for it in q.get("queue_running", [])]
-        pending = [it[1] for it in q.get("queue_pending", [])]
-        mine = list(job["prompt_ids"])
-        for pid in mine:  # the running one first: every moment it runs on, it may finish and save a file nobody records
-            if pid in running:
-                await _http.post("/interrupt", json={"prompt_id": pid}, timeout=5)
-        for pid in mine:  # prompts that already finished are in neither list and need nothing
-            if pid in pending:
-                await _http.post("/queue", json={"delete": [pid]}, timeout=5)
-    except Exception as e:  # noqa: BLE001
-        log(f"cancel_job: {e!r}")
-    return json.dumps({"job_id": job_id, "status": "cancelled"})
+    task = job.get("cancel_task")
+    if task is None or task.done():
+        async with job.setdefault("refresh_lock", asyncio.Lock()):
+            if job["status"] not in JOB_ACTIVE:
+                return json.dumps({"job_id": job_id, "status": job["status"], "note": "already finished"})
+            task = job.get("cancel_task")
+            if task is None or task.done():
+                job["status"] = "cancel_requested"
+                _remember_job(job)
+                runner = job.get("task")
+                if runner is not None and not runner.done():
+                    runner.cancel()
+                task = job["cancel_task"] = asyncio.create_task(_cancel_background_job(job))
+    await asyncio.shield(task)
+    notes = {
+        "cancel_requested": "ComfyUI accepted the request. Check get_job to confirm that it stopped.",
+        "cancel_unknown": "Could not confirm cancellation. ComfyUI might still be running this work.",
+        "cancelled": "Cancellation confirmed. Any files already written remain available.",
+        "done": "The job finished before cancellation was confirmed.",
+        "interrupted": "Render Bridge stopped its local task, and ComfyUI finished work before cancellation was confirmed.",
+    }
+    return json.dumps({"job_id": job_id, "status": job["status"], "note": notes[job["status"]]})
 
 
 # ---------------------------------------------------------------------------
@@ -3751,16 +4094,36 @@ async def serve_signed_file(scope: dict[str, Any], receive: Any, send: Any) -> N
     if exp < time.time() or not hmac.compare_digest(sig, _link_sig(filename, subfolder, ftype, exp)):
         await PlainTextResponse("Download link is invalid or expired.", status_code=403)(scope, receive, send)
         return
+    method = scope["method"]
+    request = _http.build_request(
+        method, comfy_view_url({"filename": filename, "subfolder": subfolder, "type": ftype}),
+        headers={"Accept-Encoding": "identity"}, timeout=120,
+    )
     try:
-        r = await _http.get(comfy_view_url({"filename": filename, "subfolder": subfolder, "type": ftype}), timeout=120)
+        upstream = await _http.send(request, stream=True)
     except httpx.HTTPError:
         await PlainTextResponse("ComfyUI is unavailable.", status_code=503)(scope, receive, send)
         return
-    if r.status_code != 200:
-        await PlainTextResponse("File not found.", status_code=404)(scope, receive, send)
-        return
-    headers = {"Content-Disposition": f'attachment; filename="{quote(filename)}"'}
-    await Response(r.content, media_type=r.headers.get("content-type", "application/octet-stream"), headers=headers)(scope, receive, send)
+    try:
+        if upstream.status_code != 200:
+            await PlainTextResponse("File not found.", status_code=404)(scope, receive, send)
+            return
+        headers = {"Content-Disposition": f'attachment; filename="{quote(filename)}"'}
+        for name in ("content-length", "content-encoding"):
+            if name in upstream.headers:
+                headers[name] = upstream.headers[name]
+        media_type = upstream.headers.get("content-type", "application/octet-stream")
+        if method == "HEAD":
+            response = Response(media_type=media_type, headers=headers)
+            if "content-length" not in headers:
+                del response.headers["content-length"]
+        else:
+            response = StreamingResponse(
+                upstream.aiter_raw(chunk_size=64 << 10), media_type=media_type, headers=headers,
+            )
+        await response(scope, receive, send)
+    finally:
+        await upstream.aclose()
 
 
 async def receive_signed_upload(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -3947,6 +4310,7 @@ async def amain() -> None:
     token = load_token()
     app = mcp.streamable_http_app(stateless_http=True, host=MCP_HOSTS[0], max_request_body_size=64 * 1024 * 1024)
     sockets = bind_listen_sockets(MCP_HOSTS, MCP_PORT)
+    _restore_jobs()
     log(f"Render Bridge listening on {', '.join(MCP_HOSTS)} at port {MCP_PORT}.")
     # Signed upload and download URLs include their own credentials in query strings.
     managed = bool(os.environ.get("RENDER_BRIDGE_MANAGED_ID"))

@@ -5,8 +5,10 @@ use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf, absolute};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use url::{Host, Url};
 
@@ -14,6 +16,9 @@ const DEFAULT_COMFY_URL: &str = "http://127.0.0.1:8188";
 const SERVER: &str = "comfy_mcp_server.py";
 const LAUNCHER: &str = "setup_render_bridge.py";
 const REQUIREMENTS: &str = "requirements.txt";
+const ACTIVE_RUNTIME: &str = "active-runtime";
+const RUNTIME_PREFIX: &str = "app-";
+const INSTALL_CANCELLED: &str = "Setup cancelled. You can retry when ready.";
 const REQUIREMENTS_TEXT: &str = include_str!("../../requirements.txt");
 const RUNTIME_FILES: [(&str, &str); 5] = [
     (SERVER, include_str!("../../comfy_mcp_server.py")),
@@ -24,20 +29,6 @@ const RUNTIME_FILES: [(&str, &str); 5] = [
     ),
     (REQUIREMENTS, REQUIREMENTS_TEXT),
     ("LICENSE", include_str!("../../LICENSE")),
-];
-const STARTER_MODELS: [(&str, &str, &str); 4] = [
-    (
-        "UNETLoader",
-        "unet_name",
-        "SwarmUI_Z-Image-Turbo-FP8Mix.safetensors",
-    ),
-    ("CLIPLoader", "clip_name", "qwen_3_4b.safetensors"),
-    ("VAELoader", "vae_name", "ae.safetensors"),
-    (
-        "CheckpointLoaderSimple",
-        "ckpt_name",
-        "NetaYumev35_pretrained_all_in_one.safetensors",
-    ),
 ];
 const PYTHON_VERSION_CHECK: &str = "import sys; sys.exit(sys.version_info < (3, 11))";
 
@@ -63,12 +54,13 @@ pub struct Settings {
 }
 
 pub struct ModelCheck {
-    pub filename: String,
+    pub filename: &'static str,
     pub available: Option<bool>,
 }
 
 #[derive(Clone)]
 pub struct Installed {
+    pub data_dir: PathBuf,
     pub app_dir: PathBuf,
     pub token_path: PathBuf,
     pub mcp_url: String,
@@ -116,8 +108,43 @@ fn read_settings(directory: &Path) -> Option<Settings> {
     serde_json::from_slice(&fs::read(directory.join("settings.json")).ok()?).ok()
 }
 
+fn active_runtime(directory: &Path) -> io::Result<PathBuf> {
+    let marker = directory.join(ACTIVE_RUNTIME);
+    let pointer = match fs::read_to_string(marker) {
+        Ok(pointer) => pointer,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(directory.join("app")),
+        Err(error) => return Err(error),
+    };
+    let name = pointer.trim();
+    let valid_name = name.strip_prefix(RUNTIME_PREFIX).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.len() <= 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    });
+    if !valid_name {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid runtime name",
+        ));
+    }
+    Ok(directory.join(name))
+}
+
+fn settings_for_runtime(data: &Path, runtime: &Path) -> Option<Settings> {
+    read_settings(if runtime == data.join("app") {
+        data
+    } else {
+        runtime
+    })
+}
+
 pub fn default_settings() -> Settings {
-    let saved = data_dir().ok().and_then(|path| read_settings(&path));
+    let saved = data_dir().ok().and_then(|data| {
+        let runtime = active_runtime(&data).ok()?;
+        settings_for_runtime(&data, &runtime)
+    });
     let root_override = environment_path("COMFY_ROOT");
     let comfy_root = root_override
         .as_ref()
@@ -346,12 +373,13 @@ pub fn probe(settings: &Settings) -> Result<Probe, String> {
     let stats = fetch_json(&agent, origin, "/system_stats").filter(|stats| stats["system"].is_object())
         .ok_or("ComfyUI did not report system information. Start ComfyUI and check the URL, or finish setup and start it later.")?;
     let reported = crate::discovery::inspect(origin, &stats);
-    let models = STARTER_MODELS
+    let models = crate::models::STARTER_PIPELINES
         .iter()
-        .map(|&(node, field, filename)| ModelCheck {
-            filename: filename.into(),
-            available: fetch_json(&agent, origin, &format!("/object_info/{node}"))
-                .and_then(|data| model_available(&data, node, field, filename)),
+        .flat_map(|pipeline| pipeline.files)
+        .map(|file| ModelCheck {
+            filename: file.filename,
+            available: fetch_json(&agent, origin, &format!("/object_info/{}", file.node))
+                .and_then(|data| model_available(&data, file.node, file.field, file.filename)),
         })
         .collect();
     Ok(Probe { models, reported })
@@ -375,21 +403,25 @@ pub(crate) fn quiet_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-fn usable_python(program: impl AsRef<OsStr>, arguments: &[&str]) -> bool {
-    quiet_command(program)
-        .args(arguments)
-        .args(["-c", PYTHON_VERSION_CHECK])
-        .status()
-        .is_ok_and(|status| status.success())
+fn usable_python(program: impl AsRef<OsStr>, arguments: &[&str], cancel: &AtomicBool) -> bool {
+    let mut command = quiet_command(program);
+    command.args(arguments).args(["-c", PYTHON_VERSION_CHECK]);
+    run_install_stage(
+        &mut command,
+        cancel,
+        "Checking Python",
+        Duration::from_secs(8),
+    )
+    .is_ok()
 }
 
-fn python_for_creation() -> Result<Command, String> {
+fn python_for_creation(cancel: &AtomicBool) -> Result<Command, String> {
     if let Some(program) = environment_path("RENDER_BRIDGE_PYTHON") {
-        return usable_python(&program, &[])
-            .then(|| quiet_command(&program))
-            .ok_or(
-                "RENDER_BRIDGE_PYTHON must name a working Python 3.11 or newer executable.".into(),
-            );
+        let usable = usable_python(&program, &[], cancel);
+        check_cancel(cancel)?;
+        return usable.then(|| quiet_command(&program)).ok_or(
+            "RENDER_BRIDGE_PYTHON must name a working Python 3.11 or newer executable.".into(),
+        );
     }
     let candidates: &[(&str, &[&str])] = if cfg!(windows) {
         &[("py", &["-3"]), ("python", &[]), ("python3", &[])]
@@ -397,11 +429,12 @@ fn python_for_creation() -> Result<Command, String> {
         &[("python3", &[]), ("python", &[])]
     };
     for &(program, arguments) in candidates {
-        if usable_python(program, arguments) {
+        if usable_python(program, arguments, cancel) {
             let mut command = quiet_command(program);
             command.args(arguments);
             return Ok(command);
         }
+        check_cancel(cancel)?;
     }
     Err("Python 3.11 or newer was not found. Install Python, reopen setup, or set RENDER_BRIDGE_PYTHON to its executable.".into())
 }
@@ -494,15 +527,14 @@ fn mcp_port() -> Result<u16, String> {
         .ok_or_else(|| "MCP_PORT must be a valid port.".into())
 }
 
-fn installation() -> Result<Installed, String> {
-    let data_dir = data_dir()?;
-    let app_dir = data_dir.join("app");
+fn installation(data_dir: &Path, app_dir: PathBuf) -> Result<Installed, String> {
     let python = venv_python(&app_dir);
     let token_path = if let Some(path) = environment_path("MCP_TOKEN_FILE") {
         let path = if path.is_absolute() || path.starts_with("~") {
             path
         } else {
-            app_dir.join(path)
+            // A relative override used to resolve inside the legacy app.
+            data_dir.join("app").join(path)
         };
         resolve_path(&path).map_err(|_| "The configured MCP token path could not be resolved.")?
     } else {
@@ -510,17 +542,19 @@ fn installation() -> Result<Installed, String> {
     };
     let port = mcp_port()?;
     Ok(Installed {
-        start_command: start_command(&data_dir, &app_dir, &python, &token_path, port)?,
+        start_command: start_command(data_dir, &app_dir, &python, &token_path, port)?,
         mcp_url: format!("http://127.0.0.1:{port}/mcp"),
         token_path,
+        data_dir: data_dir.to_path_buf(),
         app_dir,
     })
 }
 
 pub fn existing_install() -> Option<Installed> {
-    let installed = installation().ok()?;
-    let data = installed.app_dir.parent()?;
-    read_settings(data)?;
+    let data = data_dir().ok()?;
+    let app = active_runtime(&data).ok()?;
+    let installed = installation(&data, app).ok()?;
+    settings_for_runtime(&data, &installed.app_dir)?;
     (venv_python(&installed.app_dir).is_file()
         && RUNTIME_FILES
             .iter()
@@ -529,87 +563,201 @@ pub fn existing_install() -> Option<Installed> {
 }
 
 pub(crate) fn saved_install_settings(installed: &Installed) -> Result<Settings, String> {
-    let settings = installed
-        .app_dir
-        .parent()
-        .and_then(read_settings)
+    let settings = settings_for_runtime(&installed.data_dir, &installed.app_dir)
         .ok_or("Bridge setup settings are missing. Run setup again.")?;
     validate_settings(&settings)
 }
 
-pub fn install(settings: &Settings, mut progress: impl FnMut(&str)) -> Result<Installed, String> {
+fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(INSTALL_CANCELLED.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn stop_install_stage(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // The unreaped child owns its process group. Its ID cannot be reused.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+
+    // Windows Python launchers can spawn a separate interpreter. Stop the
+    // tree rooted at this stage's still-owned process before reaping it.
+    #[cfg(windows)]
+    if matches!(child.try_wait(), Ok(None))
+        && let Some(system) = environment_path("SystemRoot")
+    {
+        let _ = quiet_command(system.join("System32/taskkill.exe"))
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_install_stage(
+    command: &mut Command,
+    cancel: &AtomicBool,
+    phase: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    check_cancel(cancel)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|_| {
+        format!("{phase} could not start. Check the Python executable and setup permissions.")
+    })?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                check_cancel(cancel)?;
+                return if status.success() {
+                    Ok(())
+                } else {
+                    let code = status
+                        .code()
+                        .map_or_else(|| "interrupted".into(), |code| format!("exit code {code}"));
+                    Err(format!(
+                        "{phase} failed ({code}). Check Python, write permissions, and access to your package index before retrying."
+                    ))
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                stop_install_stage(&mut child);
+                return Err(format!("{phase} stopped unexpectedly. Retry setup."));
+            }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            stop_install_stage(&mut child);
+            return Err(INSTALL_CANCELLED.into());
+        }
+        if Instant::now() >= deadline {
+            stop_install_stage(&mut child);
+            return Err(format!(
+                "{phase} timed out. Check your connection and retry setup."
+            ));
+        }
+        thread::sleep(Duration::from_millis(75));
+    }
+}
+
+fn activate_runtime(
+    directory: &Path,
+    staging: tempfile::TempDir,
+    settings: &Settings,
+) -> io::Result<()> {
+    save_settings(staging.path(), settings)?;
+    let name = staging
+        .path()
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid runtime name"))?;
+    atomic_write(&directory.join(ACTIVE_RUNTIME), name.as_bytes())?;
+    // Existing shortcut and command paths can still point to a previous generation.
+    let _ = staging.keep();
+    Ok(())
+}
+
+pub fn install(
+    settings: &Settings,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(&str),
+) -> Result<Installed, String> {
+    check_cancel(cancel)?;
     let settings = validate_settings(settings)?;
-    let installed = installation()?;
-    let python = venv_python(&installed.app_dir);
-    create_private_dir(&installed.app_dir)
-        .map_err(|_| "Could not create the Render Bridge app directory.")?;
+    let data_dir = data_dir()?;
+    create_private_dir(&data_dir)
+        .map_err(|_| "Could not create the Render Bridge data directory.")?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(installed.app_dir.join("install.lock"))
+        .open(data_dir.join("install.lock"))
         .map_err(|_| "Could not open the Render Bridge install lock.")?;
     lock.try_lock().map_err(
         |_| "Could not lock the runtime for setup. Close any other setup wizard and retry.",
     )?;
 
-    if !python.is_file() {
-        progress("Looking for Python 3.11 or newer.");
-        let mut command = python_for_creation()?;
-        progress("Creating the Render Bridge virtual environment.");
-        let status = command
-            .args(["-m", "venv"])
-            .arg(installed.app_dir.join(".venv"))
-            .status()
-            .map_err(|_| "Could not launch Python to create the virtual environment.")?;
-        if !status.success() {
-            return Err("Could not create the virtual environment. Check your Python installation and app directory permissions.".into());
-        }
-    }
-    if !usable_python(&python, &[]) {
-        return Err("The Render Bridge .venv needs Python 3.11 or newer. Move that environment aside and rerun setup.".into());
-    }
-
-    progress("Installing Python dependencies. This may take a minute.");
-    let mut requirements = tempfile::Builder::new()
-        .prefix(".requirements-")
-        .suffix(".txt")
-        .tempfile_in(&installed.app_dir)
-        .map_err(|_| "Could not stage the Python requirements.")?;
-    requirements
-        .write_all(REQUIREMENTS_TEXT.as_bytes())
-        .map_err(|_| "Could not write the Python requirements.")?;
-    requirements
-        .flush()
-        .map_err(|_| "Could not write the Python requirements.")?;
-    let status = quiet_command(&python)
-        .args([
-            "-m",
-            "pip",
-            "--disable-pip-version-check",
-            "--no-input",
-            "install",
-            "-r",
-        ])
-        .arg(requirements.path())
-        .status()
-        .map_err(|_| "Could not launch pip from the Render Bridge virtual environment.")?;
-    if !status.success() {
-        return Err("Dependency installation failed. Check your package index and connection, then rerun setup.".into());
-    }
-
-    progress("Saving the runtime files and ComfyUI settings.");
+    let staging = tempfile::Builder::new()
+        .prefix(RUNTIME_PREFIX)
+        .tempdir_in(&data_dir)
+        .map_err(|_| "Could not create a staging directory for this upgrade.")?;
+    let installed = installation(&data_dir, staging.path().to_path_buf())?;
+    let python = venv_python(&installed.app_dir);
     for (name, content) in RUNTIME_FILES {
-        atomic_write(&installed.app_dir.join(name), content.as_bytes()).map_err(|_| {
-            format!("Could not install {name}. Check the app directory permissions.")
-        })?;
+        check_cancel(cancel)?;
+        atomic_write(&installed.app_dir.join(name), content.as_bytes())
+            .map_err(|_| format!("Could not stage {name}. Check the app directory permissions."))?;
     }
-    let data_dir = installed
-        .app_dir
-        .parent()
-        .ok_or("The Bridge data directory is missing.")?;
-    save_settings(data_dir, &settings).map_err(|_| "Could not save the ComfyUI settings.")?;
+    progress("Looking for Python 3.11 or newer.");
+    let mut command = python_for_creation(cancel)?;
+    progress("Preparing a fresh Python environment.");
+    run_install_stage(
+        command
+            .args(["-m", "venv"])
+            .arg(installed.app_dir.join(".venv")),
+        cancel,
+        "Python environment creation",
+        Duration::from_secs(120),
+    )?;
+
+    progress("Installing Python dependencies.");
+    run_install_stage(
+        quiet_command(&python)
+            .args([
+                "-m",
+                "pip",
+                "--disable-pip-version-check",
+                "--no-input",
+                "install",
+                "--timeout",
+                "20",
+                "--retries",
+                "1",
+                "-r",
+            ])
+            .arg(installed.app_dir.join(REQUIREMENTS)),
+        cancel,
+        "Dependency installation",
+        Duration::from_secs(600),
+    )?;
+
+    progress("Checking the staged Render Bridge runtime.");
+    run_install_stage(
+        quiet_command(&python).args(["-m", "pip", "--disable-pip-version-check", "check"]),
+        cancel,
+        "Dependency verification",
+        Duration::from_secs(45),
+    )?;
+    let smoke_data = tempfile::Builder::new()
+        .prefix(".smoke-")
+        .tempdir_in(&installed.app_dir)
+        .map_err(|_| "Could not prepare the runtime check.")?;
+    run_install_stage(
+        quiet_command(&python)
+            .current_dir(&installed.app_dir)
+            .env("COMFY_MCP_DATA_DIR", smoke_data.path())
+            .env("MCP_TOKEN_FILE", smoke_data.path().join("token.txt"))
+            .arg(installed.app_dir.join(SERVER))
+            .arg("--help"),
+        cancel,
+        "Render Bridge startup check",
+        Duration::from_secs(30),
+    )?;
+    drop(smoke_data);
+
+    check_cancel(cancel)?;
+    progress("Activating the verified Render Bridge runtime.");
+    activate_runtime(&data_dir, staging, &settings)
+        .map_err(|_| "Could not activate the verified runtime. Retry setup.")?;
     Ok(installed)
 }
 
@@ -619,6 +767,59 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn upgrade_activation_keeps_previous_runtime_settings_and_token() {
+        let data = tempfile::tempdir().unwrap();
+        let previous = tempfile::Builder::new()
+            .prefix(RUNTIME_PREFIX)
+            .tempdir_in(data.path())
+            .unwrap();
+        let previous_path = previous.path().to_path_buf();
+        let token = data.path().join("token.txt");
+        fs::write(&token, b"fixture-token").unwrap();
+        let settings = Settings {
+            comfy_root: "fixture".into(),
+            comfy_url: "http://localhost:8188".into(),
+            comfy_input: String::new(),
+            comfy_output: String::new(),
+        };
+        activate_runtime(data.path(), previous, &settings).unwrap();
+
+        let broken = tempfile::Builder::new()
+            .prefix(RUNTIME_PREFIX)
+            .tempdir_in(data.path())
+            .unwrap();
+        let broken_path = broken.path().to_path_buf();
+        fs::create_dir(broken_path.join("settings.json")).unwrap();
+        assert!(activate_runtime(data.path(), broken, &settings).is_err());
+        assert!(!broken_path.exists());
+        assert_eq!(active_runtime(data.path()).unwrap(), previous_path);
+        assert!(
+            settings_for_runtime(data.path(), &previous_path)
+                .is_some_and(|stored| stored == settings)
+        );
+
+        let latest = tempfile::Builder::new()
+            .prefix(RUNTIME_PREFIX)
+            .tempdir_in(data.path())
+            .unwrap();
+        let latest_path = latest.path().to_path_buf();
+        let changed = Settings {
+            comfy_url: "http://localhost:9288".into(),
+            ..settings.clone()
+        };
+        activate_runtime(data.path(), latest, &changed).unwrap();
+        assert_eq!(active_runtime(data.path()).unwrap(), latest_path);
+        assert!(
+            settings_for_runtime(data.path(), &latest_path).is_some_and(|stored| stored == changed)
+        );
+        assert!(
+            settings_for_runtime(data.path(), &previous_path)
+                .is_some_and(|stored| stored == settings)
+        );
+        assert_eq!(fs::read(&token).unwrap(), b"fixture-token");
+    }
 
     #[test]
     fn start_command_carries_its_own_local_endpoint_and_token_location() {

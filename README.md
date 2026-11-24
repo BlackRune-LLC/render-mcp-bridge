@@ -6,6 +6,8 @@ A self-hosted image MCP server that lets your agents do the work in ComfyUI. You
 
 ## Install and run
 
+Docker is optional. The desktop installer and terminal setup run Render Bridge with Python 3.11 or newer. Install and start ComfyUI separately. Building the desktop wizard from source also requires Rust and the native build tools listed below.
+
 1. Install and start [ComfyUI](https://docs.comfy.org/installation/manual_install) on the same host. Confirm its API responds at `http://127.0.0.1:8188/system_stats`. Find the ComfyUI directory that contains its `input` and `output` folders. For a Windows portable install, this is usually the inner `ComfyUI` directory.
 2. Install Python 3.11 or later. Clone this repository or download its source, then open a terminal in that directory.
 
@@ -22,7 +24,7 @@ The Windows v0.1.0 download uses the original wizard. Build from the current sou
 
 1. Start ComfyUI, then open the wizard. It checks the selected loopback address, standard ComfyUI addresses, and port hints from current Comfy Desktop builds. Choose your build if several are detected. If its paths cannot be confirmed from its launch settings, copy the actual port from the build's **Overview** and its input and output locations from **Folders**. [Comfy Desktop build settings](https://docs.comfy.org/installation/desktop/usage/instance-management)
 2. Select **Check ComfyUI**. The wizard compares reported folders and checks starter model files. If the API cannot report absolute paths, as with a typical Windows portable launch, browse to the inner `ComfyUI` folder. Setup checks whether ComfyUI can read a temporary marker in each selected folder and removes the markers afterward. Open **Separate input and output folders** when your build uses different locations. If the wizard still cannot confirm the pairing, verify the paths manually or explicitly continue offline.
-3. Select **Install Render Bridge**. This sets up the server and Python environment in the `app` folder inside your Render Bridge user data directory. Select **Create a Gaming Mode shortcut** before installing if you want one.
+3. Review the starter pipelines. The Models screen groups the files for Z-Image Turbo and NetaYume, shows which are available, and links to each download and its ComfyUI folder. You can add weights later. Select **Install Render Bridge** to set up the server and its Python environment. Setup checks a new runtime in its own directory before activating it. If an update fails or is cancelled, the previous runtime stays usable with the same token. Select **Create a Gaming Mode shortcut** before installing if you want one.
 4. Select **Start & Verify** with **Claude Code**, **Codex**, or both checked. The wizard starts a local Bridge and makes an authenticated `server_status` call without rendering. It also checks the saved user settings for the selected clients. If you run Codex with a named profile, enter its name to check that file too. If an entry is missing, add it using the displayed endpoint and private token file, following [the client instructions](#connect-an-mcp-client). Select **Verify again**, then open a fresh client session to test that client's effective configuration.
 
 Use **Open existing setup** to return to Connect without reinstalling. **Stop Bridge** or closing the wizard stops its Bridge session. To keep the Bridge running after closing setup, use **Shutdown and terminal commands** to copy the start command. Press **Ctrl+C** in that terminal when you want to stop it.
@@ -37,9 +39,11 @@ cargo run --locked --manifest-path installer/Cargo.toml
 
 To build the standalone setup executable for the current platform, run `cargo build --release --locked --manifest-path installer/Cargo.toml`. The binary is in `installer/target/release/`. The packaged binary includes the bridge source and the pinned requirements. Installing those Python dependencies needs access to your configured package index.
 
+Windows x64 has a downloadable installer. macOS and Linux use the native source build instructions below. See the [release checklist](docs/releases.md) for signing and clean-machine verification.
+
 **macOS.** Build on the target Mac using its native Rust toolchain. Install the Xcode Command Line Tools with `xcode-select --install` if needed. Launch the installer from Terminal so it inherits your Python path. If setup cannot find your Python, set `RENDER_BRIDGE_PYTHON` to the absolute executable path in that terminal before launching. For ComfyUI Desktop, choose the shared directory that contains `input` and `output`, typically `~/ComfyUI-Shared`. [Rust macOS requirements](https://doc.rust-lang.org/rustc/platform-support/apple-darwin.html) · [ComfyUI Desktop on macOS](https://docs.comfy.org/installation/desktop/macos)
 
-**Linux.** Use your distro's native build packages. On Debian or Ubuntu, follow the [eframe build prerequisites](https://github.com/emilk/egui/blob/0.33.3/crates/eframe/README.md), install `libxcursor1` and `libxkbcommon-x11-0` for X11, and install `python3-venv` if you use the distro's Python and need virtual environment support. Run the wizard in an X11 or Wayland desktop session with OpenGL. The Browse button uses the desktop's file chooser portal. Install the portal backend for your desktop session if you need it, or enter the ComfyUI path directly. [Linux native dialogs](https://docs.rs/rfd/0.16.0/rfd/#xdg-desktop-portal-backend)
+**Linux.** Use your distro's native build packages. On Debian or Ubuntu, follow the [eframe build prerequisites](https://github.com/emilk/egui/blob/0.33.3/crates/eframe/README.md). On a minimal X11 install, check for `libxcursor1`, `libxi6`, `libxrandr2`, and `libxkbcommon-x11-0`. Install `python3-venv` if you use the distro's Python and need virtual environment support. Run the wizard in an X11 or Wayland desktop session with OpenGL. The Browse button uses the desktop's file chooser portal. Install the portal backend for your desktop session if you need it, or enter the ComfyUI path directly. [Linux native dialogs](https://docs.rs/rfd/0.16.0/rfd/#xdg-desktop-portal-backend)
 
 ### Terminal installer
 
@@ -137,7 +141,7 @@ The [pipeline guide](docs/pipelines.md#what-each-pipeline-does) covers editing, 
 
 ## AI server gaming mode
 
-If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu. It toggles Gaming Mode and reports the new state. If you skipped the shortcut, go to **Connect → Shutdown and terminal commands → Turn Gaming Mode off** and run the copied command in a terminal. To turn it on or check its state, replace the final `off` with `on` or `status`. In the v0.1.0 download, copy the start command and replace the final `start` with `gaming-mode off`.
+Toggle the **Gaming Mode** checkbox on **Connect**. If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu to toggle it outside the wizard. For terminal control, go to **Connect → Shutdown and terminal commands → Turn Gaming Mode off** and run the copied command. Use **Copy status command** to check it in a terminal or replace the final `off` with `on` to enable it. In the v0.1.0 download, copy the start command and replace the final `start` with `gaming-mode off`.
 
 If you used the terminal installer, open a second terminal in the repo and use the same Python launcher you used for setup (`py -3` on Windows or `python3` on macOS and Linux).
 

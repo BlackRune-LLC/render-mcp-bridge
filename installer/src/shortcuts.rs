@@ -5,10 +5,7 @@ use tempfile::NamedTempFile;
 
 pub fn create_gaming_shortcut(installed: &Installed) -> Result<PathBuf, String> {
     let app_dir = &installed.app_dir;
-    let data_dir = app_dir
-        .parent()
-        .filter(|path| path.is_absolute())
-        .ok_or("The Render Bridge data directory could not be found.")?;
+    let data_dir = &installed.data_dir;
     let python = venv_python(app_dir);
     let launcher = app_dir.join("setup_render_bridge.py");
     if !python.is_file() || !launcher.is_file() {

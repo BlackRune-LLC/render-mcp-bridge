@@ -2,6 +2,7 @@
 
 mod connection;
 mod discovery;
+mod models;
 mod setup;
 mod shortcuts;
 
@@ -9,8 +10,11 @@ use connection::{Client, RunningBridge};
 use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui, Vec2};
 use setup::{Installed, ModelCheck, Settings};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::Duration;
 
 const RAIL: Color32 = Color32::from_rgb(48, 36, 80);
 const RAIL_ACTIVE: Color32 = Color32::from_rgb(224, 212, 249);
@@ -51,6 +55,7 @@ enum Event {
     Checked(CheckOutcome),
     Discovered(Vec<discovery::Instance>),
     Verified(Option<RunningBridge>, Result<serde_json::Value, String>),
+    GamingModeChanged(Result<(), String>),
     Progress(String),
     Finished(Result<Installed, String>),
 }
@@ -68,6 +73,7 @@ struct Installer {
     worker: Option<Receiver<Event>>,
     progress: String,
     install_error: Option<String>,
+    install_cancel: Option<Arc<AtomicBool>>,
     installed: Option<Installed>,
     copied: Option<&'static str>,
     instances: Vec<discovery::Instance>,
@@ -75,6 +81,7 @@ struct Installer {
     discovery_done: bool,
     manual_confirmed: bool,
     gaming_shortcut: bool,
+    gaming_error: Option<String>,
     shortcut_message: Option<(String, bool)>,
     running: Option<RunningBridge>,
     verification: Option<Result<serde_json::Value, String>>,
@@ -114,6 +121,7 @@ impl Installer {
             worker: None,
             progress: String::new(),
             install_error: None,
+            install_cancel: None,
             installed: None,
             copied: None,
             instances: Vec::new(),
@@ -121,6 +129,7 @@ impl Installer {
             discovery_done: false,
             manual_confirmed: false,
             gaming_shortcut: false,
+            gaming_error: None,
             shortcut_message: None,
             running: None,
             verification: None,
@@ -239,6 +248,7 @@ impl Installer {
             return;
         };
         self.verification = None;
+        self.progress = "Starting the Bridge and checking authenticated MCP…".into();
         let mut running = self.running.take();
         let codex_profile = self.codex_profile.trim().to_owned();
         let clients: Vec<_> = [
@@ -272,23 +282,62 @@ impl Installer {
         }
     }
 
+    fn change_gaming_mode(&mut self, ctx: &egui::Context, enabled: bool) {
+        let Some(installed) = self.installed.clone() else {
+            return;
+        };
+        self.gaming_error = None;
+        self.progress = "Updating Gaming Mode…".into();
+        let ctx = ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        let result = thread::Builder::new()
+            .name("render-bridge-gaming-mode".into())
+            .spawn(move || {
+                let state = if enabled { "on" } else { "off" };
+                let succeeded = setup::quiet_command(setup::venv_python(&installed.app_dir))
+                    .arg(installed.app_dir.join("setup_render_bridge.py"))
+                    .args(["--data-dir"])
+                    .arg(&installed.data_dir)
+                    .args(["gaming-mode", state])
+                    .current_dir(&installed.app_dir)
+                    .status()
+                    .is_ok_and(|status| status.success());
+                let result = succeeded.then_some(()).ok_or_else(|| {
+                    "Could not change Gaming Mode. Use the terminal commands below for details."
+                        .into()
+                });
+                let _ = sender.send(Event::GamingModeChanged(result));
+                ctx.request_repaint();
+            });
+        if result.is_ok() {
+            self.worker = Some(receiver);
+        } else {
+            self.gaming_error = Some("Could not start the Gaming Mode control.".into());
+        }
+    }
+
     fn start_install(&mut self, ctx: &egui::Context) {
         let settings = self.settings.clone();
         let ctx = ctx.clone();
         let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
         self.install_error = None;
         self.progress = "Preparing installation…".into();
         match thread::Builder::new()
             .name("install-render-bridge".into())
             .spawn(move || {
-                let result = setup::install(&settings, |message| {
+                let result = setup::install(&settings, &worker_cancel, |message| {
                     let _ = sender.send(Event::Progress(message.into()));
                     ctx.request_repaint();
                 });
                 let _ = sender.send(Event::Finished(result));
                 ctx.request_repaint();
             }) {
-            Ok(_) => self.worker = Some(receiver),
+            Ok(_) => {
+                self.install_cancel = Some(cancel);
+                self.worker = Some(receiver);
+            }
             Err(_) => self.install_error = Some("Could not start installation. Try again.".into()),
         }
     }
@@ -314,9 +363,14 @@ impl Installer {
                     self.running = running;
                     self.verification = Some(result);
                 }
+                Ok(Event::GamingModeChanged(result)) => {
+                    self.worker = None;
+                    self.gaming_error = result.err();
+                }
                 Ok(Event::Progress(message)) => self.progress = message,
                 Ok(Event::Finished(result)) => {
                     self.worker = None;
+                    self.install_cancel = None;
                     match result {
                         Ok(installed) => {
                             if self.gaming_shortcut {
@@ -341,6 +395,7 @@ impl Installer {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.worker = None;
+                    self.install_cancel = None;
                     self.searching = false;
                     let message = "Setup stopped unexpectedly. You can try this step again.".into();
                     if self.step == Step::Install {
@@ -565,34 +620,6 @@ impl Installer {
             "Render Bridge uses model files from your ComfyUI installation.",
         );
         match &self.check {
-            Some(CheckOutcome::Models(models, _)) => {
-                card(ui, |ui| {
-                    for (index, model) in models.iter().enumerate() {
-                        if index > 0 {
-                            ui.separator();
-                        }
-                        ui.horizontal_top(|ui| {
-                            let (label, color) = match model.available {
-                                Some(true) => ("Found", GREEN),
-                                Some(false) => ("Missing", CAUTION),
-                                None => ("Unknown", MUTED),
-                            };
-                            ui.add_sized(
-                                egui::vec2(70.0, 25.0),
-                                egui::Label::new(
-                                    RichText::new(label).size(14.0).strong().color(color),
-                                ),
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&model.filename).monospace().size(13.0),
-                                )
-                                .wrap(),
-                            );
-                        });
-                    }
-                });
-            }
             _ if self.worker.is_some() => activity(ui, "Checking the model loaders…"),
             Some(CheckOutcome::Offline(message)) => {
                 status(ui, "Model status unavailable", message, CAUTION)
@@ -600,15 +627,47 @@ impl Installer {
             Some(CheckOutcome::Failed(message)) => {
                 status(ui, "Check your setup details", message, ERROR)
             }
-            None => caption(
-                ui,
-                "Run the ComfyUI check to see which starter files are available.",
-            ),
+            _ => {}
+        }
+        let checks = match &self.check {
+            Some(CheckOutcome::Models(checks, _)) => checks.as_slice(),
+            _ => &[],
+        };
+        let file_status = |filename| {
+            models::FileStatus::from(
+                checks
+                    .iter()
+                    .find(|check| check.filename == filename)
+                    .and_then(|check| check.available),
+            )
+        };
+        for pipeline in models::STARTER_PIPELINES {
+            card(ui, |ui| {
+                field_label(ui, pipeline.name);
+                let (label, color) = model_status(
+                    models::pipeline_status(
+                        pipeline.files.iter().map(|file| file_status(file.filename)),
+                    ),
+                    true,
+                );
+                ui.label(RichText::new(label).strong().color(color));
+                caption(ui, pipeline.description);
+                for file in pipeline.files {
+                    ui.separator();
+                    let (label, color) = model_status(file_status(file.filename), false);
+                    ui.label(RichText::new(label).strong().color(color));
+                    ui.add(egui::Label::new(RichText::new(file.filename).monospace()).wrap());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(file.folder).monospace().color(MUTED));
+                        ui.hyperlink_to("Open Hugging Face file", file.source);
+                    });
+                }
+            });
         }
         ui.add_space(6.0);
         caption(
             ui,
-            "Missing models can be added later. Setup installs the bridge and its Python dependencies.",
+            "These starter files are public and have no account requirement. Add them to the selected ComfyUI build's model folders, refresh its model list, then check again. File checks do not measure GPU compatibility.",
         );
         ui.horizontal_wrapped(|ui| {
             if secondary(ui, "Check again", self.worker.is_none()).clicked() {
@@ -646,8 +705,22 @@ impl Installer {
         );
         if self.worker.is_some() {
             ui.add_space(9.0);
-            activity(ui, &self.progress);
-            caption(ui, "Keep this window open until installation finishes.");
+            let cancelling = self
+                .install_cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(Ordering::Relaxed));
+            activity(
+                ui,
+                if cancelling {
+                    "Cancelling setup…"
+                } else {
+                    &self.progress
+                },
+            );
+            caption(
+                ui,
+                "Setup activates the new runtime after its dependency and startup checks pass.",
+            );
         }
         ui.add_enabled_ui(self.worker.is_none(), |ui| {
             ui.checkbox(&mut self.gaming_shortcut, "Create a Gaming Mode shortcut");
@@ -667,7 +740,7 @@ impl Installer {
             "Connect your MCP client",
             "Start the Bridge and check the saved MCP setup for the clients you use.",
         );
-        let Some(installed) = &self.installed else {
+        let Some(installed) = self.installed.clone() else {
             return;
         };
         let mut copied = None;
@@ -722,7 +795,7 @@ impl Installer {
         }
         ui.hyperlink_to("Configure Claude Code or Codex", CLIENT_GUIDE);
         if self.worker.is_some() {
-            activity(ui, "Starting the Bridge and checking authenticated MCP…");
+            activity(ui, &self.progress);
         } else if let Some(verification) = &self.verification {
             match verification {
                 Err(message) => status(ui, "Verification could not finish", message, ERROR),
@@ -765,6 +838,35 @@ impl Installer {
                 if *passed { GREEN } else { CAUTION },
             );
         }
+        if let Some(mut enabled) = gaming_mode(&installed) {
+            card(ui, |ui| {
+                if ui
+                    .add_enabled(idle, egui::Checkbox::new(&mut enabled, "Gaming Mode"))
+                    .changed()
+                {
+                    self.change_gaming_mode(ui.ctx(), enabled);
+                }
+                caption(
+                    ui,
+                    if enabled {
+                        "New GPU jobs are paused for this Bridge."
+                    } else {
+                        "This Bridge can accept new GPU jobs."
+                    },
+                );
+            });
+        } else {
+            status(
+                ui,
+                "Gaming Mode",
+                "Status unavailable. Run the status command in a terminal.",
+                MUTED,
+            );
+        }
+        if let Some(message) = &self.gaming_error {
+            status(ui, "Gaming Mode could not change", message, ERROR);
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
         caption(
             ui,
             "Stop Bridge or close this window to stop the Bridge started here.",
@@ -784,6 +886,10 @@ impl Installer {
                     copied = Some("Gaming Mode off command copied");
                 }
                 caption(ui, "Run the off command in a terminal to let agents render again. This works without the shortcut.");
+                let gaming_status = format!("{command} gaming-mode status");
+                if copy_row(ui, "Check Gaming Mode", "Copy status command", &gaming_status) {
+                    copied = Some("Gaming Mode status command copied");
+                }
             }
         });
         if copied.is_some() {
@@ -807,6 +913,12 @@ impl Installer {
             .show(ctx, |ui| {
                 let idle = self.worker.is_none();
                 ui.horizontal(|ui| {
+                    if let Some(cancel) = &self.install_cancel {
+                        let cancellable = !cancel.load(Ordering::Relaxed);
+                        if secondary(ui, "Cancel installation", cancellable).clicked() {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
                     if self.step == Step::Connect && idle {
                         if self.running.is_some() {
                             if secondary(ui, "Stop Bridge", true).clicked() {
@@ -839,6 +951,9 @@ impl Installer {
                                     && !self.settings.comfy_url.trim().is_empty(),
                             ),
                             Step::Models => ("Continue to install", self.can_continue() && idle),
+                            Step::Install if self.install_error.is_some() => {
+                                ("Retry installation", idle)
+                            }
                             Step::Install => ("Install Render Bridge", idle),
                             Step::Connect if self.running.is_some() => ("Verify again", idle),
                             Step::Connect => ("Start & Verify", idle),
@@ -867,6 +982,9 @@ impl eframe::App for Installer {
             && self.worker.is_some()
             && ctx.input(|input| input.viewport().close_requested())
         {
+            if let Some(cancel) = &self.install_cancel {
+                cancel.store(true, Ordering::Relaxed);
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         self.rail(ctx);
@@ -919,6 +1037,33 @@ fn bridge_status(code: &str) -> (&'static str, bool) {
             "Could not verify authenticated MCP. Check the Bridge and try again.",
             false,
         ),
+    }
+}
+
+fn gaming_mode(installed: &Installed) -> Option<bool> {
+    let flag = std::env::var_os("PAUSE_FLAG")
+        .map(std::path::PathBuf::from)
+        .map(|path| {
+            if let Ok(rest) = path.strip_prefix("~")
+                && let Some(home) = std::env::home_dir()
+            {
+                return home.join(rest);
+            }
+            installed.app_dir.join(path)
+        })
+        .unwrap_or_else(|| installed.data_dir.join("gaming_mode.flag"));
+    flag.try_exists().ok()
+}
+
+fn model_status(availability: models::FileStatus, pipeline: bool) -> (&'static str, Color32) {
+    use models::FileStatus::*;
+    match (availability, pipeline) {
+        (Found, true) => ("All files found", GREEN),
+        (Missing, true) => ("Files missing", CAUTION),
+        (Unknown, true) => ("Availability unconfirmed", MUTED),
+        (Found, false) => ("Found", GREEN),
+        (Missing, false) => ("Missing", CAUTION),
+        (Unknown, false) => ("Unknown", MUTED),
     }
 }
 

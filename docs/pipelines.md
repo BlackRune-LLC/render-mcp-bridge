@@ -53,6 +53,8 @@ For a workflow that explicitly calls for a third-party node pack, open it in Com
 
 For model-heavy operations that support it, call `start_job`, then `get_job` to retrieve the finished result. Keep the job ID and returned file references together.
 
+After a Bridge restart, call `get_job` with the same ID. Recent completed jobs return fresh links in `outputs`. The Bridge keeps up to 256 recent inactive job records for up to 24 hours. A job that was in flight can report `recovering` while ComfyUI finishes its existing prompts, then `interrupted` with any partial outputs found. To cancel, call `cancel_job` and poll `get_job`. `cancel_requested` means ComfyUI acknowledged the request, `cancelled` means the Bridge confirmed the stop, and `cancel_unknown` means it could not confirm the outcome. Running-job cancellation depends on ComfyUI's prompt-specific cancel support.
+
 For an image already generated on this server, give the editing or cutout tool its returned `filename` and `subfolder` with `source="output"`. For a file on your own device, ask your agent to use `upload_link`, upload the file, then pass the returned file reference with `source="input"`.
 
 ### Transparent images and cutouts
