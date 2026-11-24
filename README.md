@@ -4,9 +4,19 @@ A self-hosted image MCP server that lets your agents do the work in ComfyUI. You
 
 [Download for Windows x64](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/download/v0.1.0/RenderBridgeSetup.exe) · [Build the desktop installer](#build-the-desktop-installer) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline) · [Ask your agent to install it](#ask-your-agent-to-set-it-up)
 
+## Why Render Bridge
+
+ComfyUI gives you the visual workflow editor and runs the models. Comfy Desktop helps you install and manage ComfyUI instances. Render Bridge fits a setup where one machine runs ComfyUI and your agents send it work, either locally or from trusted machines over a private connection.
+
+- **Hand a job to an agent.** Give it a prompt, image, or workflow. It can pick an installed preset, submit a background job, check progress, and bring back the result.
+- **Move files between the agent and the GPU host.** Signed upload and download links let the agent hand off inputs and retrieve outputs. Project context and asset history can stay together on the host.
+- **Keep control of the GPU.** Gaming mode pauses new bridge jobs and can request a model unload when ComfyUI is idle.
+
+Comfy Org also offers agent tools through Comfy MCP. Render Bridge focuses on a bearer-authenticated HTTP endpoint you host, signed file transfers, project records, and the gaming controls above. [Official Comfy MCP](https://github.com/Comfy-Org/comfy-mcp)
+
 ## Install and run
 
-1. Install and start [ComfyUI](https://docs.comfy.org/installation/manual_install) on the same host. Confirm its API responds at `http://127.0.0.1:8188/system_stats`. Find the ComfyUI directory that contains its `input` and `output` folders. For a Windows portable install, this is usually the inner `ComfyUI` directory.
+1. Use your existing ComfyUI installation, [get Comfy Desktop from Comfy Org](https://comfy.org/download), or follow [ComfyUI's manual install guide](https://docs.comfy.org/installation/manual_install). Start ComfyUI on the same host as Render Bridge. Check `/system_stats` on your instance's local API address. A default manual install uses `http://127.0.0.1:8188`. Find the directory with `input` and `output`. For a Windows portable install, this is usually the inner `ComfyUI` directory. [Comfy Desktop instance settings](https://docs.comfy.org/installation/desktop/usage/instance-management)
 2. Install Python 3.11 or later. Clone this repository or download its source, then open a terminal in that directory.
 
 ```sh

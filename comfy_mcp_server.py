@@ -217,7 +217,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "lora": None,
     },
     "cinematic": {
-        "description": "HiDream-O1 (MIT, 8B). Cinematic / Unreal-Engine-style renders, environments, hero shots. 40 steps, up to 2048px.",
+        "description": "HiDream-O1 (MIT, 8B). Cinematic renders, environments, and hero shots. 40 steps, up to 2048px.",
         "builder": "hidream",
         "family": "hidream_o1",
         "ckpt": "hidream_o1_image_bf16.safetensors",
@@ -1214,7 +1214,7 @@ mcp = MCPServer(
         "Use generate_image for game art; set transparent=true for sprites/icons/UI elements (returns RGBA PNG). "
         "Results contain full-size download URLs; fetch them with curl to save files locally. "
         "Presets: z_image_turbo (fast default), qwen_image (best quality/text), qwen_image_fast (4-step Qwen), "
-        "anime (anime/illustration concept art), cinematic (Unreal-style cinematic renders), flux_dev "
+        "anime (anime/illustration concept art), cinematic (film-style lighting and scenes), flux_dev "
         "(general/photoreal/painterly), sd35 (wide style range), anima_turbo / anima_aesthetic (Anima: anime, "
         "illustration and painterly art, fast / best-looking), juggernaut_xl (Juggernaut XI SDXL workhorse), "
         "flux3_klein / flux3_klein_base (FLUX.3 Image Klein, the newest BFL model: fast distilled / slower base). "
@@ -1317,7 +1317,7 @@ async def generate_image(
             without one, be specific about style (e.g. "2D game sprite, hand-painted, top-down view").
         preset: z_image_turbo (fast) | qwen_image (best quality & in-image text, ~50 steps) |
             qwen_image_fast (4-step Qwen) | anime (NetaYume Lumina: anime/illustration concept art) |
-            cinematic (HiDream-O1: Unreal-Engine-style cinematic renders, environments, hero shots) |
+            cinematic (HiDream-O1: cinematic renders, environments, and hero shots) |
             flux_dev (FLUX.1-dev: general/photoreal/painterly; takes FLUX.1 LoRAs) |
             sd35 (SD 3.5 Large: wide style range) |
             anima_turbo (Anima, fast: anime/illustration/painterly, not realism) |
@@ -2727,7 +2727,7 @@ async def image_to_3d(
 
     Requires COMFY_3D_WORKFLOW and installed models. The Pixal3D + TRELLIS.2 pipeline can cut out the subject, estimate
     the camera with MoGe, generate the shape, remesh, decimate, UV-unwrap, then bake base color / metallic /
-    roughness, a normal map and ambient occlusion. Output is a GLB you can import into Unreal, Unity or Blender.
+    roughness, a normal map and ambient occlusion. The output is a GLB file.
 
     Best input: a single object or character, centred, full body/object visible, plain background. A good recipe
     is generate_image(..., transparent=true) first, then pass that result's filename/subfolder here.
@@ -2955,7 +2955,7 @@ async def optimize_glb(
     """Make a GLB game-ready: simplify the mesh, shrink textures, clean up (gltf-transform + meshoptimizer).
 
     Typical use: after image_to_3d, make a mobile version, e.g. target_faces=8000, texture_size=1024.
-    Geometry is NOT Draco/meshopt-compressed, so Godot, Unity and Unreal all import it.
+    Geometry is stored without Draco or meshopt compression.
 
     Args:
         filename, subfolder, source: a GLB on the server (image_to_3d saves to subfolder "mcp/3d"; pass the
@@ -2963,8 +2963,7 @@ async def optimize_glb(
         target_faces: triangle target (0 = keep geometry; mobile ~2k-20k, PC ~30k-100k). Simplification also stops
             early if it would exceed max_error, so the shape is protected.
         texture_size: maximum texture width/height in px (e.g. 512, 1024, 2048; 0 = keep).
-        texture_format: "keep" (same format, e.g. PNG) or "webp" (much smaller; Godot 4 and Blender read it,
-            some older importers don't).
+        texture_format: "keep" (same format, e.g. PNG) or "webp" (smaller textures when the importer supports WebP).
         max_error: simplification error limit as a fraction of the model size (0.01 = 1%).
     Returns before/after stats and a download link to the optimised GLB.
     project: the game this result is logged under (default: the active project).
