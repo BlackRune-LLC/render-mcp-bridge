@@ -15,13 +15,14 @@ const REVISION_SCHEMA: u32 = 1;
 const MAX_REVISION_BYTES: u64 = 256 * 1024;
 const READ_ERROR: &str = "Could not read the saved pipeline revisions.";
 const INVALID_HISTORY: &str = "The saved pipeline revision file has an unsupported format.";
+pub const WAN_VAE: &str = "Wan2_1_VAE_bf16.safetensors";
 const SHARED_MODELS: [(&str, &str, &str); 3] = [
     (
         "CLIPLoader",
         "clip_name",
         "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
     ),
-    ("VAELoader", "vae_name", "Wan2_1_VAE_bf16.safetensors"),
+    ("VAELoader", "vae_name", WAN_VAE),
     ("CLIPVisionLoader", "clip_name", "clip_vision_h.safetensors"),
 ];
 const CLIP_NODES: &[&str] = &[
@@ -89,11 +90,20 @@ impl Variant {
         }
     }
 
-    pub fn agent_args(self) -> &'static str {
-        match self {
-            Self::Distilled => r#"{"quality":false,"transparent":false}"#,
-            Self::FullQuality => r#"{"quality":true,"transparent":false}"#,
+    pub fn agent_args(self, options: RunOptions) -> String {
+        let mut args =
+            serde_json::json!({"quality": self == Self::FullQuality, "transparent": false});
+        for (name, value) in [
+            ("source", serde_json::json!(options.source)),
+            ("fps", serde_json::json!(options.fps)),
+            ("size", serde_json::json!(options.size)),
+            ("preview", serde_json::json!(options.preview)),
+        ] {
+            if !value.is_null() {
+                args[name] = value;
+            }
         }
+        args.to_string()
     }
 
     fn files(self) -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
@@ -217,11 +227,40 @@ pub fn validate(url: &str, variant: Variant) -> Result<Dependencies, String> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CharacterSource {
+    Input,
+    Output,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunOptions {
+    pub source: Option<CharacterSource>,
+    pub fps: Option<u8>,
+    pub size: Option<u16>,
+    pub preview: Option<bool>,
+}
+
+impl RunOptions {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn is_valid(self) -> bool {
+        self.fps.is_none_or(|fps| (1..=120).contains(&fps))
+            && self.size.is_none_or(|size| (320..=832).contains(&size))
+    }
+}
+
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Revision {
     pub number: u32,
     pub variant: Variant,
+    #[serde(default, skip_serializing_if = "RunOptions::is_default")]
+    pub options: RunOptions,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -254,21 +293,31 @@ pub fn load(data_dir: &Path) -> Result<Vec<Revision>, String> {
             .revisions
             .iter()
             .enumerate()
-            .any(|(index, revision)| usize::try_from(revision.number).ok() != Some(index + 1))
+            .any(|(index, revision)| {
+                usize::try_from(revision.number).ok() != Some(index + 1)
+                    || !revision.options.is_valid()
+            })
     {
         return Err(INVALID_HISTORY.into());
     }
     Ok(history.revisions)
 }
 
-pub fn append(data_dir: &Path, variant: Variant) -> Result<u32, String> {
+pub fn append(data_dir: &Path, variant: Variant, options: RunOptions) -> Result<u32, String> {
+    if !options.is_valid() {
+        return Err("The pipeline options are outside the supported range.".into());
+    }
     if !data_dir.is_absolute() || !data_dir.is_dir() {
         return Err("Open a Render Bridge installation to save pipeline revisions.".into());
     }
     let _lock = lock_install(data_dir)?;
     let mut revisions = load(data_dir)?;
     let number = u32::try_from(revisions.len() + 1).map_err(|_| INVALID_HISTORY)?;
-    revisions.push(Revision { number, variant });
+    revisions.push(Revision {
+        number,
+        variant,
+        options,
+    });
     let mut bytes = serde_json::to_vec_pretty(&History {
         schema: REVISION_SCHEMA,
         revisions,
@@ -514,7 +563,7 @@ mod tests {
         assert!(Variant::Distilled.lora().is_none());
         assert!(Variant::FullQuality.lora().is_some());
         assert_eq!(
-            Variant::FullQuality.agent_args(),
+            Variant::FullQuality.agent_args(RunOptions::default()),
             r#"{"quality":true,"transparent":false}"#
         );
     }
@@ -687,8 +736,23 @@ mod tests {
     fn revision_history_is_per_installation_and_preserves_invalid_existing_data() {
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path();
-        assert_eq!(append(path, Variant::Distilled).unwrap(), 1);
-        assert_eq!(append(path, Variant::FullQuality).unwrap(), 2);
+        assert_eq!(
+            append(path, Variant::Distilled, RunOptions::default()).unwrap(),
+            1
+        );
+        let options = RunOptions {
+            source: Some(CharacterSource::Input),
+            fps: Some(24),
+            size: Some(480),
+            preview: Some(false),
+        };
+        assert_eq!(append(path, Variant::FullQuality, options).unwrap(), 2);
+        let reopened = load(path).unwrap();
+        assert_eq!(reopened[0].options, RunOptions::default());
+        assert_eq!(
+            reopened[1].variant.agent_args(reopened[1].options),
+            r#"{"fps":24,"preview":false,"quality":true,"size":480,"source":"input","transparent":false}"#,
+        );
         let history = load(path).unwrap();
         assert_eq!(history.last().unwrap().variant, Variant::FullQuality);
         assert_eq!(history.last().unwrap().number, 2);
@@ -697,7 +761,7 @@ mod tests {
         let file = path.join("pipeline-revisions.json");
         let before = b"{\"schema\":50,\"revisions\":[]}";
         std::fs::write(&file, before).unwrap();
-        assert!(append(path, Variant::Distilled).is_err());
+        assert!(append(path, Variant::Distilled, RunOptions::default()).is_err());
         assert_eq!(std::fs::read(file).unwrap(), before);
     }
 }

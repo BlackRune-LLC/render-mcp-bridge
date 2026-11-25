@@ -8,8 +8,8 @@ use serde_json::Value;
 use crate::node_packages::{ManagedPack, Source, StagedPack, Target};
 use crate::setup::{Installed, loopback_agent, validate_comfy_url};
 use crate::{
-    CAUTION, GREEN, INK, LIME, MUTED, RAIL, activity, caption, card, primary, secondary, status,
-    theme,
+    CAUTION, GREEN, INK, LIME, LINE, MUTED, RAIL, RAIL_ACTIVE, RAIL_TEXT, SURFACE, VIOLET,
+    activity, caption, card, primary, secondary, status, theme,
 };
 
 const MAX_NODES: usize = 8192;
@@ -197,10 +197,18 @@ impl NodePanel {
             match worker.try_recv() {
                 Ok(result) => {
                     self.worker = None;
-                    self.selected = None;
                     match result {
-                        Ok(nodes) => self.nodes = nodes,
+                        Ok(nodes) => {
+                            let selected_id = self
+                                .selected
+                                .and_then(|index| self.nodes.get(index))
+                                .map(|node| node.id.as_str());
+                            self.selected = selected_id
+                                .and_then(|id| nodes.iter().position(|node| node.id == id));
+                            self.nodes = nodes;
+                        }
                         Err(error) => {
+                            self.selected = None;
                             self.nodes.clear();
                             self.error = Some(error);
                         }
@@ -218,7 +226,7 @@ impl NodePanel {
             theme::heading(ui, "Nodes", 30.0);
             if self.backend.is_some()
                 && !self.manage_open
-                && secondary(ui, "Recheck", self.worker.is_none()).clicked()
+                && node_action(ui, "Recheck", self.worker.is_none()).clicked()
             {
                 self.refresh(ui.ctx());
             }
@@ -235,17 +243,19 @@ impl NodePanel {
             caption(ui, "Connect a local ComfyUI build to view its nodes.");
             return;
         }
-        let search = ui.add(
-            egui::TextEdit::singleline(&mut self.query)
-                .desired_width(ui.available_width().min(380.0))
-                .hint_text("Search nodes"),
-        );
-        search.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Search nodes")
-        });
+        let search_width = ui.available_width().min(380.0);
         ui.horizontal_wrapped(|ui| {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .desired_width((search_width - 18.0).max(80.0))
+                    .margin(egui::Margin::symmetric(8, 6))
+                    .hint_text("Search nodes"),
+            );
+            search.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Search nodes")
+            });
             ui.selectable_value(&mut self.origin, None, "All");
-            for origin in [Origin::BuiltIn, Origin::Custom, Origin::Unreported] {
+            for origin in NODE_ORIGINS {
                 ui.selectable_value(&mut self.origin, Some(origin), origin.label());
             }
         });
@@ -258,209 +268,306 @@ impl NodePanel {
         }
 
         let query = self.query.trim().to_lowercase();
-        let visible: Vec<_> = self
-            .nodes
+        let groups = NODE_ORIGINS.map(|origin| {
+            let indices = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    let matches_text = query.is_empty()
+                        || [&node.title, &node.id, &node.category]
+                            .iter()
+                            .any(|part| part.to_lowercase().contains(&query));
+                    (node.origin == origin
+                        && self.origin.is_none_or(|filter| node.origin == filter)
+                        && matches_text)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            (origin, indices)
+        });
+        let group_count = groups
             .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                let matches_text = query.is_empty()
-                    || [&node.title, &node.id, &node.category]
-                        .iter()
-                        .any(|part| part.to_lowercase().contains(&query));
-                (matches_text && self.origin.is_none_or(|origin| node.origin == origin))
-                    .then_some(index)
-            })
-            .collect();
-        if visible.is_empty() {
+            .filter(|(_, indices)| !indices.is_empty())
+            .count();
+        if group_count == 0 {
             if self.worker.is_none() {
-                caption(ui, "No matching nodes.");
+                caption(
+                    ui,
+                    if self.nodes.is_empty() {
+                        "This ComfyUI build reported no nodes."
+                    } else {
+                        "No nodes match the current search and origin filter."
+                    },
+                );
             }
             return;
         }
-        self.selected = self
-            .selected
-            .filter(|selected| visible.contains(selected))
-            .or_else(|| visible.first().copied());
 
-        enum Row {
-            Group(Origin, usize),
-            Node(usize),
-        }
-        let mut rows = Vec::with_capacity(visible.len() + 3);
-        for origin in [Origin::BuiltIn, Origin::Custom, Origin::Unreported] {
-            let matches = visible
-                .iter()
-                .copied()
-                .filter(|index| self.nodes[*index].origin == origin);
-            let count = matches.clone().count();
-            if count > 0 {
-                rows.push(Row::Group(origin, count));
-                rows.extend(matches.map(Row::Node));
+        let mut selected = self
+            .selected
+            .filter(|selected| groups.iter().any(|(_, indices)| indices.contains(selected)))
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find_map(|(_, indices)| indices.first().copied())
+            });
+        let visible_rows =
+            ((ui.clip_rect().height() - 250.0) / NODE_ROW_HEIGHT).clamp(4.0, 9.0) as usize;
+        let custom_open = selected.is_some_and(|index| self.nodes[index].origin == Origin::Custom);
+        for (origin, indices) in groups {
+            if !indices.is_empty() {
+                let row_limit = if custom_open {
+                    2
+                } else {
+                    (visible_rows / group_count).max(2)
+                };
+                node_group(ui, &self.nodes, origin, &indices, row_limit, &mut selected);
             }
         }
-        const ROW_HEIGHT: f32 = 29.0;
-        let list = |ui: &mut Ui, selected: &mut Option<usize>| {
-            card(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 3.0;
-                egui::ScrollArea::vertical()
-                    .id_salt("node-inventory")
-                    .max_height(333.0)
-                    .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
-                        for row in range {
-                            match rows[row] {
-                                Row::Group(origin, count) => {
-                                    let fill = theme::color(ui.ctx(), RAIL);
-                                    let (bounds, response) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), ROW_HEIGHT),
-                                        egui::Sense::hover(),
-                                    );
-                                    let label = format!("{} ({count})", origin.label());
-                                    response.widget_info(|| {
-                                        egui::WidgetInfo::labeled(
-                                            egui::WidgetType::Label,
-                                            true,
-                                            &label,
-                                        )
-                                    });
-                                    let painter = ui.painter_at(bounds);
-                                    painter.rect_filled(bounds, 7, fill);
-                                    painter.text(
-                                        egui::pos2(bounds.left() + 8.0, bounds.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        label,
-                                        theme::display_font(15.0),
-                                        theme::on_fill(fill),
-                                    );
-                                }
-                                Row::Node(index) => {
-                                    let node = &self.nodes[index];
-                                    let origin = match node.origin {
-                                        Origin::BuiltIn => "Available",
-                                        Origin::Custom => "Custom source",
-                                        Origin::Unreported => "Origin unreported",
-                                    };
-                                    let mut row = egui::text::LayoutJob::default();
-                                    row.append(
-                                        &node.title,
-                                        0.0,
-                                        egui::TextFormat::simple(
-                                            theme::display_font(14.0),
-                                            theme::color(ui.ctx(), INK),
-                                        ),
-                                    );
-                                    row.append(
-                                        &format!("  ·  {origin}"),
-                                        0.0,
-                                        egui::TextFormat::simple(
-                                            egui::FontId::proportional(12.0),
-                                            theme::color(
-                                                ui.ctx(),
-                                                if node.origin == Origin::BuiltIn {
-                                                    GREEN
-                                                } else {
-                                                    MUTED
-                                                },
-                                            ),
-                                        ),
-                                    );
-                                    let active = *selected == Some(index);
-                                    let (bounds, response) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), ROW_HEIGHT),
-                                        egui::Sense::click(),
-                                    );
-                                    response.widget_info(|| {
-                                        egui::WidgetInfo::selected(
-                                            egui::WidgetType::Button,
-                                            true,
-                                            active,
-                                            format!("{} · {origin}", node.title),
-                                        )
-                                    });
-                                    let visuals = ui.style().interact_selectable(&response, active);
-                                    let painter = ui.painter_at(bounds);
-                                    if active || response.hovered() || response.has_focus() {
-                                        painter.rect(
-                                            bounds,
-                                            7,
-                                            visuals.weak_bg_fill,
-                                            visuals.bg_stroke,
-                                            egui::StrokeKind::Inside,
-                                        );
-                                    }
-                                    row.wrap.max_width = (bounds.width() - 16.0).max(1.0);
-                                    row.wrap.max_rows = 1;
-                                    let text = painter.layout_job(row);
-                                    painter.galley(
-                                        egui::pos2(
-                                            bounds.left() + 8.0,
-                                            bounds.center().y - text.size().y * 0.5,
-                                        ),
-                                        text,
-                                        visuals.text_color(),
-                                    );
-                                    if response.on_hover_text(&node.id).clicked() {
-                                        *selected = Some(index);
-                                    }
-                                }
-                            }
-                        }
-                    });
-            });
-        };
-        let details = |ui: &mut Ui, selected: Option<usize>| {
-            if let Some(node) = selected.map(|index| &self.nodes[index]) {
-                self.details(ui, node);
-            }
-        };
-        let mut selected = self.selected;
-        if ui.available_width() >= 620.0 {
-            ui.columns(2, |columns| {
-                list(&mut columns[0], &mut selected);
-                details(&mut columns[1], selected);
-            });
-        } else {
-            list(ui, &mut selected);
-            details(ui, selected);
-        }
+
         self.selected = selected;
+        if let Some(node) = selected.map(|index| &self.nodes[index]) {
+            self.details(ui, node);
+        }
     }
 
     fn details(&self, ui: &mut Ui, node: &Node) {
         card(ui, |ui| {
-            theme::heading(ui, node.title.as_str(), 23.0);
-            caption(ui, node.origin.label());
-            crate::code_label(ui, &node.id);
-            ui.separator();
-            for (label, value) in [
-                ("Category", &node.category),
-                ("Module", &node.module),
-                ("Version", &node.version),
-            ] {
-                if !value.is_empty() {
-                    theme::heading(ui, label, 13.0);
-                    crate::code_label(ui, value);
-                }
-            }
+            ui.horizontal_wrapped(|ui| {
+                let (icon, _) =
+                    ui.allocate_exact_size(egui::vec2(19.0, 23.0), egui::Sense::hover());
+                node_icon(
+                    &ui.painter_at(icon),
+                    icon.center(),
+                    theme::color(ui.ctx(), INK),
+                );
+                theme::heading(ui, node.title.as_str(), 22.0);
+                let (label, color) = node_status(node.origin);
+                ui.label(theme::strong(label, 13.0).color(theme::color(ui.ctx(), color)));
+            });
             if !node.description.is_empty() {
                 caption(ui, &node.description);
             }
-            if node.origin == Origin::Custom {
+            if !node.category.is_empty()
+                || !node.module.is_empty()
+                || !node.version.is_empty()
+                || node.origin == Origin::Custom
+            {
                 ui.separator();
-                ui.label(
-                    egui::RichText::new("Review custom sources before installing")
-                        .color(crate::theme::color(ui.ctx(), CAUTION))
-                        .strong(),
-                );
+            }
+            if node.origin == Origin::Custom {
                 if let Some(url) = review_source(&node.source) {
-                    ui.hyperlink_to("Review source", url.as_str());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(theme::strong("Source", 13.0));
+                        crate::code_label(ui, url.as_str());
+                        if node_action(ui, "Review source", true).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url.as_str()));
+                        }
+                    });
                 } else {
-                    caption(
-                        ui,
-                        "The selected backend did not report a reviewable source link.",
-                    );
+                    caption(ui, "ComfyUI did not report a reviewable source link.");
                 }
             }
+            ui.horizontal_wrapped(|ui| {
+                for (label, value) in [
+                    ("Version", node.version.as_str()),
+                    (
+                        "Node ID",
+                        if node.id == node.title {
+                            ""
+                        } else {
+                            node.id.as_str()
+                        },
+                    ),
+                    ("Category", node.category.as_str()),
+                    ("Module", node.module.as_str()),
+                ] {
+                    if !value.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(theme::strong(label, 13.0));
+                            crate::code_label(ui, value);
+                        });
+                    }
+                }
+            });
+            if node.origin == Origin::Custom {
+                let warning = theme::color(ui.ctx(), CAUTION);
+                egui::Frame::new()
+                    .fill(warning.gamma_multiply(0.09))
+                    .stroke(egui::Stroke::new(1.0_f32, warning.gamma_multiply(0.5)))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Review the source before installing a custom pack.",
+                                )
+                                .color(warning),
+                            )
+                            .wrap(),
+                        );
+                    });
+            }
         });
+    }
+}
+
+const NODE_ORIGINS: [Origin; 3] = [Origin::BuiltIn, Origin::Custom, Origin::Unreported];
+const NODE_ROW_HEIGHT: f32 = 34.0;
+
+fn node_action(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(theme::strong(label, 14.0))
+            .min_size(egui::vec2(76.0, 31.0))
+            .corner_radius(8),
+    )
+}
+
+fn node_status(origin: Origin) -> (&'static str, egui::Color32) {
+    match origin {
+        Origin::BuiltIn => ("Ready", GREEN),
+        Origin::Custom => ("Review needed", CAUTION),
+        Origin::Unreported => ("Origin unreported", MUTED),
+    }
+}
+
+fn node_group(
+    ui: &mut Ui,
+    nodes: &[Node],
+    origin: Origin,
+    indices: &[usize],
+    visible_rows: usize,
+    selected: &mut Option<usize>,
+) {
+    egui::Frame::new()
+        .fill(theme::color(ui.ctx(), SURFACE))
+        .stroke(egui::Stroke::new(1.0_f32, theme::color(ui.ctx(), LINE)))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let header = theme::strong(format!("{} ({})", origin.label(), indices.len()), 15.0);
+            egui::CollapsingHeader::new(header)
+                .id_salt(origin.label())
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    egui::ScrollArea::vertical()
+                        .id_salt(("node-origin-rows", origin.label()))
+                        .max_height(visible_rows as f32 * (NODE_ROW_HEIGHT + 1.0))
+                        .auto_shrink([false, true])
+                        .show_rows(ui, NODE_ROW_HEIGHT, indices.len(), |ui, range| {
+                            for row in range {
+                                let index = indices[row];
+                                if node_row(ui, &nodes[index], *selected == Some(index)).clicked() {
+                                    *selected = Some(index);
+                                }
+                            }
+                        });
+                });
+        });
+}
+
+fn node_row(ui: &mut Ui, node: &Node, active: bool) -> egui::Response {
+    let (label, color) = node_status(node.origin);
+    let (bounds, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), NODE_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            true,
+            active,
+            format!("{} · {label}", node.title),
+        )
+    });
+    let painter = ui.painter_at(bounds);
+    let accent = theme::color(ui.ctx(), VIOLET);
+    let fill = if active {
+        theme::color(ui.ctx(), RAIL_ACTIVE)
+    } else if response.hovered() {
+        theme::color(ui.ctx(), RAIL)
+    } else {
+        theme::color(ui.ctx(), SURFACE)
+    };
+    if active || response.has_focus() || response.hovered() {
+        let stroke = if active || response.has_focus() {
+            egui::Stroke::new(1.3_f32, accent)
+        } else {
+            egui::Stroke::NONE
+        };
+        painter.rect(bounds, 7, fill, stroke, egui::StrokeKind::Inside);
+    } else {
+        painter.hline(
+            bounds.x_range(),
+            bounds.bottom(),
+            egui::Stroke::new(0.7_f32, theme::color(ui.ctx(), LINE)),
+        );
+    }
+    let text_color = if !active && response.hovered() {
+        theme::color(ui.ctx(), RAIL_TEXT)
+    } else {
+        theme::on_fill(fill)
+    };
+    let center = bounds.center().y;
+    node_icon(
+        &painter,
+        egui::pos2(bounds.left() + 15.0, center),
+        text_color,
+    );
+
+    let status_color = theme::color(ui.ctx(), color);
+    let status = painter.layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(13.0),
+        status_color,
+    );
+    let status_x = bounds.right() - status.size().x - 12.0;
+    painter.circle_filled(egui::pos2(status_x - 8.0, center), 3.0, status_color);
+    painter.galley(
+        egui::pos2(status_x, center - status.size().y * 0.5),
+        status,
+        status_color,
+    );
+
+    let text_x = bounds.left() + 29.0;
+    let mut title = egui::text::LayoutJob::simple(
+        node.title.clone(),
+        theme::display_font(14.0),
+        text_color,
+        (status_x - text_x - 20.0).max(1.0),
+    );
+    title.wrap.max_rows = 1;
+    let title = painter.layout_job(title);
+    painter.galley(
+        egui::pos2(text_x, center - title.size().y * 0.5),
+        title,
+        text_color,
+    );
+    response.on_hover_text(&node.id)
+}
+
+fn node_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let point = |x, y| center + egui::vec2(x, y);
+    let line = egui::Stroke::new(1.25_f32, color);
+    painter.add(egui::Shape::closed_line(
+        vec![
+            point(0.0, -7.0),
+            point(6.2, -3.5),
+            point(6.2, 3.5),
+            point(0.0, 7.0),
+            point(-6.2, 3.5),
+            point(-6.2, -3.5),
+        ],
+        line,
+    ));
+    for corner in [point(-6.2, -3.5), point(6.2, -3.5), point(0.0, 7.0)] {
+        painter.line_segment([center, corner], line);
     }
 }
 

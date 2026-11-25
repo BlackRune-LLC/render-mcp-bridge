@@ -4,7 +4,9 @@ use std::thread;
 
 use eframe::egui::{self, Button, Color32, Frame, Margin, RichText, ScrollArea, Stroke, Ui};
 
-use crate::pipeline::{self, Availability, Dependencies, Dependency, Revision, Variant};
+use crate::pipeline::{
+    self, Availability, CharacterSource, Dependencies, Dependency, Revision, RunOptions, Variant,
+};
 use crate::{
     CAUTION, CREAM, GREEN, INK, LINE, MODEL_GUIDE, MUTED, RAIL_ACTIVE, SURFACE, VIOLET, activity,
     caption, code_label, primary, secondary, status, theme,
@@ -33,14 +35,26 @@ impl Node {
         }
     }
 
-    fn summary(self, draft: Variant) -> &'static str {
+    fn summary(self, variant: Variant, options: RunOptions) -> String {
         match self {
-            Self::Character => "Image",
-            Self::DrivingClip => "Video",
-            Self::MotionModel => draft.label(),
-            Self::Animate => "Motion transfer",
-            Self::Decode => "Video frames",
-            Self::Output => "MP4 + frames",
+            Self::Character => match options.source {
+                None => "Image".into(),
+                Some(CharacterSource::Input) => "Uploaded image".into(),
+                Some(CharacterSource::Output) => "Generated image".into(),
+            },
+            Self::DrivingClip => options.fps.map_or_else(
+                || "Clip or frames".into(),
+                |fps| format!("{fps} fps for frames"),
+            ),
+            Self::MotionModel => variant.label().into(),
+            Self::Animate => format!("{} px", options.size.unwrap_or(640)),
+            Self::Decode => "Wan 2.1 VAE".into(),
+            Self::Output => if options.preview == Some(false) {
+                "MP4 + frames"
+            } else {
+                "Preview included"
+            }
+            .into(),
         }
     }
 
@@ -75,6 +89,7 @@ pub struct PipelinePanel {
     latest: Option<Revision>,
     history_error: Option<String>,
     draft: Variant,
+    options: RunOptions,
     node: Node,
     backend: Option<String>,
     validation: Option<CheckResult>,
@@ -158,6 +173,9 @@ impl PipelinePanel {
             self.draft = self
                 .latest
                 .map_or(Variant::Distilled, |revision| revision.variant);
+            self.options = self
+                .latest
+                .map_or_else(RunOptions::default, |revision| revision.options);
             self.invalidate_validation();
         }
         if self.backend.as_deref() != backend {
@@ -279,7 +297,7 @@ impl PipelinePanel {
                                     egui::WidgetType::Button,
                                     true,
                                     selected,
-                                    node.title(),
+                                    format!("{} options", node.title()),
                                 )
                             });
                             let highlighted = selected || response.has_focus();
@@ -310,14 +328,53 @@ impl PipelinePanel {
                                 theme::display_font(13.0),
                                 theme::color(ui.ctx(), INK),
                             );
+                            let choice = egui::Rect::from_min_max(
+                                egui::pos2(inner.left() + 2.0, inner.center().y + 1.0),
+                                egui::pos2(inner.right() - 2.0, inner.bottom() - 1.0),
+                            );
+                            let option_fill =
+                                theme::color(ui.ctx(), if selected { RAIL_ACTIVE } else { CREAM });
+                            label.rect(
+                                choice,
+                                5,
+                                option_fill,
+                                Stroke::new(1.0_f32, border),
+                                egui::StrokeKind::Inside,
+                            );
+                            let value_rect = choice.shrink2(egui::vec2(4.0, 0.0));
+                            let value_rect = egui::Rect::from_min_max(
+                                value_rect.min,
+                                egui::pos2(value_rect.right() - 10.0, value_rect.bottom()),
+                            );
+                            let value_color =
+                                theme::color(ui.ctx(), if selected { INK } else { MUTED });
                             node_line(
                                 &label,
-                                inner,
-                                10.0,
-                                node.summary(self.draft),
+                                value_rect,
+                                0.0,
+                                &node.summary(self.draft, self.options),
                                 egui::FontId::proportional(11.0),
-                                theme::color(ui.ctx(), MUTED),
+                                value_color,
                             );
+                            let chevron = egui::pos2(choice.right() - 8.0, choice.center().y + 1.0);
+                            label.line_segment(
+                                [
+                                    chevron + egui::vec2(-3.0, -2.0),
+                                    chevron + egui::vec2(0.0, 1.0),
+                                ],
+                                Stroke::new(1.15_f32, value_color),
+                            );
+                            label.line_segment(
+                                [
+                                    chevron + egui::vec2(0.0, 1.0),
+                                    chevron + egui::vec2(3.0, -2.0),
+                                ],
+                                Stroke::new(1.15_f32, value_color),
+                            );
+                            egui::Popup::menu(&response).show(|ui| {
+                                ui.set_min_width(170.0);
+                                self.step_options(ui, node);
+                            });
                             response.on_hover_text(node.description());
                         }
                         for (start, end, _) in paths {
@@ -341,6 +398,67 @@ impl PipelinePanel {
             });
     }
 
+    fn step_options(&mut self, ui: &mut Ui, node: Node) {
+        let before = self.options;
+        match node {
+            Node::Character => {
+                ui.strong("Character image source");
+                ui.selectable_value(&mut self.options.source, None, "Agent chooses");
+                ui.selectable_value(
+                    &mut self.options.source,
+                    Some(CharacterSource::Input),
+                    "Uploaded image",
+                );
+                ui.selectable_value(
+                    &mut self.options.source,
+                    Some(CharacterSource::Output),
+                    "Generated image",
+                );
+            }
+            Node::DrivingClip => {
+                ui.strong("Frame rate for image sequences");
+                ui.selectable_value(&mut self.options.fps, None, "Tool default (16 fps)");
+                for fps in [12, 24, 30] {
+                    ui.selectable_value(&mut self.options.fps, Some(fps), format!("{fps} fps"));
+                }
+                caption(ui, "Video clips keep their original frame rate.");
+            }
+            Node::MotionModel => {
+                ui.strong("Motion model");
+                let previous = self.draft;
+                for variant in [Variant::Distilled, Variant::FullQuality] {
+                    ui.selectable_value(&mut self.draft, variant, variant.label());
+                }
+                if self.draft != previous {
+                    self.invalidate_validation();
+                }
+            }
+            Node::Animate => {
+                ui.strong("Longest side");
+                ui.selectable_value(&mut self.options.size, None, "Tool default (640 px)");
+                for size in [480, 768, 832] {
+                    ui.selectable_value(&mut self.options.size, Some(size), format!("{size} px"));
+                }
+            }
+            Node::Decode => {
+                ui.strong("Fixed VAE for this preset");
+                code_label(ui, pipeline::WAN_VAE);
+                caption(
+                    ui,
+                    "To change VAEs, open an editable workflow in Your pipelines.",
+                );
+            }
+            Node::Output => {
+                ui.strong("Return MP4 and PNG frames");
+                ui.selectable_value(&mut self.options.preview, None, "Include contact sheet");
+                ui.selectable_value(&mut self.options.preview, Some(false), "Skip contact sheet");
+            }
+        }
+        if self.options != before {
+            self.copied = false;
+        }
+    }
+
     fn inspector(&mut self, ui: &mut Ui) {
         theme::heading(
             ui,
@@ -353,9 +471,7 @@ impl PipelinePanel {
         );
         caption(ui, self.node.description());
         if self.node != Node::MotionModel {
-            if secondary(ui, "Select Motion model", true).clicked() {
-                self.node = Node::MotionModel;
-            }
+            self.step_options(ui, self.node);
             return;
         }
         let previous = self.draft;
@@ -364,6 +480,7 @@ impl PipelinePanel {
             let edge = theme::color(ui.ctx(), if selected { VIOLET } else { LINE });
             let fill = theme::color(ui.ctx(), if selected { RAIL_ACTIVE } else { CREAM });
             let button = Button::selectable(selected, theme::strong(candidate.label(), 15.0))
+                .frame_when_inactive(true)
                 .fill(fill)
                 .stroke(Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, edge))
                 .corner_radius(8);
@@ -457,7 +574,7 @@ impl PipelinePanel {
     fn show_revision_status(&self, ui: &mut Ui) {
         caption(
             ui,
-            "Save a local revision. Copy agent options to use this variant in a new render.",
+            "Save a local revision. Copy agent options to use these step settings in a new render.",
         );
         if let Some(revision) = self.latest {
             caption(
@@ -475,7 +592,7 @@ impl PipelinePanel {
         if self.copied {
             caption(
                 ui,
-                "Copied options for animate_from_clip. Your agent also needs the image, driving clip, and prompt.",
+                "Copied options for animate_from_clip. Your agent also needs the image, motion reference, and prompt.",
             );
         }
     }
@@ -485,9 +602,9 @@ impl PipelinePanel {
             .validation
             .as_ref()
             .is_some_and(|result| result.as_ref().is_ok_and(Dependencies::ready));
-        let saved = self
-            .latest
-            .is_some_and(|revision| revision.variant == self.draft);
+        let saved = self.latest.is_some_and(|revision| {
+            revision.variant == self.draft && revision.options == self.options
+        });
         if secondary(
             ui,
             "Validate",
@@ -505,11 +622,12 @@ impl PipelinePanel {
         .clicked()
             && let Some(data) = &self.data_dir
         {
-            match pipeline::append(data, self.draft) {
+            match pipeline::append(data, self.draft, self.options) {
                 Ok(number) => {
                     self.latest = Some(Revision {
                         number,
                         variant: self.draft,
+                        options: self.options,
                     });
                     self.history_error = None;
                 }
@@ -517,7 +635,7 @@ impl PipelinePanel {
             }
         }
         if secondary(ui, "Copy agent options", ready).clicked() {
-            ui.ctx().copy_text(self.draft.agent_args().to_owned());
+            ui.ctx().copy_text(self.draft.agent_args(self.options));
             self.copied = true;
         }
     }
@@ -626,5 +744,79 @@ mod tests {
 
         assert!(panel.validation.is_none());
         assert!(panel.worker.is_none());
+    }
+
+    #[test]
+    fn every_built_in_graph_step_exposes_its_options() {
+        use eframe::egui::accesskit::{Action, Role};
+
+        let mut panel = PipelinePanel::default();
+        let ctx = egui::Context::default();
+        theme::configure_for(&ctx, egui::ThemePreference::Dark, None);
+        ctx.enable_accesskit();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| panel.graph(ui));
+        });
+        let tree = output.platform_output.accesskit_update.unwrap();
+        for label in [
+            "Character options",
+            "Driving clip options",
+            "Motion model options",
+            "Animate options",
+            "VAE decode options",
+            "Save video options",
+        ] {
+            assert!(
+                tree.nodes.iter().any(|(_, node)| {
+                    node.role() == Role::Button
+                        && node.label() == Some(label)
+                        && node.supports_action(Action::Click)
+                }),
+                "Missing a step dropdown for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_from_the_inline_motion_menu_changes_agent_options() {
+        use eframe::egui::accesskit::{Action, ActionRequest};
+
+        let mut panel = PipelinePanel::default();
+        let ctx = egui::Context::default();
+        theme::configure_for(&ctx, egui::ThemePreference::Dark, None);
+        ctx.enable_accesskit();
+        let frame = |panel: &mut PipelinePanel, input| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.graph(ui));
+            })
+        };
+        for label in ["Motion model options", "Full quality"] {
+            let output = frame(&mut panel, egui::RawInput::default());
+            let tree = output.platform_output.accesskit_update.unwrap();
+            let (target, _) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label() == Some(label)
+                        && node.supports_action(Action::Click)
+                        && !node.is_disabled()
+                })
+                .unwrap_or_else(|| panic!("Missing dropdown action {label}"));
+            let _ = frame(
+                &mut panel,
+                egui::RawInput {
+                    events: vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Click,
+                        target: *target,
+                        data: None,
+                    })],
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(panel.draft, Variant::FullQuality);
+        let args: serde_json::Value =
+            serde_json::from_str(&panel.draft.agent_args(panel.options)).unwrap();
+        assert_eq!(args["quality"], true);
     }
 }

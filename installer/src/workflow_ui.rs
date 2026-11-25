@@ -61,6 +61,7 @@ pub struct WorkflowPanel {
     model: Option<ModelSelection>,
     notice: Option<&'static str>,
     node: Option<String>,
+    reveal_step: bool,
     form: PortForm,
     backend: Option<String>,
     schema: Option<WorkflowSchema>,
@@ -203,18 +204,16 @@ impl WorkflowPanel {
             );
             return;
         };
-        let name = self
-            .saved
-            .as_ref()
-            .map(|(name, _)| name.as_str())
-            .or_else(|| path.file_stem().and_then(|name| name.to_str()))
-            .unwrap_or("Workflow");
-        ui.horizontal_wrapped(|ui| {
+        if self.saved.is_none() {
+            let name = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Workflow");
             ui.label(RichText::new(name).strong());
-            if self.dirty() {
-                caption(ui, "Unsaved changes");
-            }
-        });
+        }
+        if self.dirty() {
+            caption(ui, "Unsaved changes");
+        }
         if self.worker.as_ref().is_some_and(|worker| !worker.test) {
             activity(ui, "Checking node types, ports, and model files…");
         }
@@ -229,15 +228,7 @@ impl WorkflowPanel {
                 "Check dependencies to load the choices reported by this build.",
             );
         }
-        if ui.available_width() >= 700.0 {
-            ui.columns(2, |columns| {
-                self.graph_list(&mut columns[0]);
-                self.inspector(&mut columns[1]);
-            });
-        } else {
-            self.graph_list(ui);
-            self.inspector(ui);
-        }
+        self.pipeline_steps(ui);
         self.review(ui, installed);
     }
 
@@ -437,6 +428,7 @@ impl WorkflowPanel {
         self.path = Some(path);
         self.checkpoint = self.graph.clone();
         self.node = self.graph.nodes().keys().next().cloned();
+        self.reveal_step = false;
         self.select_first_input();
         self.schema = None;
         self.issues.clear();
@@ -546,6 +538,7 @@ impl WorkflowPanel {
             {
                 Ok(_) => {
                     self.node = Some(id.clone());
+                    self.reveal_step = true;
                     self.form = PortForm {
                         name: input.clone(),
                         ..Default::default()
@@ -562,30 +555,67 @@ impl WorkflowPanel {
         self.model = Some(model);
     }
 
-    fn graph_list(&mut self, ui: &mut Ui) {
-        let mut selected = self.node.clone();
+    fn pipeline_steps(&mut self, ui: &mut Ui) {
+        let ids = self.graph.nodes().keys().cloned().collect::<Vec<_>>();
         card(ui, |ui| {
-            ui.label(RichText::new(format!("Nodes · {}", self.graph.nodes().len())).strong());
+            ui.label(RichText::new("Pipeline steps").strong());
             ScrollArea::vertical()
-                .id_salt("workflow-graph")
-                .max_height(170.0)
+                .id_salt("workflow-steps")
+                .max_height(460.0)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for (id, node) in self.graph.nodes() {
-                        ui.selectable_value(
-                            &mut selected,
-                            Some(id.clone()),
-                            format!("#{id}  {}", node.class_type),
-                        );
+                    for id in ids {
+                        ui.push_id(("workflow-step", &id), |ui| {
+                            let node = &self.graph.nodes()[&id];
+                            let label = format!("{} · #{id}", node.class_type);
+                            let expanded = self.node.as_ref() == Some(&id);
+                            let control = egui::Button::new(RichText::new(&label).strong())
+                                .right_text("    ")
+                                .selected(expanded)
+                                .min_size(egui::vec2(ui.available_width(), 34.0))
+                                .truncate();
+                            let response = ui.add(control).on_hover_text(&label);
+                            let center =
+                                egui::pos2(response.rect.right() - 15.0, response.rect.center().y);
+                            let points = if expanded {
+                                [
+                                    egui::vec2(-3.5, -2.0),
+                                    egui::vec2(0.0, 1.5),
+                                    egui::vec2(3.5, -2.0),
+                                ]
+                            } else {
+                                [
+                                    egui::vec2(-1.5, -3.5),
+                                    egui::vec2(2.0, 0.0),
+                                    egui::vec2(-1.5, 3.5),
+                                ]
+                            };
+                            ui.painter().add(egui::Shape::line(
+                                points.into_iter().map(|offset| center + offset).collect(),
+                                egui::Stroke::new(1.45_f32, ui.visuals().text_color()),
+                            ));
+                            ui.ctx().accesskit_node_builder(response.id, |node| {
+                                node.set_label(label);
+                                node.set_expanded(expanded);
+                            });
+                            if response.clicked() {
+                                self.node = (!expanded).then(|| id.clone());
+                                self.select_first_input();
+                            }
+                            if self.node.as_ref() == Some(&id) {
+                                if std::mem::take(&mut self.reveal_step) {
+                                    response.scroll_to_me(Some(egui::Align::Min));
+                                }
+                                self.step_options(ui);
+                                ui.add_space(4.0);
+                            }
+                        });
                     }
                 });
         });
-        if self.node != selected {
-            self.node = selected;
-            self.select_first_input();
-        }
     }
 
-    fn inspector(&mut self, ui: &mut Ui) {
+    fn step_options(&mut self, ui: &mut Ui) {
         let Some(id) = self.node.as_deref() else {
             return;
         };
@@ -608,8 +638,7 @@ impl WorkflowPanel {
         }
         let mut input = self.form.name.clone();
         let mut edit = None;
-        card(ui, |ui| {
-            ui.label(RichText::new(format!("#{}  {}", id, node.class_type)).strong());
+        ui.indent("step-options", |ui| {
             if let Some(shape) = shape
                 && !shape.outputs.is_empty()
             {
@@ -630,6 +659,7 @@ impl WorkflowPanel {
                 caption(ui, "No input ports reported.");
                 return;
             }
+            let input_label = crate::field_label(ui, "Input");
             ComboBox::from_id_salt("workflow-input")
                 .selected_text(if input.is_empty() {
                     "Choose an input"
@@ -647,7 +677,9 @@ impl WorkflowPanel {
                         };
                         ui.selectable_value(&mut input, name.clone(), label);
                     }
-                });
+                })
+                .response
+                .labelled_by(input_label);
             if input != self.form.name || input.is_empty() {
                 return;
             }
@@ -1057,6 +1089,73 @@ fn link_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_workflow_step_has_its_own_expandable_editor() {
+        use eframe::egui::accesskit::{Action, ActionRequest, Role};
+
+        let mut panel = WorkflowPanel::default();
+        panel
+            .graph
+            .import_json(
+                br#"{
+                "1":{"class_type":"CLIPTextEncode","inputs":{"text":"first prompt"}},
+                "2":{"class_type":"SaveImage","inputs":{"filename_prefix":"second step"}}
+            }"#,
+            )
+            .unwrap();
+        panel.loaded(PathBuf::from("workflow.json"));
+
+        let ctx = egui::Context::default();
+        crate::theme::configure_for(&ctx, egui::ThemePreference::Dark, None);
+        ctx.enable_accesskit();
+        let frame = |panel: &mut WorkflowPanel, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(540.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| panel.show(ui, None, None, None));
+                },
+            )
+            .platform_output
+            .accesskit_update
+            .unwrap()
+        };
+        let initial = frame(&mut panel, Vec::new());
+        let step = |label| {
+            initial
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == Role::Button
+                        && node.label() == Some(label)
+                        && node.supports_action(Action::Click)
+                        && node.is_expanded().is_some()
+                })
+                .unwrap_or_else(|| panic!("Missing step dropdown {label}"))
+        };
+        assert_eq!(step("CLIPTextEncode · #1").1.is_expanded(), Some(true));
+        let (second, collapsed) = step("SaveImage · #2");
+        assert_eq!(collapsed.is_expanded(), Some(false));
+
+        frame(
+            &mut panel,
+            vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                action: Action::Click,
+                target: *second,
+                data: None,
+            })],
+        );
+        assert_eq!(panel.node.as_deref(), Some("2"));
+        assert_eq!(panel.form.name, "filename_prefix");
+        assert_eq!(panel.form.text, "second step");
+    }
 
     #[test]
     fn opening_a_graph_preselects_an_editable_input() {
