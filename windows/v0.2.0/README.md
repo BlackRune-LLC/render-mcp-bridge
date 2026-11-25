@@ -1,13 +1,13 @@
 # Render Bridge 0.2.0 for Windows x64
 
-Use `RenderBridgeSetup.exe` from this directory. These are the installer bytes planned for the public release. The installer is unsigned and built from source commit `35778fa084058a347c38496fa71ca691137ec0a9`.
+Use `RenderBridgeSetup.exe` from this directory. These are the installer bytes planned for the public release. The installer is unsigned and built from source commit `f52ebdc39dbdd6461de5f742faa178af0fd2c291`.
 
 Download [RenderBridgeSetup.exe](./RenderBridgeSetup.exe?raw=1) and [SHA256SUMS.txt](./SHA256SUMS.txt?raw=1) to the same folder. Open PowerShell in that folder and run the following before opening Setup.
 
 ```powershell
 $expected = ((Get-Content -LiteralPath .\SHA256SUMS.txt -TotalCount 1) -split '\s+')[0]
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath .\RenderBridgeSetup.exe).Hash
-if ($expected -ne '8e3b63792f2e2cd033e0db7211a11bbf755e953ac723767f8e9f90a7a6e2c22e' -or $actual -ne $expected) {
+if ($expected -ne 'b3e3581c60ccad6e7c44df16c8ffa1612dc739f175ba9c9778e1204b2f428363' -or $actual -ne $expected) {
     throw 'RenderBridgeSetup.exe checksum mismatch.'
 }
 ```
@@ -16,6 +16,11 @@ if ($expected -ne '8e3b63792f2e2cd033e0db7211a11bbf755e953ac723767f8e9f90a7a6e2c
 
 - On a clean Windows x64 profile, run Setup and follow its Python and ComfyUI instructions. Select the intended local ComfyUI instance and installation folder.
 - Select **Start & Verify**, connect an agent, and use **First render** to have the agent generate a PNG. Open the agent's download link and paste it into **Verify test PNG** in Setup. Select **Finish and keep running**, then reopen Render Bridge from the tray.
+
+## Pipeline edits
+
+- Export a ComfyUI workflow in **API Format**. Open **Pipelines → Add pipeline**, import the JSON, and name it. Check that the pipeline opens from **Your pipelines** after reopening the panel.
+- If another compatible model is installed, select it in **Models → Installed → Use in pipeline**, choose the saved pipeline and loader slot, then select **Apply model** and **Save changes**. Reopen the pipeline and confirm the loader and **Copy agent prompt** carry the selected filename.
 
 ## Upgrade from v0.1.0
 
