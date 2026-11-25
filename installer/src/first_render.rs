@@ -283,6 +283,8 @@ mod tests {
             data_dir: PathBuf::from("bridge"),
             app_dir: PathBuf::from("bridge/app"),
             token_path: PathBuf::from("bridge/token"),
+            pause_flag: PathBuf::from("bridge/gaming_mode.flag"),
+            attach_only: false,
             mcp_url: "http://127.0.0.1:8190/mcp".into(),
             start_command: String::new(),
         };

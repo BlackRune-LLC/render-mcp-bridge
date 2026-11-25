@@ -1123,6 +1123,7 @@ struct VerificationTarget {
     data_dir: PathBuf,
     app_dir: PathBuf,
     endpoint: String,
+    attach_only: bool,
     settings: Option<Settings>,
 }
 
@@ -1132,6 +1133,7 @@ impl VerificationTarget {
             data_dir: installed.data_dir.clone(),
             app_dir: installed.app_dir.clone(),
             endpoint: installed.mcp_url.clone(),
+            attach_only: installed.attach_only,
             settings: setup::saved_install_settings(installed).ok(),
         }
     }
@@ -1486,6 +1488,14 @@ impl Installer {
 
     #[cfg(windows)]
     fn request_server_action(&mut self, ctx: &egui::Context, action: ServerAction) {
+        if !matches!(action, ServerAction::Exit)
+            && self
+                .installed
+                .as_ref()
+                .is_some_and(|installed| !installed.may_manage_server())
+        {
+            return;
+        }
         if matches!(action, ServerAction::Exit) && self.model_manager.downloading() {
             self.select_workspace(ctx, WorkspaceTab::Models);
             self.queue_dialog = None;
@@ -1739,7 +1749,7 @@ impl Installer {
     }
 
     fn start_verification(&mut self, ctx: &egui::Context) {
-        let Some(installed) = self.installed.clone() else {
+        let Some(installed) = self.installed.clone().filter(Installed::may_manage_server) else {
             return;
         };
         self.verification = None;
@@ -1840,8 +1850,11 @@ impl Installer {
                 .as_deref()
                 .and_then(setup::existing_install_at)
                 .as_ref()
-                .map(|current| &current.app_dir)
-                != self.installed.as_ref().map(|opened| &opened.app_dir)
+                .map(|current| (&current.app_dir, &current.pause_flag))
+                != self
+                    .installed
+                    .as_ref()
+                    .map(|opened| (&opened.app_dir, &opened.pause_flag))
         }) {
             self.load_controls(ctx);
             self.gaming_error = Some(
@@ -1866,6 +1879,7 @@ impl Installer {
                     .args(["--data-dir"])
                     .arg(&installed.data_dir)
                     .args(["gaming-mode", state])
+                    .env("PAUSE_FLAG", &installed.pause_flag)
                     .current_dir(&installed.app_dir)
                     .status()
                     .is_ok_and(|status| status.success());
@@ -1893,7 +1907,7 @@ impl Installer {
         force_start: bool,
         verify_client: bool,
     ) {
-        let Some(installed) = self.installed.clone() else {
+        let Some(installed) = self.installed.clone().filter(Installed::may_manage_server) else {
             return;
         };
         let owned = self.running.as_mut().is_some_and(RunningBridge::is_running);
@@ -2637,6 +2651,17 @@ impl Installer {
             );
             return;
         };
+        if installed.attach_only {
+            #[cfg(windows)]
+            let online = self
+                .controls
+                .as_ref()
+                .map(|controls| controls.bridge_online);
+            #[cfg(not(windows))]
+            let online = None;
+            attached_connect(ui, online);
+            return;
+        }
         let idle = self.worker.is_none() && !self.update_in_progress();
         ui.horizontal_wrapped(|ui| {
             for (target, label) in [
@@ -3034,6 +3059,16 @@ impl Installer {
         if let Some(error) = &self.model_destination_error {
             status(ui, "Model folder choice was not saved", error, CAUTION);
         }
+        if let Some(installed) = self
+            .installed
+            .clone()
+            .filter(|installed| installed.attach_only)
+        {
+            theme::heading(ui, "Connect an agent", 27.0);
+            attached_connect(ui, None);
+            self.show_gaming_mode(ui, &installed);
+            return;
+        }
         let server_verified = self.server_ready_for_render();
         let receipt_verified = self
             .first_render
@@ -3417,7 +3452,15 @@ impl Installer {
                 if dense {
                     compact_monitor_spacing(ui);
                 }
-                self.job_server_actions(ui, online, owned, idle, compact);
+                if self
+                    .installed
+                    .as_ref()
+                    .is_some_and(|installed| installed.attach_only)
+                {
+                    server_state(ui, online, false, compact);
+                } else {
+                    self.job_server_actions(ui, online, owned, idle, compact);
+                }
                 if !dense {
                     ui.separator();
                 }
@@ -3732,6 +3775,9 @@ impl Installer {
                                 ("Retry installation", idle)
                             }
                             Step::Install => ("Install Render Bridge", idle),
+                            Step::Connect if self.installed.as_ref().is_some_and(|installed| installed.attach_only) => {
+                                ("Close setup", idle)
+                            }
                             #[cfg(windows)]
                             Step::Connect if self.finish_ready() => (
                                 if self.panel_manages_listener() == Some(true) {
@@ -3762,6 +3808,9 @@ impl Installer {
                                 Step::Comfy => self.start_check(ctx),
                                 Step::Models => self.change_step(Step::Install),
                                 Step::Install => self.start_install(ctx),
+                                Step::Connect if self.installed.as_ref().is_some_and(|installed| installed.attach_only) => {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
                                 Step::Connect => {
                                     #[cfg(windows)]
                                     {
@@ -3925,6 +3974,23 @@ impl eframe::App for Installer {
     }
 }
 
+fn attached_connect(ui: &mut Ui, online: Option<bool>) {
+    card(ui, |ui| {
+        let (title, tone) = match online {
+            Some(true) => ("External server online", GREEN),
+            Some(false) => ("External server offline", CAUTION),
+            None => ("External server", MUTED),
+        };
+        status(
+            ui,
+            title,
+            "Connect your agent using the external server’s address and credentials.",
+            tone,
+        );
+        ui.hyperlink_to("Connect an MCP client", CLIENT_GUIDE);
+    });
+}
+
 fn open_configuration_file(installed: &Installed) -> Result<(), String> {
     let path = setup::config_file(installed);
     let (program, args): (&str, &[&str]) = if cfg!(windows) {
@@ -4004,18 +4070,7 @@ fn bridge_status(code: &str) -> (&'static str, bool) {
 }
 
 fn gaming_mode(installed: &Installed) -> Option<bool> {
-    let flag = std::env::var_os("PAUSE_FLAG")
-        .map(std::path::PathBuf::from)
-        .map(|path| {
-            if let Ok(rest) = path.strip_prefix("~")
-                && let Some(home) = std::env::home_dir()
-            {
-                return home.join(rest);
-            }
-            installed.app_dir.join(path)
-        })
-        .unwrap_or_else(|| installed.data_dir.join("gaming_mode.flag"));
-    flag.try_exists().ok()
+    installed.pause_flag.try_exists().ok()
 }
 
 fn model_status(availability: models::FileStatus, pipeline: bool) -> (&'static str, Color32) {
@@ -4728,7 +4783,8 @@ fn launch_mode(mut args: impl Iterator<Item = std::ffi::OsString>) -> LaunchMode
     };
     LaunchMode::Controls {
         start_hidden: start_hidden && !matches!(&target, MonitorTarget::Missing),
-        start_server: start_server && matches!(&target, MonitorTarget::Installation(_)),
+        start_server: start_server
+            && matches!(&target, MonitorTarget::Installation(data) if !setup::attach_only(data)),
         target,
     }
 }
@@ -5031,6 +5087,44 @@ mod launch_tests {
 
     #[cfg(windows)]
     #[test]
+    fn attach_only_monitor_starts_hidden_without_starting_a_bridge() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path();
+        let arguments = [
+            OsString::from("--job-monitor"),
+            OsString::from("--data-dir"),
+            folder.as_os_str().to_owned(),
+            OsString::from("--start-bridge-in-tray"),
+        ];
+        assert!(matches!(
+            launch_mode(arguments.clone().into_iter()),
+            LaunchMode::Controls {
+                start_server: true,
+                ..
+            }
+        ));
+        std::fs::write(folder.join("attach-only"), "").unwrap();
+        let mode = launch_mode(arguments.into_iter());
+        assert!(matches!(
+            &mode,
+            LaunchMode::Controls {
+                target: MonitorTarget::Installation(path), start_hidden: true, start_server: false
+            } if path == folder
+        ));
+        let setting = startup_setting(&mode).unwrap();
+        assert_eq!(setting.arguments.last().unwrap(), "--start-in-tray");
+        assert!(matches!(
+            launch_mode(setting.arguments.into_iter()),
+            LaunchMode::Controls {
+                start_hidden: true,
+                start_server: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn startup_preserves_the_selected_installation() {
         let folder = std::env::current_dir()
             .unwrap()
@@ -5147,7 +5241,8 @@ fn open_app() -> eframe::Result {
                     let server_controls = installer
                         .controls
                         .as_ref()
-                        .is_some_and(|controls| controls.data_dir.is_some());
+                        .and_then(|controls| controls.data_dir.as_deref())
+                        .is_some_and(|data| !setup::attach_only(data));
                     let root =
                         creation
                             .window_handle()

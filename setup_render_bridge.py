@@ -27,7 +27,10 @@ MODEL_GUIDE = "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs
 CLIENT_GUIDE = "https://github.com/BlackRune-LLC/render-mcp-bridge#connect-an-mcp-client"
 COMFY_INSTALL = "https://docs.comfy.org/installation/manual_install"
 SETTINGS_KEYS = {"COMFY_ROOT", "COMFY_URL"}
-OPTIONAL_SETTINGS = {"COMFY_INPUT_DIR", "COMFY_OUTPUT_DIR"}
+OPTIONAL_FOLDERS = {"COMFY_INPUT_DIR", "COMFY_OUTPUT_DIR"}
+OPTIONAL_SETTINGS = OPTIONAL_FOLDERS | {"PAUSE_FLAG"}
+GAMING_MODE_FLAG = "gaming_mode.flag"
+ATTACH_ONLY = "attach-only"
 SETTINGS_LIMIT = 64 * 1024
 ACTIVE_RUNTIME = "active-runtime"
 MCP_PORT_FILE = "mcp-port"
@@ -79,6 +82,16 @@ def unique_json_object(pairs):
     return obj
 
 
+def validate_pause_flag(value: str) -> None:
+    # Inspect the raw components because Path normalizes dot segments and trailing separators.
+    parts = re.split(r"[\\/]" if os.name == "nt" else "/", value)
+    if (
+        not Path(value).is_absolute() or parts[-1] != GAMING_MODE_FLAG
+        or any(part in {".", ".."} for part in parts) or "\0" in value
+    ):
+        raise ValueError("PAUSE_FLAG must be an absolute path to gaming_mode.flag without dot segments.")
+
+
 def load_settings(path: Path, *, partial: bool = False, missing_ok: bool = True) -> dict[str, str]:
     invalid = "Invalid setup settings."
     try:
@@ -103,6 +116,9 @@ def load_settings(path: Path, *, partial: bool = False, missing_ok: bool = True)
         or any(not isinstance(value, str) for value in settings.values())
     ):
         raise ValueError(invalid)
+    flag = settings.get("PAUSE_FLAG", "")
+    if flag.strip():
+        validate_pause_flag(flag)
     if partial:
         return {key: value.strip() for key, value in settings.items() if value.strip()}
     if not SETTINGS_KEYS <= settings.keys() or any(not value.strip() for value in settings.values()):
@@ -436,7 +452,8 @@ def stage_runtime(
                 [python, str(staging / "comfy_mcp_server.py"), "--help"],
                 staging, "Render Bridge startup check", 30,
                 {**os.environ, "COMFY_MCP_DATA_DIR": smoke, "MCP_PORT": str(port),
-                 "MCP_TOKEN_FILE": str(Path(smoke) / "token.txt")},
+                 "MCP_TOKEN_FILE": str(Path(smoke) / "token.txt"),
+                 "PAUSE_FLAG": str(Path(smoke) / GAMING_MODE_FLAG)},
             )
         require_settings_unchanged(directory, expected)
         save_settings(staging / "settings.json", settings)
@@ -473,7 +490,7 @@ def install(settings_path: Path, config_path: Path | None = None) -> int:
     print(f"Install ComfyUI first if you need it. {COMFY_INSTALL}")
     overrides = {}
     try:
-        for key in sorted(OPTIONAL_SETTINGS):
+        for key in sorted(OPTIONAL_FOLDERS):
             if value := settings.get(key) or os.environ.get(key, "").strip():
                 folder = Path(value).expanduser().resolve()
                 if not folder.is_dir():
@@ -500,6 +517,9 @@ def install(settings_path: Path, config_path: Path | None = None) -> int:
     print(f"Render Bridge installation: {settings_path.parent}")
     print(f"ComfyUI directory: {root}")
     print(f"ComfyUI API URL: {url}")
+    if "PAUSE_FLAG" in settings:
+        overrides["PAUSE_FLAG"] = settings["PAUSE_FLAG"]
+        print(f"Gaming Mode flag: {settings['PAUSE_FLAG']}")
     for kind in ("input", "output"):
         folder = overrides.get(f"COMFY_{kind.upper()}_DIR") or root / kind
         print(f"ComfyUI {kind} folder: {folder}")
@@ -533,7 +553,21 @@ def install(settings_path: Path, config_path: Path | None = None) -> int:
     return 0
 
 
+def attach_only(directory: Path) -> bool:
+    try:
+        (directory / ATTACH_ONLY).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable marker cannot authorize starting a listener.
+        pass
+    return True
+
+
 def launch(settings_path: Path, server_args: list[str]) -> int:
+    if not server_args and attach_only(settings_path.parent):
+        print("Use the external server's own launcher to manage it.", file=sys.stderr)
+        return 1
     try:
         # A copied start command points to its verified generation. Keep it
         # usable as a fallback if a later install is unsuitable. Controls such
@@ -576,6 +610,8 @@ def launch(settings_path: Path, server_args: list[str]) -> int:
         print("The saved Render Bridge MCP port could not be read.", file=sys.stderr)
         return 1
     env = {**os.environ, **settings, "COMFY_MCP_DATA_DIR": str(settings_path.parent), "MCP_PORT": str(port)}
+    if (pause_flag := os.environ.get("PAUSE_FLAG")) is not None:
+        env["PAUSE_FLAG"] = pause_flag
     if env.get("MCP_TOKEN_FILE"):
         token = Path(env["MCP_TOKEN_FILE"]).expanduser()
         if not token.is_absolute():

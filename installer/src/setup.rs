@@ -18,6 +18,8 @@ const LAUNCHER: &str = "setup_render_bridge.py";
 const REQUIREMENTS: &str = "requirements.txt";
 const ACTIVE_RUNTIME: &str = "active-runtime";
 const MCP_PORT_FILE: &str = "mcp-port";
+const GAMING_FLAG: &str = "gaming_mode.flag";
+const ATTACH_ONLY: &str = "attach-only";
 const DEFAULT_MCP_PORT: u16 = 8189;
 const RUNTIME_PREFIX: &str = "app-";
 const INSTALL_CANCELLED: &str = "Setup cancelled. You can retry when ready.";
@@ -111,6 +113,8 @@ pub struct Settings {
         skip_serializing_if = "String::is_empty"
     )]
     pub comfy_output: String,
+    #[serde(rename = "PAUSE_FLAG", skip_serializing_if = "String::is_empty")]
+    pub pause_flag: String,
 }
 
 pub struct ModelCheck {
@@ -123,8 +127,22 @@ pub struct Installed {
     pub data_dir: PathBuf,
     pub app_dir: PathBuf,
     pub token_path: PathBuf,
+    pub pause_flag: PathBuf,
+    pub attach_only: bool,
     pub mcp_url: String,
     pub start_command: String,
+}
+
+impl Installed {
+    pub(crate) fn may_manage_server(&self) -> bool {
+        !self.attach_only && !attach_only(&self.data_dir)
+    }
+}
+
+pub(crate) fn attach_only(data_dir: &Path) -> bool {
+    // A marker that cannot be opened safely must not enable server management.
+    !matches!(fs::symlink_metadata(data_dir.join(ATTACH_ONLY)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound)
 }
 
 fn environment_path(name: &str) -> Option<PathBuf> {
@@ -197,9 +215,11 @@ fn read_setup_config(path: &Path) -> Result<Option<Settings>, String> {
     {
         return Err("The Render Bridge setup config must be a JSON object.".into());
     }
-    serde_json::from_slice(bytes).map(Some).map_err(|_| {
-        "Use a settings JSON object with only COMFY_ROOT, COMFY_URL, COMFY_INPUT_DIR, and COMFY_OUTPUT_DIR as strings.".into()
-    })
+    let settings: Settings = serde_json::from_slice(bytes).map_err(|_| {
+        "Use a settings JSON object with only COMFY_ROOT, COMFY_URL, COMFY_INPUT_DIR, COMFY_OUTPUT_DIR, and PAUSE_FLAG as strings."
+    })?;
+    configured_pause_flag(&settings.pause_flag)?;
+    Ok(Some(settings))
 }
 
 pub(crate) fn fill_missing(mut settings: Settings, defaults: &Settings) -> Settings {
@@ -212,6 +232,7 @@ pub(crate) fn fill_missing(mut settings: Settings, defaults: &Settings) -> Setti
     for (saved, fallback) in [
         (&mut settings.comfy_input, &defaults.comfy_input),
         (&mut settings.comfy_output, &defaults.comfy_output),
+        (&mut settings.pause_flag, &defaults.pause_flag),
     ] {
         if saved.trim().is_empty() {
             saved.clone_from(fallback);
@@ -326,8 +347,7 @@ pub fn default_settings() -> Settings {
     Settings {
         comfy_root,
         comfy_url,
-        comfy_input: String::new(),
-        comfy_output: String::new(),
+        ..Settings::default()
     }
 }
 
@@ -355,7 +375,44 @@ pub(crate) fn validate_comfy_url(value: &str) -> Result<String, String> {
     Ok(url.as_str().trim_end_matches('/').into())
 }
 
+fn configured_pause_flag(value: &str) -> Result<Option<PathBuf>, String> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let path = Path::new(value);
+    let separators: &[_] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    let mut components = value.rsplit(separators);
+    if !path.is_absolute()
+        || value.contains('\0')
+        || components.next() != Some(GAMING_FLAG)
+        || components.any(|part| matches!(part, "." | ".."))
+    {
+        return Err("PAUSE_FLAG must be an absolute path ending in gaming_mode.flag without dot components.".into());
+    }
+    Ok(Some(path.to_path_buf()))
+}
+
+fn effective_pause_flag(
+    data_dir: &Path,
+    app_dir: &Path,
+    configured: &str,
+    inherited: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    let configured = configured_pause_flag(configured)?;
+    if let Some(path) = inherited {
+        let path = if path.is_absolute() || path.starts_with("~") {
+            path
+        } else {
+            app_dir.join(path)
+        };
+        return resolve_path(&path)
+            .map_err(|_| "The Gaming Mode flag could not be resolved.".into());
+    }
+    Ok(configured.unwrap_or_else(|| data_dir.join(GAMING_FLAG)))
+}
+
 pub fn validate_settings(settings: &Settings) -> Result<Settings, String> {
+    configured_pause_flag(&settings.pause_flag)?;
     let root = settings.comfy_root.trim();
     if root.is_empty() {
         return Err(
@@ -372,6 +429,11 @@ pub fn validate_settings(settings: &Settings) -> Result<Settings, String> {
     let mut settings = Settings {
         comfy_root,
         comfy_url,
+        pause_flag: if settings.pause_flag.trim().is_empty() {
+            String::new()
+        } else {
+            settings.pause_flag.clone()
+        },
         ..settings.clone()
     };
     for kind in ["input", "output"] {
@@ -854,22 +916,24 @@ fn start_command(
     app_dir: &Path,
     python: &Path,
     token_path: &Path,
+    pause_flag: &Path,
     port: u16,
 ) -> Result<String, String> {
     let data = console_quote(data_dir)?;
     let program = console_quote(python)?;
     let script = console_quote(&app_dir.join(LAUNCHER))?;
     let token = console_quote(token_path)?;
+    let pause = console_quote(pause_flag)?;
     if cfg!(windows) {
         Ok(format!(
             "$env:COMFY_MCP_DATA_DIR = {data}; $env:MCP_HOST = '127.0.0.1'; \
              $env:MCP_PORT = '{port}'; $env:MCP_TOKEN_FILE = {token}; \
-             & {program} {script} start"
+             $env:PAUSE_FLAG = {pause}; & {program} {script} start"
         ))
     } else {
         Ok(format!(
             "COMFY_MCP_DATA_DIR={data} MCP_HOST='127.0.0.1' MCP_PORT='{port}' \
-             MCP_TOKEN_FILE={token} {program} {script} start"
+             MCP_TOKEN_FILE={token} PAUSE_FLAG={pause} {program} {script} start"
         ))
     }
 }
@@ -920,7 +984,12 @@ fn save_mcp_port(data_dir: &Path, port: u16) -> Result<(), String> {
     Ok(())
 }
 
-fn installation(data_dir: &Path, app_dir: PathBuf, port: u16) -> Result<Installed, String> {
+fn installation(
+    data_dir: &Path,
+    app_dir: PathBuf,
+    port: u16,
+    settings: &Settings,
+) -> Result<Installed, String> {
     let python = venv_python(&app_dir);
     let token_path = if let Some(path) = environment_path("MCP_TOKEN_FILE") {
         let path = if path.is_absolute() || path.starts_with("~") {
@@ -933,10 +1002,18 @@ fn installation(data_dir: &Path, app_dir: PathBuf, port: u16) -> Result<Installe
     } else {
         data_dir.join("token.txt")
     };
+    let pause_flag = effective_pause_flag(
+        data_dir,
+        &app_dir,
+        &settings.pause_flag,
+        env::var_os("PAUSE_FLAG").map(PathBuf::from),
+    )?;
     Ok(Installed {
-        start_command: start_command(data_dir, &app_dir, &python, &token_path, port)?,
+        start_command: start_command(data_dir, &app_dir, &python, &token_path, &pause_flag, port)?,
         mcp_url: format!("http://127.0.0.1:{port}/mcp"),
         token_path,
+        pause_flag,
+        attach_only: attach_only(data_dir),
         data_dir: data_dir.to_path_buf(),
         app_dir,
     })
@@ -947,8 +1024,8 @@ pub fn existing_install_at(data: &Path) -> Option<Installed> {
         return None;
     }
     let app = active_runtime(data).ok()?;
-    let installed = installation(data, app, mcp_port(data).ok()?).ok()?;
-    settings_for_runtime(data, &installed.app_dir)?;
+    let settings = settings_for_runtime(data, &app)?;
+    let installed = installation(data, app, mcp_port(data).ok()?, &settings).ok()?;
     (venv_python(&installed.app_dir).is_file()
         && RUNTIME_FILES
             .iter()
@@ -1154,6 +1231,7 @@ pub(crate) fn lock_install(data_dir: &Path) -> Result<fs::File, String> {
 fn stage_runtime(
     data_dir: &Path,
     port: u16,
+    settings: &Settings,
     mut command: Command,
     cancel: &AtomicBool,
     mut progress: impl FnMut(&str),
@@ -1162,7 +1240,7 @@ fn stage_runtime(
         .prefix(RUNTIME_PREFIX)
         .tempdir_in(data_dir)
         .map_err(|_| "Could not create a staging directory for this upgrade.")?;
-    let installed = installation(data_dir, staging.path().to_path_buf(), port)?;
+    let installed = installation(data_dir, staging.path().to_path_buf(), port, settings)?;
     let python = venv_python(&installed.app_dir);
     for (name, content) in RUNTIME_FILES {
         check_cancel(cancel)?;
@@ -1216,6 +1294,7 @@ fn stage_runtime(
             .current_dir(&installed.app_dir)
             .env("COMFY_MCP_DATA_DIR", smoke_data.path())
             .env("MCP_TOKEN_FILE", smoke_data.path().join("token.txt"))
+            .env("PAUSE_FLAG", smoke_data.path().join(GAMING_FLAG))
             .env("MCP_PORT", port.to_string())
             .arg(installed.app_dir.join(SERVER))
             .arg("--help"),
@@ -1290,7 +1369,8 @@ pub fn install(
     let port = mcp_port(&data_dir)?;
     #[cfg(windows)]
     crate::uninstall::mark_install(&data_dir)?;
-    let (staging, installed) = stage_runtime(&data_dir, port, command, cancel, &mut progress)?;
+    let (staging, installed) =
+        stage_runtime(&data_dir, port, &settings, command, cancel, &mut progress)?;
     check_cancel(cancel)?;
     progress("Activating the verified Render Bridge runtime.");
     if setup_snapshot(&data_dir)? != snapshot {
@@ -1374,7 +1454,8 @@ pub fn upgrade_existing(
     let interpreter = venv_python(&snapshot.0);
     let command = python_for_creation(Some(&interpreter), cancel)
         .or_else(|_| python_for_creation(None, cancel))?;
-    let (staging, installed) = stage_runtime(data_dir, port, command, cancel, &mut progress)?;
+    let (staging, installed) =
+        stage_runtime(data_dir, port, &settings, command, cancel, &mut progress)?;
     check_cancel(cancel)?;
     progress("Activating the verified Render Bridge runtime.");
     if setup_snapshot(data_dir)? != snapshot {
@@ -1398,8 +1479,7 @@ mod tests {
         let default = Settings {
             comfy_root: data.path().join("ComfyUI").to_string_lossy().into_owned(),
             comfy_url: DEFAULT_COMFY_URL.into(),
-            comfy_input: String::new(),
-            comfy_output: String::new(),
+            ..Settings::default()
         };
         let path = data.path().join("settings.json");
         fs::write(
@@ -1440,6 +1520,117 @@ mod tests {
         .unwrap();
         assert!(settings_for_setup(data.path(), &default).is_err());
         assert!(fs::read_to_string(&path).unwrap().contains("MCP_TOKEN"));
+    }
+
+    #[test]
+    fn configured_shared_gaming_mode_flag_is_retained_and_used_by_the_installation() {
+        let data = tempfile::tempdir().unwrap();
+        let app = data.path().join("app-fixture");
+        let flag = data
+            .path()
+            .join("shared flag folder")
+            .join("gaming_mode.flag");
+        let python = venv_python(&app);
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(python, b"fixture").unwrap();
+        for (file, _) in RUNTIME_FILES {
+            fs::write(app.join(file), b"fixture").unwrap();
+        }
+        fs::write(data.path().join(ACTIVE_RUNTIME), "app-fixture").unwrap();
+        fs::write(
+            app.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "COMFY_ROOT": data.path(),
+                "COMFY_URL": DEFAULT_COMFY_URL,
+                "PAUSE_FLAG": flag,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let reviewed = settings_for_setup(data.path(), &default_settings()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reviewed).unwrap()["PAUSE_FLAG"],
+            serde_json::json!(flag)
+        );
+        let installed = existing_install_at(data.path()).unwrap();
+        assert_eq!(installed.pause_flag, flag);
+        assert!(
+            installed
+                .start_command
+                .contains(&console_quote(&flag).unwrap())
+        );
+        assert_eq!(crate::gaming_mode(&installed), Some(false));
+        fs::create_dir_all(flag.parent().unwrap()).unwrap();
+        fs::write(&flag, "fixture").unwrap();
+        assert_eq!(crate::gaming_mode(&installed), Some(true));
+    }
+
+    #[test]
+    fn an_attach_only_marker_blocks_all_managed_start_helpers() {
+        let data = tempfile::tempdir().unwrap();
+        let installed = installation(
+            data.path(),
+            data.path().join("app"),
+            DEFAULT_MCP_PORT,
+            &default_settings(),
+        )
+        .unwrap();
+        assert!(installed.may_manage_server());
+
+        // Simulate an open panel holding its installation while the marker is added.
+        fs::write(data.path().join(ATTACH_ONLY), "").unwrap();
+        assert!(!installed.may_manage_server());
+        let mut running = None;
+        let error =
+            crate::connection::start_and_verify(&installed, &mut running, &[], "").unwrap_err();
+        assert!(error.contains("external server"));
+        assert!(running.is_none());
+        #[cfg(windows)]
+        assert!(
+            crate::connection::start_installed_and_verify(&installed, &[], "")
+                .unwrap_err()
+                .contains("external server")
+        );
+    }
+
+    #[test]
+    fn configured_gaming_flags_are_safe_and_the_explicit_environment_wins() {
+        let data = tempfile::tempdir().unwrap();
+        let app = data.path().join("app");
+        let configured = data.path().join("shared").join(GAMING_FLAG);
+        let inherited = PathBuf::from("legacy-custom.flag");
+        assert_eq!(
+            effective_pause_flag(data.path(), &app, configured.to_str().unwrap(), None),
+            Ok(configured.clone())
+        );
+        assert_eq!(
+            effective_pause_flag(
+                data.path(),
+                &app,
+                configured.to_str().unwrap(),
+                Some(inherited.clone())
+            ),
+            Ok(app.join(inherited))
+        );
+        assert_eq!(
+            effective_pause_flag(data.path(), &app, "", None),
+            Ok(data.path().join(GAMING_FLAG))
+        );
+        assert!(configured_pause_flag(GAMING_FLAG).is_err());
+        let prefix = data.path().display();
+        for path in [
+            format!("{prefix}/./{GAMING_FLAG}"),
+            format!("{prefix}/shared/../{GAMING_FLAG}"),
+            format!("{prefix}/{GAMING_FLAG}/"),
+            format!("{prefix}/token.txt"),
+            format!("{prefix}/nul\0/{GAMING_FLAG}"),
+        ] {
+            assert!(
+                configured_pause_flag(&path).is_err(),
+                "unexpected valid fixture {path:?}"
+            );
+        }
     }
 
     #[test]
@@ -1582,8 +1773,7 @@ mod tests {
         let settings = Settings {
             comfy_root: "fixture".into(),
             comfy_url: "http://localhost:8188".into(),
-            comfy_input: String::new(),
-            comfy_output: String::new(),
+            ..Settings::default()
         };
         activate_runtime(data.path(), previous, &settings).unwrap();
 
@@ -1632,8 +1822,7 @@ mod tests {
             let settings = Settings {
                 comfy_root: "fixture".into(),
                 comfy_url: "http://localhost:8188".into(),
-                comfy_input: String::new(),
-                comfy_output: String::new(),
+                ..Settings::default()
             };
             let old_runtime = if legacy {
                 let path = data.path().join("app");
@@ -1677,7 +1866,8 @@ mod tests {
         let data = Path::new("account's local data");
         let app = data.join("app");
         let token = data.join("a friend's token file");
-        let command = start_command(data, &app, &venv_python(&app), &token, 19189).unwrap();
+        let flag = data.join(GAMING_FLAG);
+        let command = start_command(data, &app, &venv_python(&app), &token, &flag, 19189).unwrap();
         assert!(!command.contains("PUBLIC_URLS"));
         if cfg!(windows) {
             assert!(command.contains("$env:MCP_HOST = '127.0.0.1'"));
@@ -1722,8 +1912,7 @@ mod tests {
         let settings = Settings {
             comfy_root: data.path().display().to_string(),
             comfy_url: DEFAULT_COMFY_URL.into(),
-            comfy_input: String::new(),
-            comfy_output: String::new(),
+            ..Settings::default()
         };
         assert_eq!(mcp_port_with_env(data.path(), None), Ok(8189));
         let port = mcp_port_with_env(data.path(), Some("19189")).unwrap();
@@ -1809,8 +1998,7 @@ mod tests {
         let settings = Settings {
             comfy_root: directory.path().to_string_lossy().into_owned(),
             comfy_url: DEFAULT_COMFY_URL.into(),
-            comfy_input: String::new(),
-            comfy_output: String::new(),
+            ..Settings::default()
         };
         let mut instance = crate::discovery::Instance {
             url: settings.comfy_url.clone(),
@@ -1871,8 +2059,7 @@ mod tests {
         let settings = Settings {
             comfy_root: directory.path().to_string_lossy().into_owned(),
             comfy_url: format!("http://{address}"),
-            comfy_input: String::new(),
-            comfy_output: String::new(),
+            ..Settings::default()
         };
         assert_eq!(verify_folders(&settings, None), Ok(true));
         worker.join().unwrap();
@@ -1888,8 +2075,7 @@ mod tests {
         let settings = Settings {
             comfy_root: "fixture folder".into(),
             comfy_url: "http://localhost:8188".into(),
-            comfy_input: String::new(),
-            comfy_output: String::new(),
+            ..Settings::default()
         };
         save_settings(directory.path(), &settings).unwrap();
         let updated = Settings {
@@ -1957,8 +2143,7 @@ mod tests {
         let checks = probe(&Settings {
             comfy_root: directory.path().to_str().unwrap().into(),
             comfy_url: origin,
-            comfy_input: String::new(),
-            comfy_output: String::new(),
+            ..Settings::default()
         })
         .unwrap();
         worker.join().unwrap();

@@ -35,6 +35,7 @@ pub struct RunningBridge {
 
 impl RunningBridge {
     fn start(installed: &Installed, settings: &setup::Settings) -> Result<Self, String> {
+        require_managed_server(installed)?;
         let port = available_port(installed)?;
         let marker = tempfile::NamedTempFile::new_in(&installed.app_dir)
             .map_err(|_| "Could not prepare the Bridge startup check.")?;
@@ -47,6 +48,7 @@ impl RunningBridge {
             .current_dir(&installed.app_dir)
             .stdin(Stdio::piped())
             .env("COMFY_MCP_DATA_DIR", &installed.data_dir)
+            .env("PAUSE_FLAG", &installed.pause_flag)
             .env("COMFY_ROOT", &settings.comfy_root)
             .env("COMFY_URL", &settings.comfy_url)
             .env("COMFY_INPUT_DIR", setup::folder(settings, "input"))
@@ -139,6 +141,7 @@ pub fn start_and_verify(
     clients: &[Client],
     codex_profile: &str,
 ) -> Result<serde_json::Value, String> {
+    require_managed_server(installed)?;
     validate_client_options(clients, codex_profile)?;
     let settings = setup::saved_install_settings(installed)?;
     let paired = match setup::recheck_folders(&settings) {
@@ -168,6 +171,7 @@ pub fn start_installed_and_verify(
     clients: &[Client],
     codex_profile: &str,
 ) -> Result<serde_json::Value, String> {
+    require_managed_server(installed)?;
     validate_client_options(clients, codex_profile)?;
     let settings = setup::saved_install_settings(installed)?;
     let paired = setup::recheck_folders(&settings)?;
@@ -187,6 +191,13 @@ pub fn start_installed_and_verify(
     let mut result = verify_listener(installed, clients, codex_profile)?;
     result["folders"] = paired.into();
     Ok(result)
+}
+
+fn require_managed_server(installed: &Installed) -> Result<(), String> {
+    installed
+        .may_manage_server()
+        .then_some(())
+        .ok_or_else(|| "Use the external server's own launcher to manage it.".into())
 }
 
 fn validate_client_options(clients: &[Client], codex_profile: &str) -> Result<(), String> {

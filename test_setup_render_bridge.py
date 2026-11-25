@@ -94,6 +94,100 @@ class InstallRuntimeTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][0], str(previous_python))
         self.assertEqual(run.call_args.kwargs["env"]["COMFY_URL"], self.settings["COMFY_URL"])
 
+    def test_shared_gaming_flag_is_loaded_and_used_for_start_and_controls(self):
+        shared_flag = self.data / "shared gaming state" / "gaming_mode.flag"
+        setup.save_settings(self.previous / "settings.json", {**self.settings, "PAUSE_FLAG": str(shared_flag)})
+        python = setup.venv_python(self.previous)
+        python.parent.mkdir(parents=True)
+        python.touch()
+        for kind in ("input", "output"):
+            (self.data / "comfy" / kind).mkdir(parents=True)
+        for args in ([], ["gaming-mode", "status"], ["gaming-mode", "off"]):
+            for inherited in ({}, {"PAUSE_FLAG": "legacy-override.flag"}):
+                with (
+                    self.subTest(args=args, inherited=inherited),
+                    patch.dict(os.environ, inherited, clear=True),
+                    patch.object(setup.subprocess, "run", return_value=Mock(returncode=0)) as run,
+                ):
+                    self.assertEqual(setup.launch(self.data / "settings.json", args), 0)
+                    self.assertEqual(run.call_args.kwargs["env"]["PAUSE_FLAG"],
+                                     inherited.get("PAUSE_FLAG", str(shared_flag)))
+        self.assertFalse(shared_flag.parent.exists())
+
+    def test_shared_gaming_flag_settings_reject_unsafe_paths(self):
+        reusable = self.data / "reusable.json"
+        for flag in (
+            "gaming_mode.flag",
+            os.path.join("relative", "gaming_mode.flag"),
+            str(self.data / "another.flag"),
+            str(self.data / "GAMING_MODE.FLAG"),
+            str(self.data / "gaming_mode.flag") + " ",
+            str(self.data / "gaming_mode.flag") + os.sep,
+            os.path.join(str(self.data), ".", "gaming_mode.flag"),
+            os.path.join(str(self.data), "folder", "..", "gaming_mode.flag"),
+            os.path.join(str(self.data), "bad\x00path", "gaming_mode.flag"),
+        ):
+            with self.subTest(flag=flag):
+                setup.save_settings(reusable, {**self.settings, "PAUSE_FLAG": flag})
+                with self.assertRaisesRegex(ValueError, "gaming_mode.flag"):
+                    setup.load_settings(reusable)
+                with self.assertRaisesRegex(ValueError, "gaming_mode.flag"):
+                    setup.portable_settings(reusable)
+
+    def test_upgrade_keeps_the_saved_gaming_flag_and_does_not_store_the_env_override(self):
+        for kind in ("input", "output"):
+            (self.data / "comfy" / kind).mkdir(parents=True)
+        saved = {**self.settings, "PAUSE_FLAG": str(self.data / "saved" / "gaming_mode.flag")}
+        existing = self.previous / "settings.json"
+        setup.save_settings(existing, saved)
+        reusable = self.data / "reusable.json"
+        setup.save_settings(reusable, {"PAUSE_FLAG": str(self.data / "other" / "gaming_mode.flag")})
+        with (
+            patch.dict(os.environ, {"PAUSE_FLAG": "legacy-override.flag"}, clear=True),
+            patch("builtins.input", return_value="y"),
+            patch.object(setup, "probe_backend", return_value={}),
+            patch.object(setup, "install_runtime") as install,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup.install(self.data / "settings.json", reusable), 0)
+        self.assertEqual(install.call_args.args, (self.data, saved))
+        self.assertEqual(setup.load_settings(existing), saved)
+
+    def test_install_smoke_cannot_access_the_shared_gaming_flag(self):
+        shared_flag = self.data / "shared" / "gaming_mode.flag"
+        shared_flag.parent.mkdir()
+        shared_flag.write_text("fixture paused", encoding="utf-8")
+        preferences = {**self.settings, "PAUSE_FLAG": str(shared_flag)}
+        with (
+            patch.dict(os.environ, {"PAUSE_FLAG": str(shared_flag)}),
+            patch.object(setup, "run_install_stage") as stages,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup.install_runtime(self.data, preferences)
+        smoke = stages.call_args.args[4]
+        self.assertEqual(Path(smoke["PAUSE_FLAG"]),
+                         Path(smoke["COMFY_MCP_DATA_DIR"]) / "gaming_mode.flag")
+        self.assertFalse(Path(smoke["PAUSE_FLAG"]).exists())
+        self.assertEqual(shared_flag.read_text(encoding="utf-8"), "fixture paused")
+        self.assertEqual(setup.load_settings(setup.active_runtime(self.data) / "settings.json"), preferences)
+
+    def test_attach_only_installation_blocks_start_but_keeps_gaming_mode_controls(self):
+        (self.data / "attach-only").touch()
+        python = setup.venv_python(self.previous)
+        python.parent.mkdir(parents=True)
+        python.touch()
+        for kind in ("input", "output"):
+            (self.data / "comfy" / kind).mkdir(parents=True)
+        with (
+            patch.object(setup.subprocess, "run", return_value=Mock(returncode=0)) as run,
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(setup.launch(self.data / "settings.json", []), 1)
+            run.assert_not_called()
+            self.assertEqual(setup.launch(self.data / "settings.json", ["gaming-mode", "status"]), 0)
+        self.assertIn("external server", errors.getvalue())
+        self.assertEqual(run.call_args.args[0][-2:], ["gaming-mode", "status"])
+
     def test_invalid_pointer_cannot_redirect_outside_installation(self):
         setup.atomic_text(self.data / setup.ACTIVE_RUNTIME, "app-../../escape")
         with self.assertRaises(ValueError):
@@ -135,7 +229,7 @@ class InstallRuntimeTest(unittest.TestCase):
 
     def test_fresh_terminal_install_saves_split_comfy_folders(self):
         (self.data / setup.ACTIVE_RUNTIME).unlink()
-        paths = {key: self.data / key.lower() for key in setup.OPTIONAL_SETTINGS}
+        paths = {key: self.data / key.lower() for key in setup.OPTIONAL_FOLDERS}
         for folder in [*paths.values(), self.data / "comfy"]:
             folder.mkdir()
         overrides = {key: str(path) for key, path in paths.items()}
@@ -155,7 +249,9 @@ class InstallRuntimeTest(unittest.TestCase):
         for kind in ("input", "output"):
             (root / kind).mkdir(parents=True)
         reusable = self.data / "reusable.json"
-        setup.save_settings(reusable, self.settings)
+        flag = self.data / "shared" / "gaming_mode.flag"
+        settings = {**self.settings, "PAUSE_FLAG": str(flag)}
+        setup.save_settings(reusable, settings)
         with (
             patch.dict(os.environ, {"COMFY_ROOT": "unused", "COMFY_URL": "unused"}, clear=True),
             patch("builtins.input", return_value="y") as answer,
@@ -165,8 +261,8 @@ class InstallRuntimeTest(unittest.TestCase):
         ):
             self.assertEqual(setup.main(["--data-dir", str(self.data), "install", "--config", str(reusable)]), 0)
         answer.assert_called_once_with("Prepare and activate a verified Render Bridge runtime? [y/N] ")
-        self.assertEqual(install.call_args.args, (self.data, self.settings))
-        for value in (root, root / "input", root / "output", self.settings["COMFY_URL"], self.data):
+        self.assertEqual(install.call_args.args, (self.data, settings))
+        for value in (root, root / "input", root / "output", self.settings["COMFY_URL"], self.data, flag):
             self.assertIn(str(value), preview.getvalue())
 
     def test_upgrade_keeps_filled_settings_and_fills_blanks_from_the_config(self):
