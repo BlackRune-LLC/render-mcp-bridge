@@ -3,6 +3,8 @@
 mod artwork;
 mod asset_folders;
 mod asset_ui;
+#[cfg(windows)]
+mod attached_mcp;
 mod connection;
 mod diagnostics;
 mod discovery;
@@ -126,6 +128,8 @@ enum Event {
         Result<serde_json::Value, String>,
     ),
     GamingModeChanged(Result<(), String>),
+    #[cfg(windows)]
+    AttachedMcpChanged(VerificationTarget, attached_mcp::Action, Result<(), String>),
     TokenRotated(Result<(), String>),
     Progress(String),
     Finished(Result<Installed, String>),
@@ -141,12 +145,16 @@ enum CheckOutcome {
 enum QueueAction {
     Inspect,
     StopBridge,
+    #[cfg(windows)]
+    StopAttached,
     CloseWindow,
 }
 
 struct QueueDialog {
     queue: QueueView,
     action: QueueAction,
+    #[cfg(windows)]
+    attached: Option<AttachedTarget>,
 }
 
 enum MonitorTarget {
@@ -1147,6 +1155,26 @@ impl VerificationTarget {
     }
 }
 
+#[cfg(windows)]
+struct AttachedTarget {
+    installed: Installed,
+    target: VerificationTarget,
+    registration: attached_mcp::Registration,
+}
+
+#[cfg(windows)]
+impl AttachedTarget {
+    fn capture(installed: Installed) -> Result<Self, String> {
+        let target = VerificationTarget::capture(&installed);
+        let registration = attached_mcp::registration(&installed)?;
+        Ok(Self {
+            installed,
+            target,
+            registration,
+        })
+    }
+}
+
 struct ControlsState {
     data_dir: Option<PathBuf>,
     installation: Option<VerificationTarget>,
@@ -1156,6 +1184,8 @@ struct ControlsState {
     next_load: Instant,
     #[cfg(windows)]
     bridge_online: bool,
+    #[cfg(windows)]
+    attached_controls: bool,
     #[cfg(windows)]
     bridge_probe: Option<Receiver<bool>>,
     #[cfg(windows)]
@@ -1356,6 +1386,8 @@ impl Installer {
                     #[cfg(windows)]
                     bridge_online: false,
                     #[cfg(windows)]
+                    attached_controls: false,
+                    #[cfg(windows)]
                     bridge_probe: None,
                     #[cfg(windows)]
                     update_available_here,
@@ -1483,19 +1515,13 @@ impl Installer {
         self.queue_dialog = Some(QueueDialog {
             queue: QueueView::new(url.unwrap_or_default()),
             action,
+            #[cfg(windows)]
+            attached: None,
         });
     }
 
     #[cfg(windows)]
     fn request_server_action(&mut self, ctx: &egui::Context, action: ServerAction) {
-        if !matches!(action, ServerAction::Exit)
-            && self
-                .installed
-                .as_ref()
-                .is_some_and(|installed| !installed.may_manage_server())
-        {
-            return;
-        }
         if matches!(action, ServerAction::Exit) && self.model_manager.downloading() {
             self.select_workspace(ctx, WorkspaceTab::Models);
             self.queue_dialog = None;
@@ -1510,6 +1536,37 @@ impl Installer {
         {
             setting.open = false;
         }
+        if let Some(installed) = self
+            .installed
+            .clone()
+            .filter(|installed| !installed.may_manage_server())
+            && !matches!(action, ServerAction::Exit)
+        {
+            if !matches!(action, ServerAction::Start | ServerAction::Stop) {
+                return;
+            }
+            match AttachedTarget::capture(installed) {
+                Ok(target) if matches!(action, ServerAction::Start) => {
+                    self.queue_dialog = None;
+                    self.control_attached_mcp(ctx, target, attached_mcp::Action::Start);
+                }
+                Ok(target) => {
+                    let queue_url = target
+                        .target
+                        .settings
+                        .as_ref()
+                        .and_then(|settings| setup::validate_comfy_url(&settings.comfy_url).ok())
+                        .unwrap_or_default();
+                    self.queue_dialog = Some(QueueDialog {
+                        queue: QueueView::new(queue_url),
+                        action: QueueAction::StopAttached,
+                        attached: Some(target),
+                    });
+                }
+                Err(error) => self.verification = Some(Err(error)),
+            }
+            return;
+        }
         match action {
             ServerAction::Start | ServerAction::StartSilently => {
                 self.queue_dialog = None;
@@ -1523,6 +1580,53 @@ impl Installer {
                     });
                 }
             }
+        }
+    }
+
+    #[cfg(windows)]
+    fn control_attached_mcp(
+        &mut self,
+        ctx: &egui::Context,
+        attached: AttachedTarget,
+        action: attached_mcp::Action,
+    ) {
+        let AttachedTarget {
+            installed,
+            target,
+            registration,
+        } = attached;
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        self.verification = None;
+        self.progress = match action {
+            attached_mcp::Action::Stop => "Stopping Render Bridge…",
+            _ => "Starting Render Bridge…",
+        }
+        .into();
+        if thread::Builder::new()
+            .name("render-bridge-attached-mcp".into())
+            .spawn(move || {
+                let result =
+                    attached_mcp::control(&installed, action, |current, current_registration| {
+                        if target == VerificationTarget::capture(current)
+                            && &registration == current_registration
+                        {
+                            Ok(())
+                        } else {
+                            Err(
+                                "Render Bridge settings changed. Reopen the panel and try again."
+                                    .into(),
+                            )
+                        }
+                    });
+                let _ = sender.send(Event::AttachedMcpChanged(target, action, result));
+                ctx.request_repaint();
+            })
+            .is_ok()
+        {
+            self.worker = Some(receiver);
+        } else {
+            self.verification = Some(Err("Could not run the Render Bridge server control.".into()));
         }
     }
 
@@ -1541,6 +1645,8 @@ impl Installer {
             let title = match action {
                 QueueAction::Inspect => "Jobs",
                 QueueAction::StopBridge => "Stop Render Bridge?",
+                #[cfg(windows)]
+                QueueAction::StopAttached => "Stop Render Bridge?",
                 QueueAction::CloseWindow => "Stop Render Bridge and exit?",
             };
             ui.heading(RichText::new(title).size(25.0).strong());
@@ -1556,7 +1662,7 @@ impl Installer {
             caption(ui, if exiting_panel {
                 "Exiting stops the server started by this panel. ComfyUI and its queue keep running."
             } else {
-                "Stopping Render Bridge can interrupt job tracking. ComfyUI and its queue keep running."
+                "Stopping Render Bridge disconnects agents and can interrupt job tracking. ComfyUI and its queue keep running."
             });
             let (stop_label, force_label) = if exiting_panel {
                 ("Stop and exit", "Stop and exit anyway")
@@ -1586,10 +1692,19 @@ impl Installer {
             (keep, stop)
         });
         let (dismiss, stop) = response.inner;
+        #[cfg(windows)]
+        let attached = stop.then(|| dialog.attached.take()).flatten();
         if dismiss || stop || response.should_close() {
             self.queue_dialog = None;
         }
         if stop {
+            #[cfg(windows)]
+            if action == QueueAction::StopAttached {
+                if let Some(target) = attached {
+                    self.control_attached_mcp(ctx, target, attached_mcp::Action::Stop);
+                }
+                return;
+            }
             self.running = None;
             self.verification = None;
             #[cfg(windows)]
@@ -2084,6 +2199,27 @@ impl Installer {
                         controls.next_load = Instant::now();
                     }
                     self.verification = Some(result);
+                }
+                #[cfg(windows)]
+                Ok(Event::AttachedMcpChanged(target, action, result)) => {
+                    self.worker = None;
+                    if !target.is_current() {
+                        self.verification = Some(Err(
+                            "The selected Render Bridge endpoint changed. Check it again.".into(),
+                        ));
+                        continue;
+                    }
+                    let online = !matches!(action, attached_mcp::Action::Stop);
+                    if let Some(controls) = &mut self.controls {
+                        if result.is_ok() {
+                            controls.bridge_online = online;
+                        }
+                        controls.bridge_probe = None;
+                        controls.next_load = Instant::now();
+                    }
+                    self.verification = Some(result.map(|()| serde_json::json!({
+                        "bridge": if online { "attached_mcp_online" } else { "attached_mcp_stopped" },
+                    })));
                 }
                 Ok(Event::GamingModeChanged(result)) => {
                     self.worker = None;
@@ -3323,6 +3459,7 @@ impl Installer {
         }
         #[cfg(windows)]
         {
+            controls.attached_controls = installed.as_ref().is_some_and(attached_mcp::configured);
             if changed {
                 controls.bridge_probe = None;
                 controls.bridge_online = false;
@@ -3458,6 +3595,10 @@ impl Installer {
                     .controls
                     .as_ref()
                     .is_some_and(|controls| controls.bridge_online);
+            let attached = self
+                .controls
+                .as_ref()
+                .is_some_and(|controls| controls.attached_controls);
             let width = ui.available_width();
             let compact = width < 620.0;
             let dense = width < COMPACT_MONITOR_WIDTH;
@@ -3465,14 +3606,20 @@ impl Installer {
                 if dense {
                     compact_monitor_spacing(ui);
                 }
-                if self
-                    .installed
-                    .as_ref()
-                    .is_some_and(|installed| installed.attach_only)
+                if let Some(installed) = self.installed.as_ref()
+                    && !installed.may_manage_server()
+                    && !attached
                 {
                     server_state(ui, online, false, compact);
                 } else {
-                    self.job_server_actions(ui, online, owned, idle, compact);
+                    self.job_server_actions(
+                        ui,
+                        online,
+                        owned,
+                        owned || (online && attached),
+                        idle,
+                        compact,
+                    );
                 }
                 if !dense {
                     ui.separator();
@@ -3490,6 +3637,7 @@ impl Installer {
         ui: &mut Ui,
         online: bool,
         owned: bool,
+        can_stop: bool,
         idle: bool,
         compact: bool,
     ) {
@@ -3514,11 +3662,11 @@ impl Installer {
         {
             self.request_server_action(ui.ctx(), ServerAction::Start);
         }
-        let stop_fill = if owned { ERROR } else { LINE };
+        let stop_fill = if can_stop { ERROR } else { LINE };
         if job_action_button(
             ui,
             if compact { "Stop" } else { "Stop server" },
-            idle && owned,
+            idle && can_stop,
             stop_fill,
             JobActionGlyph::Stop,
         )
@@ -3905,6 +4053,10 @@ impl eframe::App for Installer {
                     tray.server_action.take()
                 });
                 if let Some(action) = action {
+                    if matches!(action, ServerAction::Start | ServerAction::Stop) {
+                        self.load_controls(ctx);
+                        self.select_workspace(ctx, WorkspaceTab::Jobs);
+                    }
                     self.request_server_action(ctx, action);
                 }
                 if hidden {
@@ -4058,6 +4210,8 @@ fn python_venv_help() -> &'static str {
 fn bridge_status(code: &str) -> (&'static str, bool) {
     match code {
         "already_running" => ("Render Bridge is already running.", true),
+        "attached_mcp_online" => ("The selected Render Bridge MCP service is running.", true),
+        "attached_mcp_stopped" => ("The selected Render Bridge MCP service is stopped.", true),
         "ok" => (
             "Authenticated MCP connection verified. ComfyUI is reachable.",
             true,
@@ -5291,6 +5445,25 @@ mod launch_tests {
 
 fn main() -> std::process::ExitCode {
     diagnostics::install_panic_hook();
+    #[cfg(windows)]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() == Some(std::ffi::OsStr::new("--start-attached-if-enabled")) {
+            let installed = args
+                .next()
+                .map(PathBuf::from)
+                .filter(|_| args.next().is_none())
+                .and_then(|path| setup::existing_install_at(&path));
+            return if installed.as_ref().is_some_and(|installed| {
+                attached_mcp::control(installed, attached_mcp::Action::AutoStart, |_, _| Ok(()))
+                    .is_ok()
+            }) {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            };
+        }
+    }
     if open_app().is_ok() {
         std::process::ExitCode::SUCCESS
     } else {
@@ -5387,7 +5560,12 @@ fn open_app() -> eframe::Result {
                         .controls
                         .as_ref()
                         .and_then(|controls| controls.data_dir.as_deref())
-                        .is_some_and(|data| !setup::attach_only(data));
+                        .is_some_and(|data| {
+                            !setup::attach_only(data)
+                                || setup::existing_install_at(data)
+                                    .as_ref()
+                                    .is_some_and(attached_mcp::configured)
+                        });
                     let root =
                         creation
                             .window_handle()

@@ -38,6 +38,7 @@ enum Edit {
 struct AddPipeline {
     name: String,
     graph: Option<WorkflowEditor>,
+    prompt_copied: bool,
 }
 
 struct ModelSelection {
@@ -319,6 +320,29 @@ impl WorkflowPanel {
                         self.error = None;
                     }
                 });
+                let guide = format!("{}#edit-a-comfyui-workflow", crate::MODEL_GUIDE);
+                ui.horizontal_wrapped(|ui| {
+                    if secondary(ui, "Copy pipeline setup prompt", true).clicked() {
+                        ui.ctx().copy_text(format!(
+                            "Help me prepare a pipeline to import into Render Bridge.\n\n\
+                             Read {guide}. Ask what the pipeline should do if I have not specified it. \
+                             Use a workflow I provide as a starting point when available.\n\n\
+                             Prepare ComfyUI API-format JSON as an object keyed by node ID. Each node \
+                             needs class_type and inputs. Preserve valid graph connections and include \
+                             the appropriate output node. Use read-only checks for model and node \
+                             availability when possible. Tell me which dependencies are missing or unverified.\n\n\
+                             Save the graph as a new .json file I can open, or provide the JSON if you \
+                             cannot write to a location I can access. Tell me to open Pipelines > Your pipelines \
+                             > Add pipeline, select Import API JSON, name the pipeline, and select Add to library. \
+                             Ask before installing dependencies or replacing files, and ask me before queuing a render."
+                        ));
+                        add.prompt_copied = true;
+                    }
+                    ui.hyperlink_to("Pipeline guide", guide);
+                });
+                if add.prompt_copied {
+                    caption(ui, "Prompt copied. Paste it into your agent.");
+                }
             }
             if add.graph.is_some() {
                 let label = crate::field_label(ui, "Pipeline name");
@@ -1089,6 +1113,62 @@ fn link_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_pipeline_copies_agent_setup_instructions() {
+        use eframe::egui::accesskit::{Action, ActionRequest, Role};
+
+        let mut panel = WorkflowPanel::default();
+        panel.begin_add();
+        let ctx = egui::Context::default();
+        crate::theme::configure_for(&ctx, egui::ThemePreference::Dark, None);
+        ctx.enable_accesskit();
+
+        let frame = |panel: &mut WorkflowPanel, input| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.show_add_pipeline(ui));
+            })
+        };
+        // A new modal is invisible during its first frame while egui measures it.
+        frame(&mut panel, egui::RawInput::default());
+        let initial = frame(&mut panel, egui::RawInput::default());
+        let tree = initial.platform_output.accesskit_update.unwrap();
+        let (target, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == Role::Button
+                    && node.label() == Some("Copy pipeline setup prompt")
+                    && node.supports_action(Action::Click)
+                    && !node.is_disabled()
+            })
+            .expect("Add pipeline should offer setup instructions");
+        let output = frame(
+            &mut panel,
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Click,
+                    target: *target,
+                    data: None,
+                })],
+                ..Default::default()
+            },
+        );
+        let prompt = output
+            .platform_output
+            .commands
+            .into_iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(prompt) => Some(prompt),
+                _ => None,
+            })
+            .expect("the copy button should emit a prompt through egui");
+        assert!(prompt.contains("docs/pipelines.md#edit-a-comfyui-workflow"));
+        assert!(prompt.contains("class_type"));
+        assert!(prompt.contains("Import API JSON"));
+        assert!(prompt.contains("Add to library"));
+        assert!(prompt.contains("ask me before queuing a render"));
+    }
 
     #[test]
     fn each_workflow_step_has_its_own_expandable_editor() {

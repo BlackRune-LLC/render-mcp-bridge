@@ -78,6 +78,16 @@ Open **Nodes** to search the selected build by name, ID, or category. Filter by 
 
 **Test run** explicitly queues a new job on the selected local ComfyUI instance. The app checks the graph again at submission. Gaming Mode must be off. The test accepts built-in local ComfyUI nodes and requires you to confirm before it runs. Watch queue activity in **Jobs**. Copy the prompt ID to look up this test in ComfyUI. Custom and hosted workflows should be tested in ComfyUI first. Editing or exporting a draft leaves queued and running jobs alone.
 
+### Add a pipeline with an agent
+
+In Render Bridge, open **Pipelines → Your pipelines → Add pipeline**. Choose **Copy pipeline setup prompt** and paste it into your agent. Describe what you want to make and share an existing workflow if you have one. The agent can also follow this section directly.
+
+1. Ask the user for the intended output and any workflow they want to build on. Prepare a ComfyUI API-format graph as a JSON object keyed by node ID. Each node has a `class_type` and an `inputs` object. A link such as `["12", 0]` uses output 0 from node 12. Include the output node that saves the intended result.
+2. Use read-only checks where available. Call Render Bridge's `list_models` tool and inspect the [ComfyUI node registry](https://docs.comfy.org/development/comfyui-server/comms_routes) on the target build if you have access to it. Report any missing or unverified model files and node packs. Get approval before installing dependencies or replacing files.
+3. Save a new `.json` file somewhere the user can open it, or give them the JSON to save. Have the user return to **Add pipeline**, choose **Import API JSON**, name the pipeline, and select **Add to library**. In the saved pipeline, **Check dependencies** checks the selected build again.
+
+The Render Bridge app imports the file into its local library. The MCP tool `run_workflow` submits a render job, so wait for the user's approval before using it.
+
 ## Check and install nodes
 
 Standard generation, Qwen image tools, and BiRefNet cutouts use nodes supplied with current ComfyUI. The named Wan and 3D pipelines also use newer core nodes. Start by updating ComfyUI if a core node is missing. Examples include `RemoveBackground`, `WanAnimate2ToVideo`, `WanFirstLastFrameToVideo`, `LoadMoGeModel`, and `Save3DAdvanced`.

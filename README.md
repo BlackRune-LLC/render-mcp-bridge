@@ -227,7 +227,9 @@ For manual setup, use `comfy_mcp_server.py gaming-mode on|off|status` with the v
 
 The pause persists across restarts. Check `server_status` from your MCP client to confirm it, then turn Gaming Mode off when you are ready to generate again. If Render Bridge is stopped while the queue clears, start it or run `gaming-mode on` again to request the unload.
 
-An already managed local MCP endpoint can share Gaming Mode with the Windows tray. Set `PAUSE_FLAG` in the installed `settings.json` to the endpoint's absolute `gaming_mode.flag` path. In the installation data folder, set `mcp-port` to the existing port and create an empty `attach-only` file. The tray follows the listener and retains its Jobs and Gaming Mode controls. Use the existing launcher and credentials to manage that MCP endpoint.
+An already managed local MCP endpoint can share Gaming Mode with the Windows tray. Set `PAUSE_FLAG` in the installed `settings.json` to the endpoint's absolute `gaming_mode.flag` path. In the installation data folder, set `mcp-port` to the existing port and create an empty `attach-only` file. The tray follows the listener and retains its Jobs and Gaming Mode controls. Use the credentials from the existing MCP endpoint to connect your agents.
+
+On Windows, you can enable tray Start and Stop for an attached local server. In the installation data folder, add `attached-mcp.json` with a numeric `port` matching `mcp-port` and an absolute `launcher` path to the server's existing `start_mcp_server.bat`. Keep this registration in the local installation. Start uses that launcher, which must bind the registered MCP port. Stop checks that the registered launcher owns the listener, then stops the MCP service on that port. ComfyUI keeps running. If you start this service at sign-in, use `RenderBridgeMonitor.exe --start-attached-if-enabled "<installation data directory>"` so it honors an explicit Stop.
 
 ## Ask your agent to set it up
 
