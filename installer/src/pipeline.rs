@@ -384,9 +384,19 @@ pub fn save_new(
     name: &str,
     graph: &WorkflowEditor,
 ) -> Result<SavedPipeline, String> {
+    save_new_checked(data_dir, name, graph, || Ok(()))
+}
+
+pub(crate) fn save_new_checked(
+    data_dir: &Path,
+    name: &str,
+    graph: &WorkflowEditor,
+    verify_installation: impl FnOnce() -> Result<(), String>,
+) -> Result<SavedPipeline, String> {
     let path = pipeline_path(data_dir, name)?;
     let folder = pipeline_directory(data_dir)?;
     let _lock = lock_install(data_dir)?;
+    verify_installation()?;
     if !storage_exists(&folder)? {
         fs::create_dir(&folder).map_err(|_| "Could not create the saved pipelines folder.")?;
     }

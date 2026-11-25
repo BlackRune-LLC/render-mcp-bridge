@@ -131,7 +131,7 @@ pub(crate) fn control(
     let _launcher_pins = pin_local_directories(root)?;
     preflight(&current, &manifest)?;
     with_stop_setting(&installed.data_dir, manifest.port, action, || {
-        run_controller(&manifest, action)
+        run_controller(&installed.data_dir, &manifest, action)
     })
 }
 
@@ -191,7 +191,7 @@ fn powershell(script: &str) -> Result<std::process::Command, String> {
     Ok(command)
 }
 
-fn run_controller(manifest: &Registration, action: Action) -> Result<(), String> {
+fn run_controller(data_dir: &Path, manifest: &Registration, action: Action) -> Result<(), String> {
     let operation = match action {
         Action::Start | Action::AutoStart => "start",
         Action::Stop => "stop",
@@ -200,6 +200,7 @@ fn run_controller(manifest: &Registration, action: Action) -> Result<(), String>
         .env("RB_ATTACHED_PORT", manifest.port.to_string())
         .env("RB_ATTACHED_LAUNCHER", &manifest.launcher)
         .env("RB_ATTACHED_OPERATION", operation)
+        .env("RENDER_BRIDGE_PIPELINE_DATA_DIR", data_dir)
         .status()
         .map_err(|_| "Could not run the attached MCP controller.")?;
     match status.code() {

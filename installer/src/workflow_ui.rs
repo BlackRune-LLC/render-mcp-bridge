@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ComboBox, RichText, ScrollArea, TextEdit, Ui};
 use serde_json::Value;
@@ -9,6 +10,8 @@ use crate::pipeline::{self, SavedPipeline};
 use crate::setup::Installed;
 use crate::workflow_editor::{self, InputKind, InputSchema, WorkflowEditor, WorkflowSchema};
 use crate::{CAUTION, GREEN, activity, caption, card, code_label, primary, secondary, status};
+
+const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 enum Reply {
     Inventory(Result<WorkflowSchema, String>),
@@ -55,6 +58,7 @@ pub struct WorkflowPanel {
     path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     pipelines: Vec<SavedPipeline>,
+    next_catalog_refresh: Option<Instant>,
     catalog_error: Option<String>,
     saved: Option<(String, [u8; 32])>,
     checkpoint: WorkflowEditor,
@@ -108,6 +112,16 @@ impl WorkflowPanel {
             if self.saved.take().is_some() {
                 self.notice = Some("Use Add pipeline to save a copy in the current installation.");
             }
+        }
+        if self
+            .next_catalog_refresh
+            .is_some_and(|next| Instant::now() >= next)
+        {
+            self.reload_catalog();
+        }
+        if let Some(next_refresh) = self.next_catalog_refresh {
+            ui.ctx()
+                .request_repaint_after(next_refresh.saturating_duration_since(Instant::now()));
         }
         if self
             .model
@@ -236,7 +250,9 @@ impl WorkflowPanel {
     fn reload_catalog(&mut self) {
         self.pipelines.clear();
         self.catalog_error = None;
+        self.next_catalog_refresh = None;
         if let Some(data) = &self.data_dir {
+            self.next_catalog_refresh = Some(Instant::now() + CATALOG_REFRESH_INTERVAL);
             match pipeline::catalog(data) {
                 Ok(pipelines) => self.pipelines = pipelines,
                 Err(error) => self.catalog_error = Some(error),
@@ -324,16 +340,19 @@ impl WorkflowPanel {
                 ui.horizontal_wrapped(|ui| {
                     if secondary(ui, "Copy pipeline setup prompt", true).clicked() {
                         ui.ctx().copy_text(format!(
-                            "Help me prepare a pipeline to import into Render Bridge.\n\n\
+                            "Help me add a pipeline to Render Bridge.\n\n\
                              Read {guide}. Ask what the pipeline should do if I have not specified it. \
                              Use a workflow I provide as a starting point when available.\n\n\
                              Prepare ComfyUI API-format JSON as an object keyed by node ID. Each node \
                              needs class_type and inputs. Preserve valid graph connections and include \
                              the appropriate output node. Use read-only checks for model and node \
                              availability when possible. Tell me which dependencies are missing or unverified.\n\n\
-                             Save the graph as a new .json file I can open, or provide the JSON if you \
-                             cannot write to a location I can access. Tell me to open Pipelines > Your pipelines \
-                             > Add pipeline, select Import API JSON, name the pipeline, and select Add to library. \
+                             If the connected Render Bridge exposes add_pipeline, call it with a new name and \
+                             the workflow object. Tell me where it appears under Your pipelines and summarize \
+                             any missing or unverified nodes and models from the result. If the tool is unavailable, \
+                             save the graph as a new .json file I can open or provide its JSON. Tell me to open \
+                             Pipelines > Your pipelines > Add pipeline, select Import API JSON, name the pipeline, \
+                             and select Add to library. \
                              Ask before installing dependencies or replacing files, and ask me before queuing a render."
                         ));
                         add.prompt_copied = true;
@@ -1165,9 +1184,37 @@ mod tests {
             .expect("the copy button should emit a prompt through egui");
         assert!(prompt.contains("docs/pipelines.md#edit-a-comfyui-workflow"));
         assert!(prompt.contains("class_type"));
+        assert!(prompt.contains("add_pipeline"));
+        assert!(prompt.contains("missing or unverified nodes and models"));
         assert!(prompt.contains("Import API JSON"));
         assert!(prompt.contains("Add to library"));
         assert!(prompt.contains("ask me before queuing a render"));
+    }
+
+    #[test]
+    fn open_pipeline_panel_discovers_pipelines_saved_externally() {
+        let data = tempfile::tempdir().unwrap();
+        let mut panel = WorkflowPanel::default();
+        let ctx = egui::Context::default();
+        crate::theme::configure_for(&ctx, egui::ThemePreference::Dark, None);
+        let frame = |panel: &mut WorkflowPanel| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| panel.show(ui, None, Some(data.path()), None));
+            });
+        };
+
+        frame(&mut panel);
+        assert!(panel.pipelines.is_empty());
+
+        let mut graph = WorkflowEditor::default();
+        graph
+            .import_json(br#"{"1": {"class_type": "SaveImage", "inputs": {}}}"#)
+            .unwrap();
+        pipeline::save_new(data.path(), "Agent pipeline", &graph).unwrap();
+        panel.next_catalog_refresh = Some(Instant::now());
+        frame(&mut panel);
+        assert_eq!(panel.pipelines[0].name, "Agent pipeline");
     }
 
     #[test]

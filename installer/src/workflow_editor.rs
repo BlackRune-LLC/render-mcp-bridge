@@ -46,6 +46,14 @@ pub struct DependencyDiff {
     pub removed: Vec<String>,
 }
 
+#[derive(Serialize)]
+pub struct DependencyReport {
+    pub missing_nodes: Vec<String>,
+    pub missing_models: Vec<String>,
+    pub unverified_nodes: Vec<String>,
+    pub unverified_models: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub enum InputKind {
     Integer,
@@ -191,6 +199,47 @@ impl WorkflowEditor {
 
     pub fn dependency_changes(&self) -> DependencyDiff {
         difference(&self.original_models, &models(&self.nodes))
+    }
+
+    pub fn dependency_report(&self, schema: &WorkflowSchema) -> DependencyReport {
+        let mut missing_nodes = BTreeSet::new();
+        let mut missing_models = BTreeSet::new();
+        let mut unverified_nodes = BTreeSet::new();
+        let mut unverified_models = BTreeSet::new();
+        for node in self.nodes.values() {
+            let spec = schema.nodes.get(&node.class_type);
+            if spec.is_none() {
+                if schema.missing.contains(&node.class_type) {
+                    missing_nodes.insert(node.class_type.clone());
+                } else {
+                    unverified_nodes.insert(node.class_type.clone());
+                }
+            }
+            for (field, value) in &node.inputs {
+                let Some(model) = model_input(field, value) else {
+                    continue;
+                };
+                match spec.and_then(|spec| spec.inputs.get(field)) {
+                    Some(input) if matches!(input.kind, InputKind::Choice(_)) => {
+                        if !literal_matches(value, input) {
+                            missing_models.insert(model.to_owned());
+                        }
+                    }
+                    _ => {
+                        unverified_models.insert(model.to_owned());
+                    }
+                }
+            }
+        }
+        DependencyReport {
+            missing_nodes: missing_nodes.into_iter().collect(),
+            unverified_nodes: unverified_nodes.into_iter().collect(),
+            unverified_models: unverified_models
+                .difference(&missing_models)
+                .cloned()
+                .collect(),
+            missing_models: missing_models.into_iter().collect(),
+        }
     }
 
     pub fn can_undo(&self) -> bool {
@@ -879,6 +928,28 @@ mod tests {
             ),
             ("GET /object_info/Sink HTTP/1.1", json!({"Sink": sink})),
         ]
+    }
+
+    #[test]
+    fn dependency_report_distinguishes_absent_and_unverified_dependencies() {
+        let mut graph = WorkflowEditor::default();
+        graph
+            .import_json(
+                br#"{
+                    "10":{"class_type":"Loader","inputs":{"weight":"absent.safetensors"}},
+                    "20":{"class_type":"MissingClass","inputs":{"model_name":"unknown.safetensors"}},
+                    "30":{"class_type":"UnavailableClass","inputs":{}},
+                    "40":{"class_type":"Loader","inputs":{"weight":"a.safetensors"}}
+                }"#,
+            )
+            .unwrap();
+        let mut inventory = schema();
+        inventory.missing.insert("MissingClass".into());
+        let report = graph.dependency_report(&inventory);
+        assert_eq!(report.missing_nodes, ["MissingClass"]);
+        assert_eq!(report.unverified_nodes, ["UnavailableClass"]);
+        assert_eq!(report.missing_models, ["absent.safetensors"]);
+        assert_eq!(report.unverified_models, ["unknown.safetensors"]);
     }
 
     #[test]

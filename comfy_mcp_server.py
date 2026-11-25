@@ -2956,6 +2956,79 @@ async def run_workflow(workflow: dict[str, Any], timeout_s: int = DEFAULT_TIMEOU
     return await build_result({"prompt_id": prompt_id, "seconds": round(elapsed, 1)}, images, preview)
 
 
+async def add_pipeline(name: str, workflow: dict[str, Any]) -> dict[str, Any]:
+    """Save a ComfyUI API-format graph to Your pipelines in Render Bridge.
+
+    Use a new pipeline name. Returns the saved name, missing models and nodes,
+    and dependencies that could not be verified on the selected backend.
+    Use run_workflow separately to render the graph.
+    """
+    data_dir = Path(os.environ.get("RENDER_BRIDGE_PIPELINE_DATA_DIR", ""))
+    monitor = data_dir / "monitor" / "RenderBridgeMonitor.exe"
+    if not data_dir.is_absolute() or not monitor.is_file():
+        raise ToolError("The Render Bridge desktop pipeline library is unavailable on this host.")
+
+    try:
+        payload = json.dumps(
+            {"name": name, "workflow": workflow, "comfy_url": COMFY_URL},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (ValueError, RecursionError) as exc:
+        raise ToolError("Supply a valid ComfyUI API-format JSON graph.") from exc
+    if len(payload) > 2 * 1024 * 1024 + 1024:
+        raise ToolError("The pipeline graph exceeds the 2 MiB import limit.")
+
+    if _pipeline_import_lock.locked():
+        raise ToolError("Render Bridge is checking another pipeline. Try again in a moment.")
+    async with _pipeline_import_lock:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                str(monitor),
+                "--add-pipeline",
+                str(data_dir),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except OSError as exc:
+            raise ToolError("The Render Bridge desktop importer could not start.") from exc
+
+        communication = asyncio.create_task(process.communicate(payload))
+        try:
+            stdout, _ = await asyncio.wait_for(asyncio.shield(communication), timeout=45)
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await communication
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise ToolError("The pipeline import timed out. Check Your pipelines before retrying.") from exc
+
+    try:
+        result = json.loads(stdout)
+    except (ValueError, RecursionError) as exc:
+        raise ToolError("The Render Bridge desktop importer returned an invalid response.") from exc
+    if not isinstance(result, dict):
+        raise ToolError("The Render Bridge desktop importer returned an invalid response.")
+    if process.returncode != 0:
+        raise ToolError(result.get("error") or "The Render Bridge desktop importer refused the pipeline.")
+    if not isinstance(result.get("id"), str) or not isinstance(result.get("name"), str):
+        raise ToolError("The Render Bridge desktop importer did not confirm the saved pipeline.")
+    return result
+
+
+_pipeline_import_lock = asyncio.Lock()
+if os.environ.get("RENDER_BRIDGE_PIPELINE_DATA_DIR"):
+    mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
+    )(add_pipeline)
+
+
 # ---------------------------------------------------------------------------
 # Asset finishing tools (CPU only; no GPU / ComfyUI queue involved)
 # ---------------------------------------------------------------------------

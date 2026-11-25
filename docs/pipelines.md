@@ -82,6 +82,10 @@ Open **Nodes** to search the selected build by name, ID, or category. Filter by 
 
 In Render Bridge, open **Pipelines → Your pipelines → Add pipeline**. Choose **Copy pipeline setup prompt** and paste it into your agent. Describe what you want to make and share an existing workflow if you have one. The agent can also follow this section directly.
 
+If the connected MCP server exposes `add_pipeline`, pass the new pipeline's `name` and ComfyUI API-format graph as `workflow`. The tool saves it to **Your pipelines** and returns its ID, missing models and nodes, and dependencies it could not verify. Use a unique name. A saved draft can have missing dependencies. To render it, submit the graph with `run_workflow` when you are ready.
+
+Use these steps when the connected server does not expose `add_pipeline`.
+
 1. Ask the user for the intended output and any workflow they want to build on. Prepare a ComfyUI API-format graph as a JSON object keyed by node ID. Each node has a `class_type` and an `inputs` object. A link such as `["12", 0]` uses output 0 from node 12. Include the output node that saves the intended result.
 2. Use read-only checks where available. Call Render Bridge's `list_models` tool and inspect the [ComfyUI node registry](https://docs.comfy.org/development/comfyui-server/comms_routes) on the target build if you have access to it. Report any missing or unverified model files and node packs. Get approval before installing dependencies or replacing files.
 3. Save a new `.json` file somewhere the user can open it, or give them the JSON to save. Have the user return to **Add pipeline**, choose **Import API JSON**, name the pipeline, and select **Add to library**. In the saved pipeline, **Check dependencies** checks the selected build again.

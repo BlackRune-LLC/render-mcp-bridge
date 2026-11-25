@@ -21,6 +21,7 @@ mod models;
 mod node_packages;
 mod node_view;
 mod pipeline;
+mod pipeline_command;
 mod pipeline_ui;
 #[cfg(windows)]
 mod python_install;
@@ -5445,10 +5446,18 @@ mod launch_tests {
 
 fn main() -> std::process::ExitCode {
     diagnostics::install_panic_hook();
+    let mut args = std::env::args_os().skip(1);
+    let command = args.next();
+    if command.as_deref() == Some(std::ffi::OsStr::new("--add-pipeline")) {
+        let data_dir = args
+            .next()
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && args.next().is_none());
+        return pipeline_command::run(data_dir.as_deref());
+    }
     #[cfg(windows)]
     {
-        let mut args = std::env::args_os().skip(1);
-        if args.next().as_deref() == Some(std::ffi::OsStr::new("--start-attached-if-enabled")) {
+        if command.as_deref() == Some(std::ffi::OsStr::new("--start-attached-if-enabled")) {
             let installed = args
                 .next()
                 .map(PathBuf::from)
