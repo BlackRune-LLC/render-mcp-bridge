@@ -15,7 +15,7 @@ if ($expected -ne '8e3b63792f2e2cd033e0db7211a11bbf755e953ac723767f8e9f90a7a6e2c
 ## Fresh install
 
 - On a clean Windows x64 profile, run Setup and follow its Python and ComfyUI instructions. Select the intended local ComfyUI instance and installation folder.
-- Select **Start & Verify**, connect an agent, and choose **Finish and keep running**. Reopen Render Bridge from the tray and have the agent make a first render. Check that the signed PNG opens.
+- Select **Start & Verify**, connect an agent, and use **First render** to have the agent generate a PNG. Open the agent's download link and paste it into **Verify test PNG** in Setup. Select **Finish and keep running**, then reopen Render Bridge from the tray.
 
 ## Upgrade from v0.1.0
 
