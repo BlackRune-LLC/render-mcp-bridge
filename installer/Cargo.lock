@@ -2424,15 +2424,22 @@ dependencies = [
 
 [[package]]
 name = "render-bridge-setup"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "ab_glyph",
+ "base64",
  "eframe",
+ "image",
+ "libc",
+ "raw-window-handle",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
  "ureq",
  "url",
+ "windows",
 ]
 
 [[package]]

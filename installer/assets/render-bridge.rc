@@ -1,0 +1,32 @@
+#include <winver.h>
+
+101 ICON "render-bridge.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,2,0,0
+PRODUCTVERSION 0,2,0,0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "BlackRune LLC\0"
+            VALUE "FileDescription", "Render Bridge Setup\0"
+            VALUE "FileVersion", "0.2.0\0"
+            VALUE "InternalName", "render-bridge-setup\0"
+            VALUE "LegalCopyright", "Copyright (c) 2026 BlackRune LLC\0"
+            VALUE "OriginalFilename", "RenderBridgeSetup.exe\0"
+            VALUE "ProductName", "Render Bridge\0"
+            VALUE "ProductVersion", "0.2.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

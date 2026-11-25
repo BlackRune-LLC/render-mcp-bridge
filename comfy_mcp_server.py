@@ -31,22 +31,28 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
+from setup_render_bridge import (
+    DEFAULT_URL, asset_folders_proof, atomic_text, backend_url, default_data_dir, enable_crash_reports,
+)
+
+if __name__ == "__main__":
+    enable_crash_reports("server")
+
 import httpx
 import uvicorn
 from PIL import Image as PILImage
 from PIL import ImageChops, ImageFilter, ImageOps
+from mcp.server._otel import OpenTelemetryMiddleware
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, ImageContent, TextContent, ToolAnnotations
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
-if os.name == "nt":
-    USER_DATA_ROOT = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-else:
-    USER_DATA_ROOT = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-
-DATA_DIR = Path(os.environ.get("COMFY_MCP_DATA_DIR", USER_DATA_ROOT / "comfy-mcp")).expanduser()
-COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
+DATA_DIR = Path(os.environ.get("COMFY_MCP_DATA_DIR", default_data_dir())).expanduser()
+try:
+    COMFY_URL = backend_url(os.environ.get("COMFY_URL", DEFAULT_URL))
+except ValueError as exc:
+    raise SystemExit(f"Invalid COMFY_URL. {exc}") from None
 MCP_HOSTS = [host.strip() for host in os.environ.get("MCP_HOST", "127.0.0.1").split(",") if host.strip()]
 MCP_PORT = int(os.environ.get("MCP_PORT", "8189"))
 PUBLIC_URLS = {
@@ -63,7 +69,7 @@ LINK_TTL_S = float(os.environ.get("DOWNLOAD_LINK_DAYS", "1")) * 86400
 TOKEN_FILE = Path(os.environ.get("MCP_TOKEN_FILE", DATA_DIR / "token.txt")).expanduser()
 DEFAULT_TIMEOUT_S = int(float(os.environ.get("JOB_TIMEOUT_MIN", "15")) * 60)
 QUEUE_WAIT_MAX_S = float(os.environ.get("QUEUE_WAIT_MAX_MIN", "240")) * 60
-IDLE_UNLOAD_S = float(os.environ.get("IDLE_UNLOAD_MIN", "0")) * 60
+IDLE_UNLOAD_S = float(os.environ.get("IDLE_UNLOAD_MIN", "10")) * 60
 COMFY_BUSY_WAIT_S = float(os.environ.get("COMFY_BUSY_WAIT_S", "60"))
 PAUSE_FLAG = Path(os.environ.get("PAUSE_FLAG", DATA_DIR / "gaming_mode.flag")).expanduser()
 PAUSED_MSG = "Gaming mode is on. ComfyUI MCP is not accepting new GPU work. Retry when gaming mode is off."
@@ -81,6 +87,8 @@ def is_loopback(host: str) -> bool:
 
 
 def validate_server_settings() -> None:
+    if not math.isfinite(IDLE_UNLOAD_S) or IDLE_UNLOAD_S < 0:
+        raise SystemExit("Set IDLE_UNLOAD_MIN to a finite non-negative number of minutes.")
     if not MCP_HOSTS or not 1 <= MCP_PORT <= 65535:
         raise SystemExit("Set MCP_HOST and MCP_PORT to valid listen addresses and a port.")
     if any(not is_loopback(host) for host in MCP_HOSTS):
@@ -217,7 +225,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "lora": None,
     },
     "cinematic": {
-        "description": "HiDream-O1 (MIT, 8B). Cinematic / Unreal-Engine-style renders, environments, hero shots. 40 steps, up to 2048px.",
+        "description": "HiDream-O1 (MIT, 8B). Cinematic renders, environments, and hero shots. 40 steps, up to 2048px.",
         "builder": "hidream",
         "family": "hidream_o1",
         "ckpt": "hidream_o1_image_bf16.safetensors",
@@ -389,7 +397,10 @@ EDIT_MODELS = {
 }
 THREE_D_WORKFLOW = os.environ.get("COMFY_3D_WORKFLOW")
 COMFY_ROOT = Path(os.environ.get("COMFY_ROOT", Path.home() / "ComfyUI")).expanduser()
-COMFY_DIRS = {"output": COMFY_ROOT / "output", "input": COMFY_ROOT / "input"}
+COMFY_DIRS = {
+    kind: Path(os.environ.get(f"COMFY_{kind.upper()}_DIR", COMFY_ROOT / kind)).expanduser()
+    for kind in ("input", "output")
+}
 GLTF_TRANSFORM_CLI = os.environ.get("GLTF_TRANSFORM_CLI")
 THREE_D_TIMEOUT_S = 2400
 BG_REMOVAL_MODEL = "birefnet.safetensors"  # BiRefNet, MIT licence
@@ -399,7 +410,11 @@ TRANSPARENT_HINT = ", isolated on a plain solid white background, centered, full
 # ---------------------------------------------------------------------------
 # ComfyUI client helpers
 # ---------------------------------------------------------------------------
-_http = httpx.AsyncClient(base_url=COMFY_URL, timeout=httpx.Timeout(60.0, connect=5.0))
+_http = httpx.AsyncClient(
+    base_url=COMFY_URL,
+    timeout=httpx.Timeout(60.0, connect=5.0),
+    trust_env=False,
+)
 _model_cache: dict[str, Any] = {"t": 0.0, "lists": {}}
 
 # ---------------------------------------------------------------------------
@@ -414,10 +429,14 @@ _state: dict[str, Any] = {
     "last_unload_reason": None,
 }
 
-# Background jobs (start_job / get_job). Kept in memory; lost if this server restarts.
+# Background job tasks and full results live in memory. A private journal retains status and file references.
 _jobs: dict[str, dict[str, Any]] = {}
 _current_job: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("current_job", default=None)
 JOB_RETENTION_S = 24 * 3600
+JOB_HISTORY_LIMIT = 256
+JOB_OUTPUT_LIMIT = 512
+JOB_ACTIVE = {"queued", "running", "recovering", "cancel_requested", "cancel_unknown"}
+JOB_PROMPT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 # The project (name, context version) the current tool call works for; set by use_project().
 _call_project: contextvars.ContextVar[tuple[str, int] | None] = contextvars.ContextVar("call_project", default=None)
 
@@ -487,9 +506,13 @@ def mark_activity() -> None:
     _state["models_loaded"] = True
 
 
+async def _request_model_unload() -> None:
+    response = await _http.post("/free", json={"unload_models": True, "free_memory": True}, timeout=10)
+    response.raise_for_status()
+
+
 async def unload(reason: str) -> dict[str, Any]:
-    r = await _http.post("/free", json={"unload_models": True, "free_memory": True}, timeout=10)
-    r.raise_for_status()
+    await _request_model_unload()
     _state.update(models_loaded=False, last_unload=time.time(), last_unload_reason=reason)
     log(f"Unloaded models ({reason})")
     await asyncio.sleep(3)  # ComfyUI applies the flag on its worker loop
@@ -505,30 +528,104 @@ async def gpu_info() -> dict[str, Any]:
         return {}
 
 
+async def _queue_busy() -> bool | None:
+    response = await _http.get("/queue", timeout=5)
+    response.raise_for_status()
+    queue = response.json()
+    if not isinstance(queue, dict) or not all(
+        isinstance(queue.get(key), list) for key in ("queue_running", "queue_pending")
+    ):
+        return None
+    return bool(queue["queue_running"] or queue["queue_pending"])
+
+
+def _gaming_activation() -> bytes | None:
+    try:
+        flag = PAUSE_FLAG.stat()
+    except FileNotFoundError:
+        return None
+    return f"{flag.st_dev}:{flag.st_ino}:{flag.st_ctime_ns}:{flag.st_mtime_ns}".encode("ascii")
+
+
+async def _gaming_unload(activation: bytes) -> str:
+    # The CLI and watcher share one receipt. Lock its first byte while checking
+    # the queue and sending /free, then store the accepted activation after it.
+    receipt_path = PAUSE_FLAG.with_name(f"{PAUSE_FLAG.name}.unload")
+    with os.fdopen(os.open(receipt_path, os.O_RDWR | os.O_CREAT, 0o600), "r+b") as receipt:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(receipt.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(receipt.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "checking"
+
+        if _gaming_activation() != activation:
+            return "changed"
+        receipt.seek(1)
+        if receipt.read(len(activation) + 1) == activation:
+            accepted_at = os.fstat(receipt.fileno()).st_mtime
+        else:
+            try:
+                busy = await _queue_busy()
+                if _gaming_activation() != activation:
+                    return "changed"
+                if busy is None:
+                    return "unknown"
+                if busy:
+                    return "busy"
+                await _request_model_unload()
+            except (httpx.HTTPError, ValueError):
+                return "unknown"
+            receipt.seek(1)
+            receipt.write(activation)
+            receipt.truncate()
+            accepted_at = time.time()
+            log("ComfyUI accepted the model unload request (gaming mode)")
+        if _gaming_activation() == activation and accepted_at > (_state["last_unload"] or 0):
+            _state.update(models_loaded=False, last_unload=accepted_at, last_unload_reason="gaming mode")
+        return "accepted"
+
+
+async def idle_check() -> None:
+    if (activation := _gaming_activation()) is not None:
+        await _gaming_unload(activation)
+        return
+    if not await comfy_up():
+        _state["models_loaded"] = False
+        return
+    busy = await _queue_busy()
+    if busy is None:
+        return
+    if busy:
+        mark_activity()
+        return
+    response = await _http.get("/history", params={"max_items": 1}, timeout=5)
+    response.raise_for_status()
+    history = response.json()
+    if not isinstance(history, dict):
+        return
+    last_id = next(iter(history), None)
+    if not _state["history_seen"] or last_id != _state["last_history_id"]:
+        _state.update(history_seen=True, last_history_id=last_id)
+        mark_activity()
+        return
+    idle = time.time() - _state["last_activity"]
+    if IDLE_UNLOAD_S > 0 and _state["models_loaded"] and idle >= IDLE_UNLOAD_S and not PAUSE_FLAG.exists():
+        await unload(f"idle {idle / 60:.0f} min")
+
+
 async def idle_watcher() -> None:
     """Track backend activity and optionally unload models when the queue is idle."""
     while True:
         await asyncio.sleep(15)
         try:
-            if PAUSE_FLAG.exists():
-                continue
-            if not await comfy_up():
-                _state["models_loaded"] = False
-                continue
-            q = (await _http.get("/queue", timeout=5)).json()
-            busy = bool(q.get("queue_running")) or bool(q.get("queue_pending"))
-            h = (await _http.get("/history", params={"max_items": 1}, timeout=5)).json()
-            last_id = next(iter(h), None) if isinstance(h, dict) else None
-            if not _state["history_seen"]:
-                _state.update(history_seen=True, last_history_id=last_id)
-            elif last_id != _state["last_history_id"]:
-                _state["last_history_id"] = last_id
-                mark_activity()
-            if busy:
-                mark_activity()
-            idle = time.time() - _state["last_activity"]
-            if IDLE_UNLOAD_S > 0 and _state["models_loaded"] and not busy and idle >= IDLE_UNLOAD_S:
-                await unload(f"idle {idle / 60:.0f} min")
+            _prune_jobs()
+            await idle_check()
         except Exception as e:  # noqa: BLE001
             log(f"idle watcher: {e!r}")
 
@@ -957,17 +1054,31 @@ async def _queue_and_wait(graph: dict[str, Any], timeout_s: int) -> tuple[str, d
     if PAUSE_FLAG.exists():
         raise ToolError(PAUSED_MSG)
     t0 = time.time()
+    job = _current_job.get()
+    if job is not None:
+        if job["status"] != "running":
+            raise asyncio.CancelledError
+        job["submission_pending"] = True
+        if not _remember_job(job):
+            job["submission_pending"] = False
+            raise ToolError("Could not record the background job before submitting to ComfyUI.")
     try:
         r = await _http.post("/prompt", json={"prompt": graph, "client_id": f"mcp-{uuid.uuid4().hex[:8]}"})
     except httpx.HTTPError as e:
         raise _comfy_lost(e) from None
     if r.status_code != 200:
+        if job is not None and 400 <= r.status_code < 500:
+            job["submission_pending"] = False
+            _remember_job(job)
         raise ToolError(f"ComfyUI rejected the workflow ({r.status_code}): {r.text[:2000]}")
     prompt_id = r.json()["prompt_id"]
+    if not isinstance(prompt_id, str) or not JOB_PROMPT_ID.fullmatch(prompt_id):
+        raise ToolError("ComfyUI did not return a usable prompt ID. Its submission may still be active.")
     _last_prompt.set(prompt_id)
-    job = _current_job.get()
     if job is not None:
         job["prompt_ids"].append(prompt_id)
+        job["submission_pending"] = False
+        _remember_job(job)
     started: float | None = None  # when ComfyUI began running it: the run timeout counts from here
     next_check, missing = 0.0, 0
     try:
@@ -985,10 +1096,13 @@ async def _queue_and_wait(graph: dict[str, Any], timeout_s: int) -> tuple[str, d
             if started is not None and now - started > timeout_s:
                 raise ToolError(f"Timed out after {timeout_s}s of running prompt {prompt_id} (it may still be running).")
             if started is None and now - t0 > QUEUE_WAIT_MAX_S:
-                await _dequeue(prompt_id)
+                removed = await _dequeue(prompt_id)
+                queue = await _upstream_queue() if removed else None
+                outcome = ("The prompt is no longer in the queue."
+                           if queue is not None and prompt_id not in queue
+                           else "Its removal could not be confirmed. It may still be queued or running.")
                 raise ToolError(f"Gave up after {QUEUE_WAIT_MAX_S / 60:g} min waiting in ComfyUI's queue behind other "
-                                "jobs, and took this request out of the queue. Nothing was generated; server_status shows "
-                                "the queue, so try again when it is shorter.")
+                                f"jobs. {outcome}")
             try:
                 h = await _http.get(f"/history/{prompt_id}")
             except httpx.HTTPError as e:
@@ -1007,7 +1121,7 @@ async def _queue_and_wait(graph: dict[str, Any], timeout_s: int) -> tuple[str, d
                     return prompt_id, entry, time.time() - (started or t0)
             await asyncio.sleep(0.5)
     except asyncio.CancelledError:
-        if started is None:  # don't leave work for the GPU that nobody will collect
+        if started is None and job is None:
             await _dequeue(prompt_id)
         raise
 
@@ -1025,11 +1139,12 @@ async def _prompt_state(prompt_id: str) -> str:
         return "unknown"
 
 
-async def _dequeue(prompt_id: str) -> None:
+async def _dequeue(*prompt_ids: str) -> bool:
     try:
-        await _http.post("/queue", json={"delete": [prompt_id]}, timeout=5)
-    except Exception as e:  # noqa: BLE001
-        log(f"could not remove prompt {prompt_id} from the queue: {e!r}")
+        response = await _http.post("/queue", json={"delete": list(prompt_ids)}, timeout=5)
+        return response.is_success
+    except httpx.HTTPError:
+        return False
 
 
 def comfy_view_url(img: dict[str, Any]) -> str:
@@ -1069,6 +1184,10 @@ async def collect_images(entry: dict[str, Any], primary_node: str | None = None)
             })
     out.sort(key=lambda i: i["role"] != "primary")
     return out
+
+
+def _saved_as(file: dict[str, Any], extension: str) -> bool:
+    return file["type"] == "output" and file["filename"].lower().endswith(f".{extension}")
 
 
 async def preview_content(img: dict[str, Any], max_side: int = 512) -> ImageContent | None:
@@ -1159,9 +1278,11 @@ def log_asset(tool: str, summary: dict[str, Any], files: list[dict[str, Any]]) -
     Returns (project, context version)."""
     project, version = _log_project()
     summary["project"], summary["project_context_version"] = project, version
+    job = _current_job.get()
+    if job is not None:
+        _remember_job_outputs(job, files)
     try:
         ensure_record_dir()
-        job = _current_job.get()
         skip = {"images", "files", "download_hint", "godot_hint", "preview", "files_in_zip", "project",
                 "project_context_version"}
         rec = {
@@ -1182,10 +1303,16 @@ def log_asset(tool: str, summary: dict[str, Any], files: list[dict[str, Any]]) -
 
 
 async def build_result(summary: dict[str, Any], images: list[dict[str, Any]], preview: bool, max_previews: int = 4,
-                       tool: str = "") -> CallToolResult:
+                       tool: str = "", *, expected_extension: str = "") -> CallToolResult:
     import sys
+    missing_output = expected_extension and not any(
+        img["role"] == "primary" and _saved_as(img, expected_extension) for img in images
+    )
     if images:
-        log_asset(tool or sys._getframe(1).f_code.co_name, summary, images)
+        record = {**summary, "incomplete": True} if missing_output else summary
+        log_asset(tool or sys._getframe(1).f_code.co_name, record, images)
+    if missing_output:
+        raise ToolError(f"ComfyUI finished without a saved {expected_extension.upper()} from the main save node.")
     content: list[Any] = []
     previews = []
     if preview:
@@ -1210,48 +1337,22 @@ mcp = MCPServer(
     name="comfyui",
     title="Render Bridge",
     instructions=(
-        "Provides tools for a locally managed ComfyUI instance. "
-        "Use generate_image for game art; set transparent=true for sprites/icons/UI elements (returns RGBA PNG). "
-        "Results contain full-size download URLs; fetch them with curl to save files locally. "
-        "Presets: z_image_turbo (fast default), qwen_image (best quality/text), qwen_image_fast (4-step Qwen), "
-        "anime (anime/illustration concept art), cinematic (Unreal-style cinematic renders), flux_dev "
-        "(general/photoreal/painterly), sd35 (wide style range), anima_turbo / anima_aesthetic (Anima: anime, "
-        "illustration and painterly art, fast / best-looking), juggernaut_xl (Juggernaut XI SDXL workhorse), "
-        "flux3_klein / flux3_klein_base (FLUX.3 Image Klein, the newest BFL model: fast distilled / slower base). "
-        "Switch models with generate_image(preset=...), or per game with set_project_context(default_preset=...). "
-        "Style LoRAs (painterly, watercolor, gouache, oil, hand-painted textures) go in generate_image(loras=[{name, "
-        "strength}]); each works only with presets of its family (sdxl: juggernaut_xl, flux1: flux_dev, anima: "
-        "anima_*), and list_models lists them by family with their trigger words. "
-        "edit_image edits an existing image or combines it with up to 2 references (same character in new poses, "
-        "recolours, turnarounds). "
-        "repaint_frames repaints a whole action's pose-guide frames (a rig's exported frames) in one call, with the "
-        "same instruction, references and seed for every frame: frames in, finished frames out, in order. "
-        "animate_from_clip repaints a character along a short driving clip (a rig's exported action, as a video or as "
-        "frames): the character's image and the clip in, one frame per clip frame and an mp4 out (Wan-Animate-2). "
-        "animate_loop makes a looping animation from ONE image: a short video that starts and ends on it, cut into "
-        "evenly spaced frames, with an mp4 (Wan 2.2 image-to-video; the model invents the motion from the prompt). "
-        "edit_region changes ONE AREA of an image (a rectangle or a mask) and keeps every other pixel exactly, at any "
-        "image size: use it for local fixes to a large or approved image instead of building masked workflows by hand. "
-        "image_to_3d turns an image (ideally a transparent generate_image result) into a textured GLB model. "
-        "For slow work (image_to_3d, quality renders, batches) use start_job + get_job so calls don't time out. "
-        "Finishing tools: optimize_glb (game-ready/mobile GLB), pack_spritesheet (sheet PNG + Godot SpriteFrames .tres), "
-        "export_icons (iOS/Android/Godot/web/Windows icon sets). "
-        "Model weights are installed separately and subject to their own licenses. "
-        "Call set_project_context at the start of work on a game (art direction, theme, lore, and optionally a style "
-        "lock: style_prompt, style_negative, default_preset, style_anchor); every asset is then logged with that "
-        "context, its prompts, inputs and edits (asset_history) as an authorship record. Pass project=<game> on every "
-        "asset call: it applies that game's style lock and logs under it (the server-wide active project is only a "
-        "fallback). edit_image(match_style=true) uses the game's style anchor image. When the owner says which "
-        "results they pick or reject, record it with approve_asset (their words in notes); never on your own judgment. "
-        "ComfyUI loads models as needed. Call load_models to prepare a preset before a batch, unload_models to free "
-        "the GPU immediately, server_status to see what is loaded. "
-        "All sessions share one GPU queue, first come first served; time spent waiting in it doesn't count toward a "
-        "job's timeout. When server_status shows a long queue, use start_job + get_job (which shows your place in line). "
-        "To send a file to the server, call "
-        "upload_link and run the curl it gives you; then pass the returned filename/subfolder with source=\"input\". "
-        "When gaming mode is on, wait for the operator to turn it off before submitting GPU work."
+        "Render Bridge uses a local ComfyUI instance. Call server_status for availability and queue state, "
+        "and list_models for available presets, compatible LoRAs, and installed files. "
+        "Check with the user before adding weights or nodes. Wait when Gaming Mode is on. "
+        "Use start_job and get_job for long work. Download outputs using their signed links. "
+        "Use upload_link for inputs, then pass the returned filename and subfolder with source=\"input\". "
+        "Pass project on asset calls to apply that project's style and keep local provenance. "
+        "Use approve_asset only when the user chooses which results to approve or reject."
     ),
 )
+
+# MCP 2.3 installs tracing middleware by default. Keep Render Bridge out of
+# any OpenTelemetry exporter configured in the host Python environment.
+mcp._lowlevel_server.middleware[:] = [
+    middleware for middleware in mcp._lowlevel_server.middleware
+    if not isinstance(middleware, OpenTelemetryMiddleware)
+]
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True), structured_output=False)
@@ -1277,6 +1378,11 @@ async def list_models() -> str:
             item["presets"] = [n for n, q in PRESETS.items() if q["family"] == fam]
     stats = (await _http.get("/system_stats")).json()
     dev = stats.get("devices", [{}])[0]
+    workflow_error = None
+    try:
+        await asyncio.to_thread(load_3d_workflow)
+    except ToolError as error:
+        workflow_error = str(error)
     return json.dumps({
         "presets": presets,
         "loras": loras,
@@ -1287,7 +1393,8 @@ async def list_models() -> str:
                 "vram_free_gb": round(dev.get("vram_free", 0) / 2**30, 1)},
         "comfyui_version": stats.get("system", {}).get("comfyui_version"),
         "download_bases": PUBLIC_URLS,
-        "image_to_3d_configured": bool(THREE_D_WORKFLOW),
+        "image_to_3d_configured": workflow_error is None,
+        "image_to_3d_error": workflow_error,
     }, indent=2)
 
 
@@ -1317,7 +1424,7 @@ async def generate_image(
             without one, be specific about style (e.g. "2D game sprite, hand-painted, top-down view").
         preset: z_image_turbo (fast) | qwen_image (best quality & in-image text, ~50 steps) |
             qwen_image_fast (4-step Qwen) | anime (NetaYume Lumina: anime/illustration concept art) |
-            cinematic (HiDream-O1: Unreal-Engine-style cinematic renders, environments, hero shots) |
+            cinematic (HiDream-O1: cinematic renders, environments, and hero shots) |
             flux_dev (FLUX.1-dev: general/photoreal/painterly; takes FLUX.1 LoRAs) |
             sd35 (SD 3.5 Large: wide style range) |
             anima_turbo (Anima, fast: anime/illustration/painterly, not realism) |
@@ -1405,7 +1512,7 @@ async def generate_image(
         summary["loras"] = [{"name": lo["name"], "file": lo["file"].replace("\\", "/"), "strength": lo["strength"],
                              "sha256": sha} for lo, sha in zip(p["user_loras"], hashes)]
         summary["lora_triggers_added"] = triggers
-    return await build_result(summary, images, preview)
+    return await build_result(summary, images, preview, expected_extension="png")
 
 
 async def input_image_ref(filename: str, subfolder: str, source: str, image_base64: str) -> str:
@@ -1811,9 +1918,12 @@ async def run_animation(tool: str, g: dict[str, Any], summary: dict[str, Any]) -
         prompt_id = _last_prompt.get()
         try:
             if prompt_id:
-                # A cancelled or timed-out prompt may still be running: stop it, so it saves nothing after this record.
-                await _http.post("/interrupt", json={"prompt_id": prompt_id}, timeout=5)
-                await _dequeue(prompt_id)
+                # A background cancellation owns upstream requests; a direct tool call may
+                # still request a targeted stop without using ComfyUI's global interrupt.
+                job = _current_job.get()
+                if job is None or job["status"] != "cancel_requested":
+                    if await _request_prompt_cancel(prompt_id) == "unsupported":
+                        await _dequeue(prompt_id)
             entry = None
             for _ in range(8 if prompt_id else 0):
                 entry = (await _http.get(f"/history/{prompt_id}", timeout=5)).json().get(prompt_id)
@@ -1859,18 +1969,23 @@ async def _frames_result(tool: str, summary: dict[str, Any], entry: dict[str, An
     """Record one animation call and build its result: the frames by number, the video, one contact strip."""
     by_node: dict[str, dict[str, Any]] = {}
     for im in await collect_images(entry):
-        by_node.setdefault(im["node"], im)
+        extension = "mp4" if im["node"] == "save_video" else "png"
+        if _saved_as(im, extension):
+            by_node.setdefault(im["node"], im)
     frames = [by_node[s] for s in saves if s in by_node]
     video = by_node.get("save_video")
-    if len(frames) != len(saves):
-        if frames or video:
-            log_asset(tool, {**summary, "incomplete": True}, frames + ([video] if video else []))
-        raise ToolError(f"ComfyUI saved {len(frames)} of {len(saves)} frames; they are recorded as an incomplete run.")
-    log_asset(tool, summary, frames + ([video] if video else []))  # stamps the project into summary
+    files = frames + ([video] if video else [])
+    if len(frames) != len(saves) or video is None:
+        if files:
+            log_asset(tool, {**summary, "incomplete": True}, files)
+        if len(frames) != len(saves):
+            raise ToolError(f"ComfyUI saved {len(frames)} of {len(saves)} requested PNG frames.")
+        raise ToolError("ComfyUI finished without a saved MP4. The PNG frames are recorded as an incomplete run.")
+    log_asset(tool, summary, files)  # stamps the project into summary
     # One address per frame keeps a long action's result short; "bases" lists the others.
     summary["frames"] = [{"frame": n, "filename": f["filename"], "subfolder": f["subfolder"], "type": f["type"], "url": f["url"]}
                          for n, f in enumerate(frames, start=1)]
-    summary["video"] = {k: video[k] for k in ("filename", "subfolder", "type", "url", "urls")} if video else None
+    summary["video"] = {k: video[k] for k in ("filename", "subfolder", "type", "url", "urls")}
     summary["bases"] = PUBLIC_URLS
     summary["download_hint"] = ('curl -o <file> "<url>" for each frame and the video ("bases" lists every address the server '
                                 "is configured to publish). Pass the frames to pack_spritesheet.")
@@ -2654,7 +2769,7 @@ def load_3d_workflow() -> dict[str, Any]:
             for node in graph.values()
         ):
             raise ValueError("invalid API-format workflow")
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         raise ToolError("COMFY_3D_WORKFLOW must be readable API-format JSON with a Save3DAdvanced viewport.") from None
     return graph
 
@@ -2706,7 +2821,7 @@ async def _hunyuan3d_to_glb(annotated: str, face_count: int, remove_background: 
     summary = {"prompt_id": prompt_id, "source_image": annotated, "model": "hunyuan3d", "seed": seed, "face_count": face_count,
                "textured": False, "seconds": round(elapsed, 1),
                "note": "Hunyuan3D 2.1 output is untextured geometry with smooth normals and a UV atlas (ready to texture)."}
-    return await build_result(summary, files, preview=False, tool="image_to_3d")
+    return await build_result(summary, files, preview=False, tool="image_to_3d", expected_extension="glb")
 
 
 @mcp.tool(structured_output=False)
@@ -2727,7 +2842,7 @@ async def image_to_3d(
 
     Requires COMFY_3D_WORKFLOW and installed models. The Pixal3D + TRELLIS.2 pipeline can cut out the subject, estimate
     the camera with MoGe, generate the shape, remesh, decimate, UV-unwrap, then bake base color / metallic /
-    roughness, a normal map and ambient occlusion. Output is a GLB you can import into Unreal, Unity or Blender.
+    roughness, a normal map and ambient occlusion. The output is a GLB file.
 
     Best input: a single object or character, centred, full body/object visible, plain background. A good recipe
     is generate_image(..., transparent=true) first, then pass that result's filename/subfolder here.
@@ -2780,7 +2895,7 @@ async def image_to_3d(
         "prompt_id": prompt_id, "source_image": annotated, "model": model, "seed": seed, "face_count": face_count,
         "texture_size": texture_size, "seconds": round(elapsed, 1),
     }
-    return await build_result(summary, files, preview=False)
+    return await build_result(summary, files, preview=False, expected_extension="glb")
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True), structured_output=False)
@@ -2839,6 +2954,79 @@ async def run_workflow(workflow: dict[str, Any], timeout_s: int = DEFAULT_TIMEOU
     prompt_id, entry, elapsed = await queue_and_wait(workflow, timeout_s)
     images = await collect_images(entry)
     return await build_result({"prompt_id": prompt_id, "seconds": round(elapsed, 1)}, images, preview)
+
+
+async def add_pipeline(name: str, workflow: dict[str, Any]) -> dict[str, Any]:
+    """Save a ComfyUI API-format graph to Your pipelines in Render Bridge.
+
+    Use a new pipeline name. Returns the saved name, missing models and nodes,
+    and dependencies that could not be verified on the selected backend.
+    Use run_workflow separately to render the graph.
+    """
+    data_dir = Path(os.environ.get("RENDER_BRIDGE_PIPELINE_DATA_DIR", ""))
+    monitor = data_dir / "monitor" / "RenderBridgeMonitor.exe"
+    if not data_dir.is_absolute() or not monitor.is_file():
+        raise ToolError("The Render Bridge desktop pipeline library is unavailable on this host.")
+
+    try:
+        payload = json.dumps(
+            {"name": name, "workflow": workflow, "comfy_url": COMFY_URL},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (ValueError, RecursionError) as exc:
+        raise ToolError("Supply a valid ComfyUI API-format JSON graph.") from exc
+    if len(payload) > 2 * 1024 * 1024 + 1024:
+        raise ToolError("The pipeline graph exceeds the 2 MiB import limit.")
+
+    if _pipeline_import_lock.locked():
+        raise ToolError("Render Bridge is checking another pipeline. Try again in a moment.")
+    async with _pipeline_import_lock:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                str(monitor),
+                "--add-pipeline",
+                str(data_dir),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except OSError as exc:
+            raise ToolError("The Render Bridge desktop importer could not start.") from exc
+
+        communication = asyncio.create_task(process.communicate(payload))
+        try:
+            stdout, _ = await asyncio.wait_for(asyncio.shield(communication), timeout=45)
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await communication
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise ToolError("The pipeline import timed out. Check Your pipelines before retrying.") from exc
+
+    try:
+        result = json.loads(stdout)
+    except (ValueError, RecursionError) as exc:
+        raise ToolError("The Render Bridge desktop importer returned an invalid response.") from exc
+    if not isinstance(result, dict):
+        raise ToolError("The Render Bridge desktop importer returned an invalid response.")
+    if process.returncode != 0:
+        raise ToolError(result.get("error") or "The Render Bridge desktop importer refused the pipeline.")
+    if not isinstance(result.get("id"), str) or not isinstance(result.get("name"), str):
+        raise ToolError("The Render Bridge desktop importer did not confirm the saved pipeline.")
+    return result
+
+
+_pipeline_import_lock = asyncio.Lock()
+if os.environ.get("RENDER_BRIDGE_PIPELINE_DATA_DIR"):
+    mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
+    )(add_pipeline)
 
 
 # ---------------------------------------------------------------------------
@@ -2955,7 +3143,7 @@ async def optimize_glb(
     """Make a GLB game-ready: simplify the mesh, shrink textures, clean up (gltf-transform + meshoptimizer).
 
     Typical use: after image_to_3d, make a mobile version, e.g. target_faces=8000, texture_size=1024.
-    Geometry is NOT Draco/meshopt-compressed, so Godot, Unity and Unreal all import it.
+    Geometry is stored without Draco or meshopt compression.
 
     Args:
         filename, subfolder, source: a GLB on the server (image_to_3d saves to subfolder "mcp/3d"; pass the
@@ -2963,8 +3151,7 @@ async def optimize_glb(
         target_faces: triangle target (0 = keep geometry; mobile ~2k-20k, PC ~30k-100k). Simplification also stops
             early if it would exceed max_error, so the shape is protected.
         texture_size: maximum texture width/height in px (e.g. 512, 1024, 2048; 0 = keep).
-        texture_format: "keep" (same format, e.g. PNG) or "webp" (much smaller; Godot 4 and Blender read it,
-            some older importers don't).
+        texture_format: "keep" (same format, e.g. PNG) or "webp" (smaller textures when the importer supports WebP).
         max_error: simplification error limit as a fraction of the model size (0.01 = 1%).
     Returns before/after stats and a download link to the optimised GLB.
     project: the game this result is logged under (default: the active project).
@@ -3493,14 +3680,308 @@ JOB_TOOLS = {
 }
 
 
+def _job_directory() -> Path:
+    identity = [COMFY_URL, MCP_PORT, *(os.path.normcase(os.path.realpath(COMFY_DIRS[kind]))
+                                    for kind in ("input", "output"))]
+    backend = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
+    return DATA_DIR / "jobs" / backend
+
+
+def _remember_job(job: dict[str, Any]) -> bool:
+    """Record only recovery metadata. URLs, prompts, previews and errors stay in memory."""
+    from tempfile import NamedTemporaryFile
+
+    directory = _job_directory()
+    fields = ("id", "tool", "status", "created", "started", "finished", "prompt_ids",
+              "submission_pending", "outputs", "cancel_targets", "cancel_acknowledged")
+    metadata = {key: job[key] for key in fields if key in job}
+    temporary = None
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with NamedTemporaryFile(dir=directory, encoding="utf-8", mode="w", delete=False) as file:
+            temporary = Path(file.name)
+            json.dump(metadata, file, ensure_ascii=True, separators=(",", ":"))
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.replace(directory / f"{job['id']}.json")
+        return True
+    except OSError as error:
+        log(f"could not save job metadata ({type(error).__name__})")
+        return False
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _job_output_reference(item: Any) -> dict[str, str] | None:
+    if not isinstance(item, dict) or item.get("type", "output") != "output":
+        return None
+    filename, subfolder = item.get("filename"), item.get("subfolder", "")
+    if (not isinstance(filename, str) or not 0 < len(filename) <= 255
+            or filename in {".", ".."} or any(c in filename for c in ("/", "\\", ":"))
+            or not isinstance(subfolder, str) or len(subfolder) > 512
+            or any(c in subfolder for c in ("\\", ":")) or subfolder.startswith("/")
+            or ".." in subfolder.split("/") or any(ord(c) < 32 for c in filename + subfolder)):
+        return None
+    ref = {"filename": filename, "subfolder": subfolder, "type": "output"}
+    for key in ("kind", "role"):
+        value = item.get(key)
+        if isinstance(value, str) and 0 < len(value) < 40 and all(c.isalnum() or c in "_-" for c in value):
+            ref[key] = value
+    return ref
+
+
+def _remember_job_outputs(job: dict[str, Any], outputs: list[dict[str, Any]]) -> None:
+    known = job.setdefault("outputs", [])
+    before = len(known)
+    seen = {(item["subfolder"], item["filename"]) for item in known}
+    for item in outputs:
+        if len(known) >= JOB_OUTPUT_LIMIT:
+            break
+        ref = _job_output_reference(item)
+        if ref is None:
+            continue
+        key = ref["subfolder"], ref["filename"]
+        if key not in seen:
+            known.append(ref)
+            seen.add(key)
+    if len(known) != before:
+        _remember_job(job)
+
+
+def _restore_jobs() -> None:
+    for path in _job_directory().glob("*.json"):
+        try:
+            if not re.fullmatch(r"[0-9a-f]{12}", path.stem) or path.stat().st_size > 2 * 1024 * 1024:
+                continue
+            job = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(job, dict) or job.get("id") != path.stem or job.get("tool") not in JOB_TOOLS
+                    or job.get("status") not in JOB_ACTIVE | {"done", "cancelled", "interrupted", "error"}
+                    or not isinstance(job.get("created"), (int, float)) or not math.isfinite(job["created"])
+                    or not isinstance(job.get("prompt_ids"), list)
+                    or not all(isinstance(pid, str) and JOB_PROMPT_ID.fullmatch(pid) for pid in job["prompt_ids"])):
+                continue
+            if any(key in job and (not isinstance(job[key], (int, float)) or not math.isfinite(job[key]))
+                   for key in ("started", "finished")):
+                continue
+            refs = job.get("outputs", [])
+            targets = job.get("cancel_targets", {})
+            acknowledged = job.get("cancel_acknowledged", [])
+            if (not isinstance(refs, list) or not isinstance(targets, dict) or not isinstance(acknowledged, list)
+                    or any(pid not in job["prompt_ids"] or state not in ("pending", "running")
+                           for pid, state in targets.items())
+                    or any(not isinstance(pid, str) or pid not in targets for pid in acknowledged)):
+                continue
+            job["outputs"] = [ref for item in refs[:JOB_OUTPUT_LIMIT] if (ref := _job_output_reference(item))]
+            if job["status"] in {"queued", "running"}:
+                job["status"] = "recovering"
+            job.update(label="", recovered=True)
+            if job["status"] == "error":
+                job["error"] = "The job failed before Render Bridge restarted."
+            _jobs[path.stem] = job
+        except (OSError, ValueError, TypeError, RecursionError):
+            continue
+    _prune_jobs()
+
+
+def _prune_jobs() -> None:
+    now = time.time()
+    inactive = []
+    for job in _jobs.values():
+        if any(task is not None and not task.done() for task in (job.get("task"), job.get("cancel_task"))):
+            continue
+        inactive.append(job)
+    inactive.sort(key=lambda job: job.get("finished", job["created"]), reverse=True)
+    for index, job in enumerate(inactive):
+        if index >= JOB_HISTORY_LIMIT or now - job.get("finished", job["created"]) > JOB_RETENTION_S:
+            try:
+                (_job_directory() / f"{job['id']}.json").unlink(missing_ok=True)
+            except OSError:
+                continue
+            del _jobs[job["id"]]
+
+
+async def _upstream_queue() -> dict[str, str] | None:
+    try:
+        response = await _http.get("/queue", timeout=5)
+        response.raise_for_status()
+        queue = response.json()
+        prompts = {}
+        for key, state in (("queue_pending", "pending"), ("queue_running", "running")):
+            rows = queue[key]
+            if not isinstance(rows, list) or any(not isinstance(row, list) or len(row) < 2
+                                                 or not isinstance(row[1], str) for row in rows):
+                return None
+            prompts.update((row[1], state) for row in rows)
+        return prompts
+    except (httpx.HTTPError, ValueError, TypeError, KeyError):
+        return None
+
+
+async def _request_prompt_cancel(prompt_id: str) -> str:
+    """Ask ComfyUI to stop this exact prompt, never fall back to a global interrupt."""
+    try:
+        response = await _http.post(f"/api/jobs/{quote(prompt_id, safe='')}/cancel", timeout=5)
+        if response.status_code in (404, 405):
+            return "unsupported"
+        if response.is_success and response.json().get("cancelled") is True:
+            return "accepted"
+    except (httpx.HTTPError, ValueError, AttributeError):
+        pass
+    return "unknown"
+
+
+async def _job_history(prompt_id: str) -> dict[str, Any] | None:
+    try:
+        response = await _http.get(f"/history/{quote(prompt_id, safe='')}", timeout=5)
+        response.raise_for_status()
+        history = response.json()
+        if isinstance(history, dict):
+            entry = history.get(prompt_id, {})
+            if isinstance(entry, dict):
+                return entry
+    except (httpx.HTTPError, ValueError):
+        pass
+    return None
+
+
+def _history_outputs(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    outputs = entry.get("outputs", {})
+    return [item for node in outputs.values() if isinstance(node, dict)
+            for items in node.values() if isinstance(items, list)
+            for item in items if isinstance(item, dict)] if isinstance(outputs, dict) else []
+
+
+def _was_interrupted(entry: dict[str, Any]) -> bool:
+    status = entry.get("status", {})
+    messages = status.get("messages", []) if isinstance(status, dict) else []
+    return isinstance(messages, list) and any(
+        isinstance(message, list) and bool(message) and message[0] == "execution_interrupted"
+        for message in messages)
+
+
+def _finish_job(job: dict[str, Any], status: str, error: str | None = None) -> None:
+    job.update(status=status, error=error, finished=time.time())
+    _remember_job(job)
+
+
+async def _recover_prompt_history(job: dict[str, Any]) -> dict[str, dict[str, Any] | None]:
+    history = {}
+    prompts = job["prompt_ids"]
+    for index in range(0, len(prompts), 8):
+        group = prompts[index:index + 8]
+        entries = await asyncio.gather(*(_job_history(pid) for pid in group))
+        history.update(zip(group, entries))
+        _remember_job_outputs(job, [item for entry in entries if entry for item in _history_outputs(entry)])
+    return history
+
+
+async def _refresh_background_job(job: dict[str, Any]) -> None:
+    status = job["status"]
+    if status not in {"recovering", "cancel_requested", "cancel_unknown"}:
+        return
+    prompts = job["prompt_ids"]
+    queue = await _upstream_queue() if prompts else {}
+    if queue is None:
+        if status != "recovering" and status != "cancel_unknown":
+            job["status"] = "cancel_unknown"
+            _remember_job(job)
+        return
+    active = {prompt for prompt in prompts if prompt in queue}
+    job["gpu"] = ("running now" if any(queue[prompt] == "running" for prompt in active)
+                  else "waiting in queue") if active else None
+    if active:
+        if status == "cancel_requested" and any(
+                queue[pid] == "running" and job.get("cancel_targets", {}).get(pid) == "pending"
+                for pid in active):
+            job["status"] = "cancel_unknown"
+            _remember_job(job)
+        return
+    history = await _recover_prompt_history(job)
+    if status == "recovering":
+        if any(entry is None for entry in history.values()):
+            return
+        note = ("Render Bridge restarted before the tool finished. ComfyUI may have accepted a submission "
+                "whose prompt ID was never confirmed." if job.get("submission_pending")
+                else "Render Bridge restarted before the tool finished. Available output files may be incomplete.")
+        _finish_job(job, "interrupted", note)
+        return
+    targets, acknowledged = job.get("cancel_targets"), job.get("cancel_acknowledged", [])
+    if targets is not None and not job.get("submission_pending"):
+        if not prompts:
+            _finish_job(job, "cancelled")
+            return
+        unconfirmed = [pid for pid, kind in targets.items()
+                       if (entry := history[pid]) is None or not (_was_interrupted(entry) or
+                           (not entry and pid in acknowledged and kind == "pending"))]
+        if targets and not unconfirmed:
+            _finish_job(job, "cancelled")
+            return
+        if all(history[pid] for pid in (unconfirmed or prompts)):
+            if job.get("result") is not None:
+                _finish_job(job, "done")
+            else:
+                _finish_job(job, "interrupted", "ComfyUI finished work before cancellation was confirmed. "
+                            "Render Bridge stopped its local task. Available output files may be incomplete.")
+            return
+    if status != "cancel_unknown":
+        job["status"] = "cancel_unknown"
+        _remember_job(job)
+
+
+async def _cancel_background_job(job: dict[str, Any]) -> None:
+    prompts = job["prompt_ids"]
+    queue = await _upstream_queue() if prompts else {}
+    if queue is None:
+        job["status"] = "cancel_unknown"
+        _remember_job(job)
+        return
+    targets = {pid: queue[pid] for pid in prompts if pid in queue}
+    job["cancel_targets"] = targets
+    job["cancel_acknowledged"] = []
+    _remember_job(job)
+    acknowledged, legacy_pending = [], []
+    for pid, state in targets.items():
+        outcome = await _request_prompt_cancel(pid)
+        if outcome == "accepted":
+            acknowledged.append(pid)
+        elif outcome == "unsupported" and state == "pending":
+            legacy_pending.append(pid)
+    if legacy_pending:
+        # Older ComfyUI may accept this HTTP request without deleting a
+        # prompt that started in the meantime. Do not treat it as proof.
+        await _dequeue(*legacy_pending)
+    job["cancel_acknowledged"] = acknowledged
+    if len(acknowledged) != len(targets) or job.get("submission_pending"):
+        job["status"] = "cancel_unknown"
+    _remember_job(job)
+    await _refresh_background_job(job)
+
+
 def _job_public(job: dict[str, Any]) -> dict[str, Any]:
     end = job.get("finished") or time.time()
-    return {
-        "job_id": job["id"], "tool": job["tool"], "label": job["label"], "status": job["status"],
+    result = {
+        "job_id": job["id"], "tool": job["tool"], "label": job.get("label", ""), "status": job["status"],
         "created": time.strftime("%H:%M:%S", time.localtime(job["created"])),
         "elapsed_seconds": round(end - (job.get("started") or job["created"])),
         "error": job.get("error"),
     }
+    if job.get("recovered"):
+        result["recovered"] = True
+    if job.get("gpu"):
+        result["gpu"] = job["gpu"]
+    if job["status"] == "cancel_unknown":
+        result["note"] = "ComfyUI might still be running this work. Check its queue or try cancellation again."
+    return result
+
+
+def _recovered_outputs(job: dict[str, Any]) -> list[dict[str, Any]]:
+    return [{**ref, "url": signed_url(ref),
+             "urls": {label: signed_url(ref, base) for label, base in PUBLIC_URLS.items()}}
+            for ref in job.get("outputs", [])]
 
 
 async def _job_progress(job: dict[str, Any]) -> dict[str, Any]:
@@ -3544,26 +4025,31 @@ async def start_job(tool: str, arguments: dict[str, Any] | None = None, label: s
     except TypeError as e:
         raise ToolError(f"Bad arguments for {tool}: {e}") from None
     now = time.time()
-    for jid in [j for j, v in _jobs.items() if v.get("finished") and now - v["finished"] > JOB_RETENTION_S]:
-        _jobs.pop(jid, None)
+    _prune_jobs()
     job: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "tool": tool, "label": label, "status": "queued", "created": now,
                            "prompt_ids": [], "result": None, "error": None}
 
     async def runner() -> None:
         _current_job.set(job)
         job.update(status="running", started=time.time())
+        _remember_job(job)
         try:
             job["result"] = await fn(**arguments)
-            job["status"] = "done"
+            if job["status"] == "running":
+                _finish_job(job, "done")
         except asyncio.CancelledError:
-            job["status"] = "cancelled"
+            if job["status"] == "running":
+                job.update(status="recovering", recovered=True)
+                _remember_job(job)
             raise
         except Exception as e:  # noqa: BLE001
-            job.update(status="error", error=f"{type(e).__name__}: {e}"[:2000])
+            if job["status"] == "running":
+                _finish_job(job, "error", f"{type(e).__name__}: {e}"[:2000])
         finally:
-            job["finished"] = time.time()
             log(f"job {job['id']} ({tool}) {job['status']}")
 
+    if not _remember_job(job):
+        raise ToolError("Could not record the background job. Check the Render Bridge data directory.")
     _jobs[job["id"]] = job
     job["task"] = asyncio.create_task(runner())
     return json.dumps({"job_id": job["id"], "status": "queued", "next": f'get_job("{job["id"]}", wait_seconds=60)'})
@@ -3573,61 +4059,77 @@ async def start_job(tool: str, arguments: dict[str, Any] | None = None, label: s
 async def get_job(job_id: str, wait_seconds: int = 0) -> CallToolResult:
     """Check a background job from start_job. wait_seconds (0-120) waits for it to finish first.
 
-    When status is "done" this returns the tool's full result (download URLs + previews); "error" includes the
-    message; otherwise it shows whether the job is running or waiting in the GPU queue.
+    Returns the full live result when available. After restart, completed jobs retain downloadable file references
+    and interrupted jobs may have partial outputs. Check again for "recovering" or "cancel_requested".
     """
+    _prune_jobs()
     job = _jobs.get(job_id)
     if job is None:
-        raise ToolError(f"No job {job_id!r} (jobs are kept for 24 h and lost if the server restarts).")
-    if wait_seconds > 0 and job["status"] in ("queued", "running"):
+        raise ToolError(f"No job {job_id!r} (up to {JOB_HISTORY_LIMIT} recent jobs are kept for up to 24 h).")
+    task = job.get("task")
+    if wait_seconds > 0 and task is not None and job["status"] in ("queued", "running"):
         try:
-            await asyncio.wait_for(asyncio.shield(job["task"]), timeout=min(int(wait_seconds), 120))
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
+            await asyncio.wait_for(asyncio.shield(task), timeout=min(int(wait_seconds), 120))
+        except asyncio.TimeoutError:
             pass
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+    if job["status"] in JOB_ACTIVE - {"queued", "running"}:
+        async with job.setdefault("refresh_lock", asyncio.Lock()):
+            cancel_task = job.get("cancel_task")
+            if cancel_task is None or cancel_task.done():
+                await _refresh_background_job(job)
     pub = _job_public(job)
-    if job["status"] == "done":
-        res: CallToolResult = job["result"]
+    res = job.get("result")
+    if job["status"] == "done" and res is not None:
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(pub)), *res.content], is_error=res.is_error)
-    if job["status"] in ("error", "cancelled"):
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps(pub, indent=2))], is_error=job["status"] == "error")
-    pub.update(await _job_progress(job))
-    return CallToolResult(content=[TextContent(type="text", text=json.dumps(pub, indent=2))])
+    if job.get("outputs"):
+        pub["outputs"] = _recovered_outputs(job)
+    if job["status"] in {"queued", "running"}:
+        pub.update(await _job_progress(job))
+    return CallToolResult(content=[TextContent(type="text", text=json.dumps(pub, indent=2))], is_error=job["status"] == "error")
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True), structured_output=False)
 async def list_jobs() -> str:
     """List background jobs (newest first) with their status."""
+    _prune_jobs()
     jobs = sorted(_jobs.values(), key=lambda j: j["created"], reverse=True)
     return json.dumps([_job_public(j) for j in jobs], indent=2)
 
 
 @mcp.tool(structured_output=False)
 async def cancel_job(job_id: str) -> str:
-    """Cancel a queued or running background job (removes it from the GPU queue or interrupts it)."""
+    """Request cancellation. Poll get_job for confirmation or retry if the outcome is unknown."""
+    _prune_jobs()
     job = _jobs.get(job_id)
     if job is None:
         raise ToolError(f"No job {job_id!r}.")
-    if job["status"] not in ("queued", "running"):
+    if job["status"] not in JOB_ACTIVE:
         return json.dumps({"job_id": job_id, "status": job["status"], "note": "already finished"})
-    # Stop the job first and wait for it: a job that queues one prompt after another (repaint_frames) would otherwise
-    # queue its next one while its earlier ones are being cleared, and the GPU would run a frame nobody records.
-    job["task"].cancel()
-    await asyncio.wait({job["task"]}, timeout=10)
-    job.update(status="cancelled", finished=time.time())
-    try:
-        q = (await _http.get("/queue", timeout=5)).json()
-        running = [it[1] for it in q.get("queue_running", [])]
-        pending = [it[1] for it in q.get("queue_pending", [])]
-        mine = list(job["prompt_ids"])
-        for pid in mine:  # the running one first: every moment it runs on, it may finish and save a file nobody records
-            if pid in running:
-                await _http.post("/interrupt", json={"prompt_id": pid}, timeout=5)
-        for pid in mine:  # prompts that already finished are in neither list and need nothing
-            if pid in pending:
-                await _http.post("/queue", json={"delete": [pid]}, timeout=5)
-    except Exception as e:  # noqa: BLE001
-        log(f"cancel_job: {e!r}")
-    return json.dumps({"job_id": job_id, "status": "cancelled"})
+    task = job.get("cancel_task")
+    if task is None or task.done():
+        async with job.setdefault("refresh_lock", asyncio.Lock()):
+            if job["status"] not in JOB_ACTIVE:
+                return json.dumps({"job_id": job_id, "status": job["status"], "note": "already finished"})
+            task = job.get("cancel_task")
+            if task is None or task.done():
+                job["status"] = "cancel_requested"
+                _remember_job(job)
+                runner = job.get("task")
+                if runner is not None and not runner.done():
+                    runner.cancel()
+                task = job["cancel_task"] = asyncio.create_task(_cancel_background_job(job))
+    await asyncio.shield(task)
+    notes = {
+        "cancel_requested": "ComfyUI accepted the request. Check get_job to confirm that it stopped.",
+        "cancel_unknown": "Could not confirm cancellation. ComfyUI might still be running this work.",
+        "cancelled": "Cancellation confirmed. Any files already written remain available.",
+        "done": "The job finished before cancellation was confirmed.",
+        "interrupted": "Render Bridge stopped its local task, and ComfyUI finished work before cancellation was confirmed.",
+    }
+    return json.dumps({"job_id": job_id, "status": job["status"], "note": notes[job["status"]]})
 
 
 # ---------------------------------------------------------------------------
@@ -3744,16 +4246,36 @@ async def serve_signed_file(scope: dict[str, Any], receive: Any, send: Any) -> N
     if exp < time.time() or not hmac.compare_digest(sig, _link_sig(filename, subfolder, ftype, exp)):
         await PlainTextResponse("Download link is invalid or expired.", status_code=403)(scope, receive, send)
         return
+    method = scope["method"]
+    request = _http.build_request(
+        method, comfy_view_url({"filename": filename, "subfolder": subfolder, "type": ftype}),
+        headers={"Accept-Encoding": "identity"}, timeout=120,
+    )
     try:
-        r = await _http.get(comfy_view_url({"filename": filename, "subfolder": subfolder, "type": ftype}), timeout=120)
+        upstream = await _http.send(request, stream=True)
     except httpx.HTTPError:
         await PlainTextResponse("ComfyUI is unavailable.", status_code=503)(scope, receive, send)
         return
-    if r.status_code != 200:
-        await PlainTextResponse("File not found.", status_code=404)(scope, receive, send)
-        return
-    headers = {"Content-Disposition": f'attachment; filename="{quote(filename)}"'}
-    await Response(r.content, media_type=r.headers.get("content-type", "application/octet-stream"), headers=headers)(scope, receive, send)
+    try:
+        if upstream.status_code != 200:
+            await PlainTextResponse("File not found.", status_code=404)(scope, receive, send)
+            return
+        headers = {"Content-Disposition": f'attachment; filename="{quote(filename)}"'}
+        for name in ("content-length", "content-encoding"):
+            if name in upstream.headers:
+                headers[name] = upstream.headers[name]
+        media_type = upstream.headers.get("content-type", "application/octet-stream")
+        if method == "HEAD":
+            response = Response(media_type=media_type, headers=headers)
+            if "content-length" not in headers:
+                del response.headers["content-length"]
+        else:
+            response = StreamingResponse(
+                upstream.aiter_raw(chunk_size=64 << 10), media_type=media_type, headers=headers,
+            )
+        await response(scope, receive, send)
+    finally:
+        await upstream.aclose()
 
 
 async def receive_signed_upload(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -3856,6 +4378,7 @@ async def receive_signed_upload(scope: dict[str, Any], receive: Any, send: Any) 
 class BearerAuth:
     def __init__(self, app: Any, token: str):
         self.app = app
+        self.installation_key = token.encode()
         self.expected = f"Bearer {token}".encode()
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -3863,6 +4386,19 @@ class BearerAuth:
             if scope.get("path") == "/health":
                 status = "paused" if PAUSE_FLAG.exists() else "ok" if await comfy_up() else "stopped"
                 body = {"mcp": "ok", "comfyui": status}
+                if managed_id := os.environ.get("RENDER_BRIDGE_MANAGED_ID"):
+                    body["wizard_session"] = managed_id
+                challenge = dict(scope.get("headers") or []).get(b"x-render-bridge-challenge", b"")
+                if re.fullmatch(rb"[0-9a-f]{32}", challenge):
+                    panel_managed = bool(managed_id) and os.environ.get("RENDER_BRIDGE_PANEL_MANAGED") == "1"
+                    message = b"rb-health-v2:" + challenge + f":{int(panel_managed)}:{COMFY_URL}".encode()
+                    body.update(panel_managed=panel_managed, comfyui_url=COMFY_URL)
+                    body["installation_proof"] = hmac.new(
+                        self.installation_key, message, "sha256",
+                    ).hexdigest()
+                    body["asset_folders_proof"] = asset_folders_proof(
+                        self.installation_key, challenge, COMFY_DIRS["input"], COMFY_DIRS["output"],
+                    )
                 await JSONResponse(body)(scope, receive, send)
                 return
             if scope.get("path", "").startswith("/files/") and scope.get("method") in ("GET", "HEAD"):
@@ -3897,6 +4433,31 @@ def bind_listen_sockets(hosts: list[str], port: int) -> list[socket.socket]:
     return socks
 
 
+def rotate_token() -> None:
+    if not MCP_HOSTS or not 1 <= MCP_PORT <= 65535:
+        raise SystemExit("Set MCP_HOST and MCP_PORT to the stopped server's listen addresses and port.")
+    # Reserve the configured listener while replacing its credential, so a
+    # concurrent server startup cannot read the previous token and then bind.
+    sockets = bind_listen_sockets(MCP_HOSTS, MCP_PORT)
+    try:
+        metadata = TOKEN_FILE.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or (
+            getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise ValueError("The token is not a regular file.")
+        if metadata.st_size > 4096 or not re.fullmatch(
+            r"[A-Za-z0-9_-]{32,}", TOKEN_FILE.read_text(encoding="utf-8").strip()
+        ):
+            raise ValueError("The existing file does not contain a Render Bridge token.")
+        atomic_text(TOKEN_FILE, secrets.token_urlsafe(32) + "\n")
+    except (OSError, ValueError):
+        raise SystemExit("Could not rotate the existing token file. Check its path and permissions.") from None
+    finally:
+        for sock in sockets:
+            sock.close()
+    print("Token rotated. Start Render Bridge and reconnect its MCP clients.")
+
+
 def set_gaming_mode(enabled: bool) -> None:
     if enabled:
         PAUSE_FLAG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -3912,37 +4473,51 @@ def set_gaming_mode(enabled: bool) -> None:
 async def enable_gaming_mode() -> None:
     set_gaming_mode(True)
     try:
-        response = await _http.get("/queue", timeout=5)
-        response.raise_for_status()
-        queue = response.json()
-        running = queue.get("queue_running") if isinstance(queue, dict) else None
-        pending = queue.get("queue_pending") if isinstance(queue, dict) else None
-        if not isinstance(running, list) or not isinstance(pending, list):
-            print("Gaming mode is on. Queue status is unknown. No model unload was requested.")
-        elif running or pending:
-            print("Gaming mode is on. The ComfyUI queue is busy. No model unload was requested.")
-        elif PAUSE_FLAG.exists():
-            response = await _http.post("/free", json={"unload_models": True, "free_memory": True}, timeout=10)
-            response.raise_for_status()
+        activation = _gaming_activation()
+        outcome = await _gaming_unload(activation) if activation is not None else "changed"
+        if outcome == "accepted":
             print("Gaming mode is on. ComfyUI accepted the model unload request.")
+        elif outcome == "changed":
+            print("Gaming mode changed before the unload request.")
+        elif outcome == "busy":
+            print("Gaming mode is on. While Render Bridge is running, it will request an unload when the ComfyUI queue is empty.")
         else:
-            print("Gaming mode was turned off before the unload request.")
-    except (httpx.HTTPError, ValueError):
-        print("Gaming mode is on. No model unload was confirmed by ComfyUI.")
+            print("Gaming mode is on. While Render Bridge is running, it will check the queue again before unloading models.")
+    except OSError:
+        print("Gaming mode is on. Could not confirm the model unload. Check access to the Gaming Mode flag folder.")
     finally:
         await _http.aclose()
 
 
 async def amain() -> None:
     validate_server_settings()
-    token = load_token()
     app = mcp.streamable_http_app(stateless_http=True, host=MCP_HOSTS[0], max_request_body_size=64 * 1024 * 1024)
     sockets = bind_listen_sockets(MCP_HOSTS, MCP_PORT)
+    try:
+        token = load_token()
+    except BaseException:
+        for sock in sockets:
+            sock.close()
+        raise
+    _restore_jobs()
     log(f"Render Bridge listening on {', '.join(MCP_HOSTS)} at port {MCP_PORT}.")
     # Signed upload and download URLs include their own credentials in query strings.
+    managed = bool(os.environ.get("RENDER_BRIDGE_MANAGED_ID"))
     server = uvicorn.Server(uvicorn.Config(
         BearerAuth(app, token), host=MCP_HOSTS[0], port=MCP_PORT, log_level="info", access_log=False,
+        timeout_graceful_shutdown=1 if managed else None,
     ))
+    if managed:
+        # Closing the wizard's stdin pipe also reaches Python through the
+        # Windows venv redirector and stops the actual server process.
+        import sys
+        import threading
+
+        def stop_on_wizard_exit() -> None:
+            sys.stdin.read()
+            server.should_exit = True
+
+        threading.Thread(target=stop_on_wizard_exit, daemon=True).start()
     watcher = asyncio.create_task(idle_watcher())
     try:
         await server.serve(sockets=sockets)
@@ -3958,13 +4533,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Render Bridge MCP server and local controls")
     commands = parser.add_subparsers(dest="command")
     game = commands.add_parser("gaming-mode", help="Pause or resume new GPU work through this MCP server")
-    game.add_argument("state", choices=("on", "off", "status"))
+    game.add_argument("state", choices=("on", "off", "status", "toggle"))
+    commands.add_parser("rotate-token", help="Replace the private token after stopping this server.")
     args = parser.parse_args()
     if args.command is None:
         asyncio.run(amain())
-    elif args.state == "on":
+    elif args.command == "rotate-token":
+        rotate_token()
+    elif args.state == "on" or (args.state == "toggle" and not PAUSE_FLAG.exists()):
         asyncio.run(enable_gaming_mode())
-    elif args.state == "off":
+    elif args.state in ("off", "toggle"):
         set_gaming_mode(False)
         print("Gaming mode is off.")
     else:

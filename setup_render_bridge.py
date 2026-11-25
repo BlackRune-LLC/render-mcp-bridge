@@ -1,14 +1,24 @@
 """Set up and run Render Bridge with a locally managed ComfyUI backend."""
 
 import argparse
+import builtins
+import hmac
 import http.client
 import ipaddress
 import json
 import os
+import re
+import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+from collections import deque
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from traceback import walk_tb
 from urllib.parse import urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -17,6 +27,22 @@ MODEL_GUIDE = "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs
 CLIENT_GUIDE = "https://github.com/BlackRune-LLC/render-mcp-bridge#connect-an-mcp-client"
 COMFY_INSTALL = "https://docs.comfy.org/installation/manual_install"
 SETTINGS_KEYS = {"COMFY_ROOT", "COMFY_URL"}
+OPTIONAL_FOLDERS = {"COMFY_INPUT_DIR", "COMFY_OUTPUT_DIR"}
+OPTIONAL_SETTINGS = OPTIONAL_FOLDERS | {"PAUSE_FLAG"}
+GAMING_MODE_FLAG = "gaming_mode.flag"
+ATTACH_ONLY = "attach-only"
+SETTINGS_LIMIT = 64 * 1024
+ACTIVE_RUNTIME = "active-runtime"
+MCP_PORT_FILE = "mcp-port"
+DEFAULT_MCP_PORT = 8189
+RUNTIME_PREFIX = "app-"
+RUNTIME_FILES = (
+    "comfy_mcp_server.py",
+    "setup_render_bridge.py",
+    "verify_render_bridge.py",
+    "requirements.txt",
+    "LICENSE",
+)
 MINIMUM_PYTHON = (3, 11)
 PROBE_TIMEOUT = 3
 PROBE_LIMIT = 1024 * 1024
@@ -26,43 +52,188 @@ STARTER_MODELS = (
     ("VAELoader", "vae_name", "ae.safetensors"),
     ("CheckpointLoaderSimple", "ckpt_name", "NetaYumev35_pretrained_all_in_one.safetensors"),
 )
+CRASH_COMPONENTS = {"server", "terminal-installer"}
+CRASH_SOURCE_FILES = {"comfy_mcp_server.py", "setup_render_bridge.py"}
 
 
-def data_dir() -> Path:
-    override = os.environ.get("COMFY_MCP_DATA_DIR")
-    if override:
-        return Path(override).expanduser().resolve()
+def asset_folders_proof(key: bytes, challenge: bytes, input_dir, output_dir) -> str:
+    paths = [os.path.normcase(os.path.realpath(path)) for path in (input_dir, output_dir)]
+    message = b"rb-health-folders-v1:" + challenge + b":" + json.dumps(paths).encode()
+    return hmac.new(key, message, "sha256").hexdigest()
+
+
+def default_data_dir() -> Path:
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
     else:
         base = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
-    return (Path(base).expanduser() / "comfy-mcp").resolve()
+    return Path(base).expanduser() / "comfy-mcp"
 
 
-def load_settings(path: Path) -> dict[str, str]:
+def data_dir() -> Path:
+    override = os.environ.get("COMFY_MCP_DATA_DIR")
+    return (Path(override).expanduser() if override else default_data_dir()).resolve()
+
+
+def unique_json_object(pairs):
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError("Duplicate setup setting.")
+    return obj
+
+
+def validate_pause_flag(value: str) -> None:
+    # Inspect the raw components because Path normalizes dot segments and trailing separators.
+    parts = re.split(r"[\\/]" if os.name == "nt" else "/", value)
+    if (
+        not Path(value).is_absolute() or parts[-1] != GAMING_MODE_FLAG
+        or any(part in {".", ".."} for part in parts) or "\0" in value
+    ):
+        raise ValueError("PAUSE_FLAG must be an absolute path to gaming_mode.flag without dot segments.")
+
+
+def load_settings(path: Path, *, partial: bool = False, missing_ok: bool = True) -> dict[str, str]:
+    invalid = "Invalid setup settings."
     try:
-        settings = json.loads(path.read_text(encoding="utf-8"))
+        metadata = path.stat()
     except FileNotFoundError:
-        return {}
+        if missing_ok and not path.is_symlink():
+            return {}
+        raise
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > SETTINGS_LIMIT:
+        raise ValueError(invalid)
+    with path.open("rb") as stream:
+        raw = stream.read(SETTINGS_LIMIT + 1)
+    if len(raw) > SETTINGS_LIMIT:
+        raise ValueError(invalid)
+    try:
+        settings = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=unique_json_object)
+    except (ValueError, RecursionError):
+        raise ValueError(invalid) from None
     if (
         not isinstance(settings, dict)
-        or settings.keys() != SETTINGS_KEYS
-        or any(not isinstance(value, str) or not value for value in settings.values())
+        or not settings.keys() <= SETTINGS_KEYS | OPTIONAL_SETTINGS
+        or any(not isinstance(value, str) for value in settings.values())
     ):
-        raise ValueError("Invalid setup settings.")
+        raise ValueError(invalid)
+    flag = settings.get("PAUSE_FLAG", "")
+    if flag.strip():
+        validate_pause_flag(flag)
+    if partial:
+        return {key: value.strip() for key, value in settings.items() if value.strip()}
+    if not SETTINGS_KEYS <= settings.keys() or any(not value.strip() for value in settings.values()):
+        raise ValueError(invalid)
     return settings
 
 
-def save_settings(path: Path, settings: dict[str, str]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+def atomic_text(path: Path, text: str, *, create_parent: bool = True) -> None:
+    if create_parent:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".render-bridge-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump({key: settings[key] for key in sorted(SETTINGS_KEYS)}, stream, indent=2)
-            stream.write("\n")
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def record_crash(component: str, error: BaseException) -> None:
+    if component not in CRASH_COMPONENTS or not isinstance(error, Exception) or isinstance(error, EOFError):
+        return
+    try:
+        directory = default_data_dir()
+        if not directory.is_absolute():
+            return
+        logs = directory / "crash-logs"
+        for folder in (directory, logs):
+            folder.mkdir(mode=0o700, parents=folder == directory, exist_ok=True)
+            metadata = folder.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or (
+                getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                return
+
+        stack = deque(maxlen=6)
+        for frame, line in walk_tb(error.__traceback__):
+            source = Path(frame.f_code.co_filename)
+            function = frame.f_code.co_name
+            if (source.name in CRASH_SOURCE_FILES and source.parent.resolve() == PROJECT_ROOT
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}|<module>", function)):
+                stack.append({"file": source.name, "function": function, "line": line})
+
+        kind = type(error)
+        report = {
+            "schema": 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "component": component,
+            "python_version": ".".join(map(str, sys.version_info[:3])),
+            "exception_type": kind.__name__ if getattr(builtins, kind.__name__, None) is kind else "Exception",
+            "stack": list(stack),
+        }
+        atomic_text(logs / f"{component}.json", json.dumps(report, indent=2) + "\n", create_parent=False)
+    except Exception:
+        # A reporting failure must leave the original process error intact.
+        pass
+
+
+def enable_crash_reports(component: str) -> None:
+    if any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+        return
+    previous_hook = sys.excepthook
+
+    def report_and_display(kind, error, traceback):
+        record_crash(component, error)
+        previous_hook(kind, error, traceback)
+
+    sys.excepthook = report_and_display
+
+
+def save_settings(path: Path, settings: dict[str, str]) -> None:
+    atomic_text(path, json.dumps(settings, indent=2, sort_keys=True) + "\n")
+
+
+def active_runtime(directory: Path) -> Path | None:
+    try:
+        name = (directory / ACTIVE_RUNTIME).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    if not re.fullmatch(r"app-[A-Za-z0-9_]{1,32}", name):
+        raise ValueError("Invalid active Render Bridge runtime.")
+    return directory / name
+
+
+def runtime_settings(legacy_settings: Path, runtime: Path | None) -> Path:
+    return runtime / "settings.json" if runtime else legacy_settings
+
+
+def installed_settings(settings_path: Path) -> tuple[Path | None, dict[str, str]]:
+    runtime = active_runtime(settings_path.parent)
+    return runtime, load_settings(runtime_settings(settings_path, runtime), partial=True, missing_ok=runtime is None)
+
+
+def configured_mcp_port(directory: Path) -> int:
+    invalid = "The saved Render Bridge MCP port is invalid."
+    try:
+        with (directory / MCP_PORT_FILE).open(encoding="ascii") as saved:
+            raw = saved.read(16)
+        if len(raw) == 16:
+            raise ValueError(invalid)
+    except FileNotFoundError:
+        raw = os.environ.get("MCP_PORT", str(DEFAULT_MCP_PORT))
+        invalid = "MCP_PORT must be a valid port."
+    except UnicodeError:
+        raise ValueError(invalid) from None
+
+    digits = raw.strip()
+    if not 1 <= len(digits) <= 5 or not digits.isascii() or not digits.isdecimal():
+        raise ValueError(invalid)
+    port = int(digits)
+    if not 1 <= port <= 65535:
+        raise ValueError(invalid)
+    return port
 
 
 def backend_url(value: str) -> str:
@@ -90,10 +261,26 @@ def backend_url(value: str) -> str:
     return f"{address.scheme}://{authority}"
 
 
-def comfy_root(value: str) -> Path:
+def portable_settings(path: Path) -> dict[str, str]:
+    settings = load_settings(path.expanduser(), partial=True, missing_ok=False)
+    home_prefixes = ("~/", "~\\") if os.name == "nt" else ("~/",)
+    for key, value in settings.items():
+        if key == "COMFY_URL":
+            backend_url(value)
+        elif not (Path(value).is_absolute() or value == "~" or value.startswith(home_prefixes)):
+            raise ValueError(f"{key} in the supplied config must be an absolute path or use ~/.")
+    return settings
+
+
+def comfy_root(value: str, overrides: dict[str, str]) -> Path:
     path = Path(value.strip().strip('"').strip("'")).expanduser().resolve()
-    if not all((path / folder).is_dir() for folder in ("input", "output")):
-        raise ValueError("Choose the ComfyUI folder that contains both input and output directories.")
+    if not path.is_dir():
+        raise ValueError("Could not find the ComfyUI root directory. Check the folder and retry.")
+    for folder in ("input", "output"):
+        override = overrides.get(f"COMFY_{folder.upper()}_DIR")
+        if not (Path(override) if override else path / folder).is_dir():
+            hint = f"COMFY_{folder.upper()}_DIR" if override else f"the {folder} subfolder"
+            raise ValueError(f"Could not find {hint} for ComfyUI. Check the folder and retry.")
     return path
 
 
@@ -141,36 +328,201 @@ def prompt_for(label, default, validate):
             print(str(error) if isinstance(error, ValueError) else "That directory could not be read.")
 
 
-def venv_python() -> Path:
+def venv_python(runtime: Path) -> Path:
     executable = "Scripts/python.exe" if os.name == "nt" else "bin/python"
-    return PROJECT_ROOT / ".venv" / executable
+    return runtime / ".venv" / executable
 
 
-def quiet_run(command: list[str]) -> int:
+class InstallFailure(RuntimeError):
+    """Stage failure with a fixed, credential-safe message."""
+
+
+def run_install_stage(command, directory, phase, timeout, env=None):
     # Package-manager diagnostics can include private index or proxy settings.
-    result = subprocess.run(
-        command, check=False, cwd=PROJECT_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    return result.returncode
-
-
-def install(settings_path: Path) -> int:
     try:
-        previous = load_settings(settings_path)
+        child = subprocess.Popen(
+            command, cwd=directory, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env,
+            start_new_session=os.name == "posix",
+        )
+    except OSError:
+        raise InstallFailure(f"{phase} could not start. Check Python and setup permissions.") from None
+    try:
+        returncode = child.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+        stop_install_stage(child)
+        if isinstance(error, KeyboardInterrupt):
+            raise
+        raise InstallFailure(f"{phase} timed out. Check your connection and retry setup.") from None
+    if returncode:
+        raise InstallFailure(
+            f"{phase} failed (exit code {returncode}). "
+            "Check Python, write permissions, and access to your package index before retrying."
+        )
+
+
+def stop_install_stage(child):
+    if os.name == "posix":
+        # The stage was started in its own session and has not been reaped.
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif os.name == "nt" and child.poll() is None and os.environ.get("SystemRoot"):
+        try:
+            taskkill = Path(os.environ["SystemRoot"]) / "System32" / "taskkill.exe"
+            subprocess.run(
+                [str(taskkill), "/PID", str(child.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    child.kill()
+    child.wait()
+
+
+@contextmanager
+def install_lock(directory: Path):
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (directory / "install.lock").open("a+b") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise InstallFailure("Could not lock the runtime for setup. Close any other setup and retry.") from None
+        yield
+
+
+def require_settings_unchanged(directory: Path, expected: tuple[Path | None, dict[str, str]] | None) -> None:
+    if expected is None:
+        return
+    error = "The saved settings changed during setup. Run setup again to review them."
+    try:
+        current = installed_settings(directory / "settings.json")
     except (OSError, ValueError):
-        print("Previous installer settings could not be read. Enter your ComfyUI settings again.")
-        previous = {}
-    default_root = os.environ.get("COMFY_ROOT") or previous.get("COMFY_ROOT") or str(Path.home() / "ComfyUI")
-    default_url = os.environ.get("COMFY_URL") or previous.get("COMFY_URL") or DEFAULT_URL
+        raise InstallFailure(error) from None
+    if current != expected:
+        raise InstallFailure(error)
+
+
+def install_runtime(
+    directory: Path, settings: dict[str, str], *, expected: tuple[Path | None, dict[str, str]] | None = None,
+) -> None:
+    with install_lock(directory):
+        require_settings_unchanged(directory, expected)
+        stage_runtime(directory, settings, expected=expected)
+
+
+def stage_runtime(
+    directory: Path, settings: dict[str, str], *, expected: tuple[Path | None, dict[str, str]] | None,
+) -> None:
+    port = configured_mcp_port(directory)
+    staging = Path(tempfile.mkdtemp(prefix=RUNTIME_PREFIX, dir=directory))
+    activated = False
     try:
-        default_url = backend_url(default_url)
-    except ValueError:
-        print("The configured ComfyUI address is not a valid loopback URL. Enter a new address.")
-        default_url = DEFAULT_URL
+        for filename in RUNTIME_FILES:
+            shutil.copyfile(PROJECT_ROOT / filename, staging / filename)
+        python = str(venv_python(staging))
+        print("Preparing a fresh Python environment.")
+        run_install_stage(
+            [sys.executable, "-m", "venv", str(staging / ".venv")],
+            staging, "Python environment creation", 120,
+        )
+        print("Installing Python dependencies.")
+        run_install_stage(
+            [python, "-m", "pip", "--disable-pip-version-check", "--no-input", "install",
+             "--timeout", "20", "--retries", "1", "-r", str(staging / "requirements.txt")],
+            staging, "Dependency installation", 600,
+        )
+        print("Checking the staged Render Bridge runtime.")
+        run_install_stage(
+            [python, "-m", "pip", "--disable-pip-version-check", "check"],
+            staging, "Dependency verification", 45,
+        )
+        with tempfile.TemporaryDirectory(prefix=".smoke-", dir=staging) as smoke:
+            run_install_stage(
+                [python, str(staging / "comfy_mcp_server.py"), "--help"],
+                staging, "Render Bridge startup check", 30,
+                {**os.environ, "COMFY_MCP_DATA_DIR": smoke, "MCP_PORT": str(port),
+                 "MCP_TOKEN_FILE": str(Path(smoke) / "token.txt"),
+                 "PAUSE_FLAG": str(Path(smoke) / GAMING_MODE_FLAG)},
+            )
+        require_settings_unchanged(directory, expected)
+        save_settings(staging / "settings.json", settings)
+        if port != DEFAULT_MCP_PORT:
+            atomic_text(directory / MCP_PORT_FILE, f"{port}\n")
+        atomic_text(directory / ACTIVE_RUNTIME, staging.name)
+        activated = True
+    finally:
+        if not activated:
+            try:
+                selected = active_runtime(directory)
+            except (OSError, ValueError):
+                # Leave this copy intact if setup cannot confirm the pointer state.
+                selected = staging
+            if selected != staging:
+                shutil.rmtree(staging, ignore_errors=True)
+
+
+def install(settings_path: Path, config_path: Path | None = None) -> int:
+    try:
+        baseline = installed_settings(settings_path)
+    except (OSError, ValueError):
+        print("The saved settings could not be read. Check the active installation before retrying setup.")
+        return 1
+    try:
+        supplied = portable_settings(config_path) if config_path is not None else {}
+    except (OSError, ValueError, RuntimeError) as error:
+        message = str(error) if isinstance(error, ValueError) else "The supplied config could not be read."
+        print(message)
+        return 1
+    _, previous = baseline
+    settings = {**supplied, **previous}
     print("Render Bridge setup")
     print(f"Install ComfyUI first if you need it. {COMFY_INSTALL}")
-    root = prompt_for("ComfyUI directory", default_root, comfy_root)
-    url = prompt_for("ComfyUI API URL", default_url, backend_url)
+    overrides = {}
+    try:
+        for key in sorted(OPTIONAL_FOLDERS):
+            if value := settings.get(key) or os.environ.get(key, "").strip():
+                folder = Path(value).expanduser().resolve()
+                if not folder.is_dir():
+                    raise ValueError(f"{key} must point to an existing directory. Check the setting and retry.")
+                overrides[key] = str(folder)
+        if "COMFY_ROOT" in settings:
+            root = comfy_root(settings["COMFY_ROOT"], overrides)
+        else:
+            default_root = os.environ.get("COMFY_ROOT") or str(Path.home() / "ComfyUI")
+            root = prompt_for("ComfyUI directory", default_root, lambda value: comfy_root(value, overrides))
+        if "COMFY_URL" in settings:
+            url = backend_url(settings["COMFY_URL"])
+        else:
+            try:
+                default_url = backend_url(os.environ.get("COMFY_URL") or DEFAULT_URL)
+            except ValueError:
+                print("The configured ComfyUI address is not a valid loopback URL. Enter a new address.")
+                default_url = DEFAULT_URL
+            url = prompt_for("ComfyUI API URL", default_url, backend_url)
+    except (OSError, ValueError, RuntimeError) as error:
+        print(str(error) if isinstance(error, ValueError) else "A configured ComfyUI directory could not be read.")
+        return 1
+
+    print(f"Render Bridge installation: {settings_path.parent}")
+    print(f"ComfyUI directory: {root}")
+    print(f"ComfyUI API URL: {url}")
+    if "PAUSE_FLAG" in settings:
+        overrides["PAUSE_FLAG"] = settings["PAUSE_FLAG"]
+        print(f"Gaming Mode flag: {settings['PAUSE_FLAG']}")
+    for kind in ("input", "output"):
+        folder = overrides.get(f"COMFY_{kind.upper()}_DIR") or root / kind
+        print(f"ComfyUI {kind} folder: {folder}")
     while True:
         print("Checking the local ComfyUI API and its model loaders.")
         models = probe_backend(url)
@@ -185,28 +537,13 @@ def install(settings_path: Path) -> int:
             print("Continuing setup. Start ComfyUI before using Render Bridge tools.")
             break
     print(f"For model installation and preset requirements, see docs/pipelines.md in this checkout. {MODEL_GUIDE}")
-    if input("Create or reuse .venv and install dependencies? [y/N] ").strip().lower() not in {"y", "yes"}:
+    if input("Prepare and activate a verified Render Bridge runtime? [y/N] ").strip().lower() not in {"y", "yes"}:
         print("Setup cancelled.")
         return 0
 
-    python = venv_python()
-    requirements = PROJECT_ROOT / "requirements.txt"
-    if not requirements.is_file():
-        print("requirements.txt is missing. Run setup from a complete Render Bridge checkout.", file=sys.stderr)
-        return 1
-    if not python.is_file():
-        print("Creating the Render Bridge virtual environment.")
-        if quiet_run([sys.executable, "-m", "venv", str(PROJECT_ROOT / ".venv")]) != 0:
-            print("Could not create .venv. Check your Python installation and repository permissions.", file=sys.stderr)
-            return 1
-    if quiet_run([str(python), "-c", f"import sys; sys.exit(sys.version_info < {MINIMUM_PYTHON!r})"]) != 0:
-        print("The virtual environment needs Python 3.11 or newer. Move the old .venv aside and rerun setup.", file=sys.stderr)
-        return 1
-    print("Installing the Python requirements. This may take a minute.")
-    if quiet_run([str(python), "-m", "pip", "--disable-pip-version-check", "--no-input", "install", "-r", str(requirements)]) != 0:
-        print("Dependency installation failed. Check your Python package index and connection, then rerun setup.", file=sys.stderr)
-        return 1
-    save_settings(settings_path, {"COMFY_ROOT": str(root), "COMFY_URL": url})
+    install_runtime(settings_path.parent, {
+        "COMFY_ROOT": str(root), "COMFY_URL": url, **overrides,
+    }, expected=baseline)
     token = Path(os.environ.get("MCP_TOKEN_FILE") or settings_path.parent / "token.txt").expanduser()
     if not token.is_absolute():
         token = PROJECT_ROOT / token
@@ -216,54 +553,119 @@ def install(settings_path: Path) -> int:
     return 0
 
 
+def attach_only(directory: Path) -> bool:
+    try:
+        (directory / ATTACH_ONLY).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable marker cannot authorize starting a listener.
+        pass
+    return True
+
+
 def launch(settings_path: Path, server_args: list[str]) -> int:
-    python = venv_python()
-    if not python.is_file():
-        print("Run setup_render_bridge.py install to create the Render Bridge virtual environment.", file=sys.stderr)
+    if not server_args and attach_only(settings_path.parent):
+        print("Use the external server's own launcher to manage it.", file=sys.stderr)
         return 1
     try:
-        settings = load_settings(settings_path)
+        # A copied start command points to its verified generation. Keep it
+        # usable as a fallback if a later install is unsuitable. Controls such
+        # as Gaming Mode still use the current generation and shared state.
+        if (not server_args and PROJECT_ROOT.parent == settings_path.parent
+                and PROJECT_ROOT.name.startswith(RUNTIME_PREFIX)):
+            selected = PROJECT_ROOT
+        else:
+            selected = active_runtime(settings_path.parent)
+        runtime = selected or PROJECT_ROOT
+        settings = load_settings(runtime_settings(settings_path, selected))
         if not settings:
             raise ValueError("Missing setup settings.")
     except (OSError, ValueError):
         print("Run setup_render_bridge.py install to save the ComfyUI connection settings.", file=sys.stderr)
         return 1
+    python = venv_python(runtime)
+    if not python.is_file():
+        print("Run setup_render_bridge.py install to create the Render Bridge virtual environment.", file=sys.stderr)
+        return 1
     try:
         settings["COMFY_URL"] = backend_url(settings["COMFY_URL"])
         root = settings["COMFY_ROOT"]
-        settings["COMFY_ROOT"] = str(Path(root).expanduser().resolve() if server_args else comfy_root(root))
+        settings["COMFY_ROOT"] = str(Path(root).expanduser().resolve())
+        for kind in ("input", "output"):
+            key = f"COMFY_{kind.upper()}_DIR"
+            folder = Path(settings[key]).expanduser().resolve() if key in settings else Path(settings["COMFY_ROOT"]) / kind
+            if not server_args and not folder.is_dir():
+                raise ValueError("Missing ComfyUI directory.")
+            settings[key] = str(folder)
     except (OSError, ValueError):
         print("The saved ComfyUI directory or URL is invalid. Rerun setup.", file=sys.stderr)
         return 1
-    env = {**os.environ, **settings, "COMFY_MCP_DATA_DIR": str(settings_path.parent)}
-    server = PROJECT_ROOT / "comfy_mcp_server.py"
-    return subprocess.run([str(python), str(server), *server_args], check=False, cwd=PROJECT_ROOT, env=env).returncode
+    try:
+        port = configured_mcp_port(settings_path.parent)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except OSError:
+        print("The saved Render Bridge MCP port could not be read.", file=sys.stderr)
+        return 1
+    env = {**os.environ, **settings, "COMFY_MCP_DATA_DIR": str(settings_path.parent), "MCP_PORT": str(port)}
+    if (pause_flag := os.environ.get("PAUSE_FLAG")) is not None:
+        env["PAUSE_FLAG"] = pause_flag
+    if env.get("MCP_TOKEN_FILE"):
+        token = Path(env["MCP_TOKEN_FILE"]).expanduser()
+        if not token.is_absolute():
+            env["MCP_TOKEN_FILE"] = str(PROJECT_ROOT / token)
+    server = runtime / "comfy_mcp_server.py"
+    return subprocess.run([str(python), str(server), *server_args], check=False, cwd=runtime, env=env).returncode
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install, start, or control a local Render Bridge server.")
+    parser.add_argument("--data-dir", type=Path, help="Use the selected Render Bridge installation data directory.")
     commands = parser.add_subparsers(dest="command")
-    commands.add_parser("install", help="Run guided setup (the default).")
+    installer = commands.add_parser("install", help="Run guided setup (the default).")
+    installer.add_argument("--config", type=Path, help="Fill missing ComfyUI settings from a local JSON file.")
     commands.add_parser("start", help="Run the configured server in the foreground.")
+    rotate = commands.add_parser("rotate-token", help="Rotate the token after stopping the server.")
+    rotate.add_argument("--confirm", action="store_true", help="Confirm that all clients must reconnect.")
     gaming = commands.add_parser("gaming-mode", help="Pause or resume work through the configured server.")
-    gaming.add_argument("state", choices=("on", "off", "status"))
+    gaming.add_argument("state", choices=("on", "off", "status", "toggle"))
+    gaming.add_argument("--wait", action="store_true", help="Keep the shortcut's terminal open until Enter.")
     args = parser.parse_args(argv)
     if sys.version_info < MINIMUM_PYTHON:
         print("Render Bridge setup requires Python 3.11 or newer.", file=sys.stderr)
         return 1
     try:
-        settings_path = data_dir() / "settings.json"
+        settings_path = (args.data_dir.expanduser().resolve() if args.data_dir else data_dir()) / "settings.json"
         if args.command in {None, "install"}:
-            return install(settings_path)
+            return install(settings_path, getattr(args, "config", None))
+        if args.command == "rotate-token":
+            if not args.confirm:
+                print("Stop Render Bridge, then run rotate-token --confirm. Existing clients must reconnect.")
+                return 1
+            return launch(settings_path, ["rotate-token"])
         server_args = ["gaming-mode", args.state] if args.command == "gaming-mode" else []
-        return launch(settings_path, server_args)
+        result = launch(settings_path, server_args)
+        if args.command == "gaming-mode" and args.wait and sys.stdin.isatty():
+            try:
+                input("Press Enter to close this Gaming Mode window.")
+            except EOFError:
+                pass
+        return result
     except (EOFError, KeyboardInterrupt):
         print("\nRender Bridge command stopped.", file=sys.stderr)
         return 130
-    except (OSError, RuntimeError):
+    except InstallFailure as error:
+        print(error, file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError) as error:
+        if isinstance(error, RuntimeError):
+            record_crash("terminal-installer", error)
         print("A local file or process could not be accessed. Check the setup paths and permissions.", file=sys.stderr)
         return 1
 
 
 if __name__ == "__main__":
+    enable_crash_reports("terminal-installer")
     sys.exit(main())

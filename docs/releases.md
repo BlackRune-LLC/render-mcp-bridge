@@ -1,0 +1,66 @@
+# Installer releases
+
+Build the wizard on the target platform with the pinned Cargo lockfile. Run the tests on that exact revision before packaging. Verify that the setup app opens on a clean user profile before Python, ComfyUI, or an agent client is installed. Follow the [first-time prerequisites](../README.md#first-time-prerequisites) to complete the smoke test.
+
+Set the release version in `installer/Cargo.toml` and refresh the lockfile and [changelog](../CHANGELOG.md). Update the version fields in `installer/assets/render-bridge.rc` and regenerate `render-bridge.res` from that directory with the Windows SDK command `rc /nologo /fo render-bridge.res render-bridge.rc`. The Windows build checks the executable version and product fields. [Windows version resources](https://learn.microsoft.com/en-us/windows/win32/menurc/versioninfo-resource)
+
+Inspect the source archive for the exact release commit. The public root `AGENTS.md` guides users' agents. Check that the archive excludes internal agent instructions, `.agents`, `.claude`, `.codex`, local settings, and credentials.
+
+```sh
+cargo test --locked --manifest-path installer/Cargo.toml -- --include-ignored
+python -m pip install -r requirements.txt
+python -B -m unittest discover
+```
+
+Run the Python commands inside an isolated virtual environment. Have the clean-machine check cover missing prerequisite guidance, detection after installation, instance selection, fresh install, an interrupted upgrade, and **Start & Verify**. Check the full upgrade path from v0.1.0 using its existing data directory and confirm that setup preserves the token. Choose **Open Render Bridge** from the wizard and check the optional Gaming Mode shortcut separately. Confirm that **Keep Bridge running** cancels a stop request and that the app asks before stopping when work is active or the queue is unavailable. Use a simulated ComfyUI backend for the connection and installer checks.
+
+Verify generation on a clean render host with a supported GPU and an actual MCP client. Start without weights and confirm that setup distinguishes a live connection from missing model files. Install the approved weights and nodes. Generate one 512 × 512 PNG with `generate_image`, one playable MP4 with the catalog's Wan Animate 2 pack and `animate_from_clip`, and one importable GLB with `image_to_3d`. Use a character image and a short driving clip for the video test. Open each file from its signed link on the client device. Record the installer version and SHA-256, ComfyUI version, GPU, model choices, and results. [First-render walkthrough](../README.md#make-your-first-render)
+
+Exercise **Models** in setup and after installation. Check inventory against the active backend, download across separate registered model folders, and verify the free-space check for each destination drive. Pause and resume a transfer and confirm its final size and checksum. Use **Verify installed files** on a deliberately damaged copy and confirm that repair keeps the original as a backup. Verify that the library refreshes and the same ComfyUI build reports the new weights.
+
+On Windows, check the candidate with Comfy Desktop and Portable separately. From **Connect**, start and verify the server, connect an actual agent, and select **Finish and keep running**. Confirm the agent can still retrieve an output after the wizard closes. Check that **Start & Verify** rejects listeners with a different installation token, backend address, or asset folders. Verify that an existing terminal-launched server with matching settings stays available and setup shows **Finish setup**.
+
+After installing dependencies, disconnect internet access and verify local startup, MCP authentication, queue status, and a file transfer against a simulated ComfyUI backend. Repeat the terminal check with an HTTP proxy configured and confirm the local backend still receives the requests directly. From a clean profile, check that opening the app and leaving it idle creates no internet requests from Render Bridge. Check intentional downloads and Update separately against the [privacy disclosure](../PRIVACY.md).
+
+## Windows x64
+
+Run `./installer/build-windows.ps1` from PowerShell to build the release executable with the Visual C++ runtime linked statically. Find it at `installer/target/x86_64-pc-windows-msvc/release/render-bridge-setup.exe`. Open it on a clean Windows system before adding a separate Visual C++ redistributable for other software. Check that declining the administrator request leaves the manual Python link available. Then approve the WinGet install and verify the wizard can detect Python.
+
+Check the compact panel on that Windows profile with the optional Gaming Mode shortcut left off.
+
+1. Open the panel using **Open Render Bridge** on **Connect** and the per-user **Render Bridge** entry in Windows Start. Confirm both open the same panel for the selected local ComfyUI build.
+2. In **Jobs**, check running, queued, idle, and unavailable queue states. At the minimum Jobs window width, check that the title and actions fit. Supply a progress event for a running job and verify the step and percentage for the current node. Confirm that 100% for a node still shows the job as running until the queue reports completion. On first launch verify the Dark default. Open **Settings** and check that the separate window fits the display and that Appearance, Storage, Advanced, and Diagnostics are reachable at high scaling. Verify that **Done** is always reachable and closing Settings leaves Jobs open. Choose **Light**, then reopen the panel to verify the preference is saved. Check the layout and both Gaming Mode states in each theme. Choose **System** and confirm that the panel follows Windows appearance.
+3. Use **Start server** to start a Render Bridge session from the panel. Once the panel confirms it is running, verify that the muted **Start server** button can still be clicked and keeps the existing session. Use the red **Stop server** button to review the queue, cancel once, and then confirm. Verify that the stop applies to the panel's session and that ComfyUI continues running. In a separate check, start Render Bridge in a terminal first and verify that the panel leaves it running.
+4. Hide the panel to the Windows notification area and reopen it from the icon. Enable **Start hidden when I sign in**, sign out and back in, and confirm the panel starts in the notification area. Disable the setting and repeat sign-in to confirm the change.
+5. Select **Update** with an eligible newer stable release available, with the installed version current, and with the release service unavailable. Verify that the panel offers **Open GitHub download**, confirms the current version, or shows a retryable error. From a local preview with the same version number as the published installer, verify that the panel offers the release when its executable checksum differs. Check that the request starts on click and sends only information needed to retrieve public release metadata.
+6. Follow the [manual Windows update steps](../README.md#update-manually-on-windows). Confirm the existing installation keeps its data folder, saved settings, token, and sign-in preference. Reopen from Start and verify the new version and agent connection. Check that **Install signed build** rejects the same unsigned installer and leaves the existing installation usable.
+7. Verify that the signed-install action protects running and queued jobs and checks its own server session before replacing files. Cancel a signed installer download while it is in progress. Check that the transfer stops and the installer does not launch. Check that independently launched Render Bridge and ComfyUI processes keep running.
+8. Install into a custom directory. Exit the tray, stop its Bridge server, and repair in place after removing a runtime program file in the clean test profile. Uninstall from a standalone copy of the wizard. Verify it removes its owned app files and matching shortcuts, preserves user settings and assets, and can reinstall in the same directory.
+
+### Test on a clean Windows PC
+
+Share the release installer and checksum with the tester. Ask them to confirm the SHA-256 before opening the file. Test a fresh profile and a separate profile with v0.1.0 installed so the upgrade can be verified independently.
+
+1. **Fresh install.** On Windows x64 without Python, ComfyUI, or an agent already installed, follow the [first-time prerequisites](../README.md#first-time-prerequisites). Run the wizard, start the local ComfyUI build, and connect an agent. Close setup with **Finish and keep running**. Reopen the tray panel and confirm the agent can still reach Render Bridge.
+2. **In-place upgrade.** Stop Render Bridge and exit its tray app if present. Run the same release installer, select the existing ComfyUI build and Render Bridge installation folder, then choose **Install Render Bridge**. Check the installed version, settings, and agent connection. [Windows update steps](../README.md#update-manually-on-windows)
+3. **Report the result.** Include the Windows and Render Bridge versions, ComfyUI type and version, the install or upgrade step, and what happened. If a step fails, include the exact error or a redacted screenshot. Keep tokens, private paths, and raw logs out of public feedback.
+
+### Package the release
+
+Build from the source commit intended for release. Pass `-DocsCommit (git rev-parse HEAD)` to `./installer/build-windows.ps1` so the installer opens guides from that commit. Make the source commit available in the public repository before sharing the installer.
+
+Copy the release installer to `RenderBridgeSetup.exe` and calculate its checksum. The clean PC checks use those same executable bytes.
+
+```powershell
+Get-FileHash -Algorithm SHA256 RenderBridgeSetup.exe
+```
+
+Create a draft GitHub release and attach the unsigned executable, its checksum, and third-party notices. Label the installer unsigned in the release notes. Verify that the draft installer matches the file tested on the clean Windows PC, and check every draft asset before publishing. GitHub locks the release tag and assets on publication. After publishing, verify that the [latest release](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/latest) and [stable installer link](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/latest/download/RenderBridgeSetup.exe) point to the new version. [GitHub immutable releases](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes)
+
+## macOS and Linux
+
+Run `cargo build --release --locked --manifest-path installer/Cargo.toml` on the target platform.
+
+Build on Apple silicon macOS and test the packaged app from Finder and Terminal. Verify the optional `.command` shortcut and wizard-owned process shutdown. Use Developer ID signing and notarization for a public macOS download. [Apple distribution guidance](https://developer.apple.com/developer-id/)
+
+Build the Linux x64 installer against the oldest distribution you plan to support. Test startup, the folder chooser, the application-menu shortcut, and shutdown in a normal desktop session. Record the distro, display session, and runtime-library requirements with the asset. Include a checksum and third-party notices.
