@@ -4001,6 +4001,7 @@ fn attached_connect(ui: &mut Ui, online: Option<bool>, copied: &mut Option<&'sta
             tone,
         );
         ui.horizontal_wrapped(|ui| {
+            ui.label(theme::strong(ConnectClient::Other.label(), 14.0));
             *copied = copy_agent_prompt(ui, None, ConnectClient::Other, true).or(*copied);
             ui.hyperlink_to("Manual setup", CLIENT_GUIDE);
         });
@@ -4892,6 +4893,65 @@ fn startup_setting(mode: &LaunchMode) -> Option<StartupSetting> {
 mod launch_tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn attached_connect_copies_the_generic_agent_prompt() {
+        use egui::accesskit::{Action, ActionRequest, Role};
+
+        let ctx = egui::Context::default();
+        theme::configure_for(&ctx, egui::ThemePreference::Dark, None);
+        ctx.enable_accesskit();
+        let mut copied = None;
+        let frame = |copied: &mut Option<&'static str>, input| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    attached_connect(ui, Some(true), copied);
+                });
+            })
+        };
+        let output = frame(&mut copied, egui::RawInput::default());
+        let tree = output.platform_output.accesskit_update.unwrap();
+        assert!(
+            tree.nodes.iter().any(|(_, node)| {
+                node.role() == Role::Label && node.value() == Some("Any agent")
+            })
+        );
+        let (target, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == Role::Button
+                    && node.label() == Some("Copy agent setup prompt")
+                    && node.supports_action(Action::Click)
+                    && !node.is_disabled()
+            })
+            .expect("attached Connect should have an enabled copy button");
+
+        let output = frame(
+            &mut copied,
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Click,
+                    target: *target,
+                    data: None,
+                })],
+                ..Default::default()
+            },
+        );
+        let prompt = output
+            .platform_output
+            .commands
+            .into_iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(prompt) => Some(prompt),
+                _ => None,
+            })
+            .expect("copy button should emit text through egui");
+        assert_eq!(prompt, agent_setup_prompt(None, ConnectClient::Other));
+        assert!(prompt.contains("[MCP URL reachable from this client]"));
+        assert!(prompt.contains("[private token file path or secret name on this device]"));
+        assert!(copied.is_some());
+    }
 
     #[test]
     fn any_agent_setup_prompt_uses_the_selected_local_installation() {
