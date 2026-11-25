@@ -1086,9 +1086,9 @@ enum ConnectTarget {
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum ConnectClient {
-    #[default]
     Codex,
     Claude,
+    #[default]
     Other,
 }
 
@@ -1102,7 +1102,7 @@ impl ConnectClient {
     }
 
     fn label(self) -> &'static str {
-        self.verifier().map_or("Other clients", Client::label)
+        self.verifier().map_or("Any agent", Client::label)
     }
 
     fn guide(self) -> &'static str {
@@ -1286,8 +1286,8 @@ impl Installer {
             first_render: first_render::FirstRender::default(),
             #[cfg(windows)]
             finish_requested: false,
-            verify_claude: true,
-            verify_codex: true,
+            verify_claude: false,
+            verify_codex: false,
             codex_profile: String::new(),
             queue_dialog: None,
             controls: None,
@@ -2715,16 +2715,15 @@ impl Installer {
                     });
                 });
             }
+            if self.connect_client == ConnectClient::Other {
+                caption(
+                    ui,
+                    "Use OpenCode, Gemini CLI, Antigravity, or another agent with authenticated Streamable HTTP.",
+                );
+            }
             ui.horizontal_wrapped(|ui| {
-                if primary(ui, "Copy agent setup prompt", true).clicked() {
-                    let preface = match self.connect_client {
-                        ConnectClient::Other => String::new(),
-                        client => format!("Use {} as my MCP client.\n\n", client.label()),
-                    };
-                    ui.ctx().copy_text(preface + &agent_setup_prompt(installed));
-                    self.copied =
-                        Some("Setup prompt copied. Paste it into your agent on this computer.");
-                }
+                self.copied = copy_agent_prompt(ui, Some(installed), self.connect_client, true)
+                    .or(self.copied);
                 ui.hyperlink_to("Manual setup", self.connect_client.guide());
             });
             ui.separator();
@@ -2745,8 +2744,13 @@ impl Installer {
                 caption(ui, message);
             }
             ui.separator();
+            let verify_hint = if self.connect_client.verifier().is_some() {
+                "Verify the server and the selected client settings."
+            } else {
+                "Verify Render Bridge and its ComfyUI folders. Check the connection from your agent."
+            };
             if monitor_button(ui, "Start & Verify", idle, SURFACE)
-                .on_hover_text("Verify the running server and the selected client settings")
+                .on_hover_text(verify_hint)
                 .clicked()
             {
                 self.start_or_verify_panel(ui.ctx(), true, true);
@@ -2852,9 +2856,13 @@ impl Installer {
             }
             caption(
                 ui,
-                "Store the bearer token in the client device's private credential settings, then verify with server_status.",
+                "Use the address reachable by your agent and provision the token in that device's private settings.",
             );
-            ui.hyperlink_to("Set up access from another device", REMOTE_GUIDE);
+            ui.horizontal_wrapped(|ui| {
+                self.copied =
+                    copy_agent_prompt(ui, None, ConnectClient::Other, true).or(self.copied);
+                ui.hyperlink_to("Set up access from another device", REMOTE_GUIDE);
+            });
             if let Some(message) = self.copied {
                 caption(ui, message);
             }
@@ -3050,7 +3058,7 @@ impl Installer {
             } else if server_verified {
                 "Render Bridge and its ComfyUI folders are verified. Try a first render from your agent."
             } else {
-                "Start Render Bridge and check the agent you want to connect."
+                "Start Render Bridge and copy the setup prompt into your agent."
             },
         );
         let Some(installed) = self.installed.clone() else {
@@ -3063,7 +3071,13 @@ impl Installer {
         let idle = self.worker.is_none();
         let mut selection_changed = false;
         card(ui, |ui| {
-            field_label(ui, "Clients to verify");
+            caption(
+                ui,
+                "Paste the setup prompt into any client with authenticated Streamable HTTP.",
+            );
+            copied = copy_agent_prompt(ui, Some(&installed), ConnectClient::Other, idle).or(copied);
+            ui.separator();
+            field_label(ui, "Optional client checks");
             ui.horizontal_wrapped(|ui| {
                 for (label, selected) in [
                     ("Codex", &mut self.verify_codex),
@@ -3075,7 +3089,6 @@ impl Installer {
                     }
                 }
             });
-            copied = copy_agent_prompt(ui, &installed, idle).or(copied);
             if self.verify_claude || self.verify_codex {
                 ui.collapsing("Client paths and profiles", |ui| {
                     for (client, selected) in [
@@ -4623,28 +4636,51 @@ fn model_paths(folder: &Path) -> String {
     )
 }
 
-fn copy_agent_prompt(ui: &mut Ui, installed: &Installed, enabled: bool) -> Option<&'static str> {
-    if primary(ui, "Copy setup prompt", enabled).clicked() {
-        ui.ctx().copy_text(agent_setup_prompt(installed));
-        Some("Prompt copied. Paste it into your agent on this computer.")
+fn copy_agent_prompt(
+    ui: &mut Ui,
+    installed: Option<&Installed>,
+    client: ConnectClient,
+    enabled: bool,
+) -> Option<&'static str> {
+    if primary(ui, "Copy agent setup prompt", enabled).clicked() {
+        ui.ctx().copy_text(agent_setup_prompt(installed, client));
+        Some("Prompt copied. Paste it into your agent and supply any missing connection details.")
     } else {
         None
     }
 }
 
-fn agent_setup_prompt(installed: &Installed) -> String {
+fn agent_setup_prompt(installed: Option<&Installed>, client: ConnectClient) -> String {
+    let (client_instruction, new_name) = match client.verifier() {
+        Some(client) => (
+            format!("Use {} as my MCP client.\n\n", client.label()),
+            "render_bridge",
+        ),
+        None => (String::new(), "render-bridge"),
+    };
+    let (details, next) = if let Some(installed) = installed {
+        (
+            format!(
+                "MCP URL: {}\nPrivate token file on this computer: {}",
+                installed.mcp_url,
+                installed.token_path.display(),
+            ),
+            "If Render Bridge is offline or the token file has not been created, ask me to start it from Jobs or Setup.",
+        )
+    } else {
+        (
+            "MCP URL: [MCP URL reachable from this client]\nPrivate credential: [private token file path or secret name on this device]".into(),
+            "Ask me for any missing address or private credential reference. Use the address from the environment where this client runs, including its private network or SSH tunnel when applicable.",
+        )
+    };
     format!(
-        "Connect this MCP client to my installed Render Bridge server on this computer.\n\n\
-         Server name: render_bridge\n\
-         Transport: Streamable HTTP\n\
-         MCP URL: {}\n\
-         Private token file: {}\n\n\
-         Use the active client's user settings and keep existing entries. Ask me first if the client requires permission to edit its configuration. If an entry already uses this name, check it before changing it. Use the private token file for bearer authentication, preferably with the client's secret storage or a private environment variable. Keep the token out of chat, logs, command-line arguments, and project files.\n\n\
-         If the server is offline or the token file is missing, ask me to click Start server in the Jobs panel or Start & Verify in Setup. After configuring it, initialize the connection, list its tools, and call server_status before submitting any jobs. If MCP settings load only at startup, tell me to start a fresh session and verify there.\n\n\
+        "{client_instruction}Connect my agent to the existing Render Bridge server using Streamable HTTP and bearer authentication.\n\n\
+         {details}\n\n\
+         Use this client's documented user-level MCP settings. If the client lacks support for authenticated Streamable HTTP, tell me what is needed. Reuse a server entry that matches this URL. For a new entry, use a compatible name such as {new_name}. Ask before changing an entry that points to a different server. Preserve my other settings and request permission if the client requires it.\n\n\
+         Supply the bearer token through the client's authentication field or its Authorization: Bearer header. Prefer a secret manager or private environment variable when supported. Keep the token out of chat, logs, command-line arguments, and project files. {next}\n\n\
+         Verify the connection by calling the read-only server_status tool. If the client needs to reload its MCP settings, tell me to open a fresh session and repeat that check.\n\n\
          Connection guide: {CLIENT_GUIDE}\n\
-         Agent guide: {AGENT_GUIDE}",
-        installed.mcp_url,
-        installed.token_path.display(),
+         Agent guide: {AGENT_GUIDE}"
     )
 }
 
@@ -4792,6 +4828,40 @@ fn startup_setting(mode: &LaunchMode) -> Option<StartupSetting> {
 mod launch_tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn any_agent_setup_prompt_uses_the_selected_local_installation() {
+        let data = tempfile::tempdir().unwrap();
+        let token_path = data.path().join("private-token.txt");
+        std::fs::write(&token_path, "fixture-token-do-not-copy").unwrap();
+        let installed = Installed {
+            data_dir: data.path().into(),
+            app_dir: data.path().into(),
+            token_path,
+            mcp_url: "http://127.0.0.1:9410/mcp".into(),
+            start_command: String::new(),
+        };
+
+        assert!(matches!(ConnectClient::default(), ConnectClient::Other));
+        let prompt = agent_setup_prompt(Some(&installed), ConnectClient::Other);
+        assert!(prompt.contains("http://127.0.0.1:9410/mcp"));
+        assert!(prompt.contains(installed.token_path.to_str().unwrap()));
+        assert!(prompt.contains("render-bridge"));
+        assert!(prompt.contains("server_status"));
+        assert!(!prompt.contains("fixture-token-do-not-copy"));
+
+        let claude = agent_setup_prompt(Some(&installed), ConnectClient::Claude);
+        assert!(claude.contains("Claude Code"));
+        assert!(claude.contains("render_bridge"));
+
+        let template = agent_setup_prompt(None, ConnectClient::Other);
+        assert!(template.contains("[MCP URL reachable from this client]"));
+        assert!(template.contains("[private token file path or secret name on this device]"));
+        assert!(template.contains("server_status"));
+        assert!(!template.contains("127.0.0.1"));
+        assert!(!template.contains("private-token.txt"));
+        assert!(!template.contains("Start server"));
+    }
 
     #[test]
     fn model_paths_include_the_categories_used_by_animation_and_3d() {

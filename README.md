@@ -40,7 +40,7 @@ Use [ComfyUI Portable for Windows](https://docs.comfy.org/installation/comfyui_p
 
 #### 3. Choose your agent client and first pipeline
 
-Choose a client with authenticated Streamable HTTP support on the device where your agent will run. The connection guide below includes Claude Code, Codex, and VS Code Copilot. Complete any client sign-in in its own app or terminal. You can set up the Bridge and check its connection before downloading models. Before your first render, choose a starter pipeline and download its listed weights. [Client setup](docs/connections.md) · [Starter pipelines](docs/pipelines.md#recommended-first-pipeline) · [Accounts for gated models and hosted nodes](docs/pipelines.md#accounts-and-credentials)
+Choose a client with authenticated Streamable HTTP support on the device where your agent will run. The connection guide includes Claude Code, Codex, VS Code Copilot, OpenCode, Gemini CLI, and Google Antigravity. Complete any client sign-in in its own app or terminal. You can set up the Bridge and check its connection before downloading models. Before your first render, choose a starter pipeline and download its listed weights. [Client setup](docs/connections.md) · [Starter pipelines](docs/pipelines.md#recommended-first-pipeline) · [Accounts for gated models and hosted nodes](docs/pipelines.md#accounts-and-credentials)
 
 ### Desktop installer
 
@@ -186,11 +186,11 @@ If ComfyUI is already set up on the destination computer, reuse a `settings.json
 
 Use an agent client that supports **Streamable HTTP** and a bearer token or custom HTTP header. Render Bridge and ComfyUI run together on the render host. The agent can run on that host or on another device with a network route to Render Bridge.
 
-1. On **Connect** in the current Windows installer, start Render Bridge and select **Copy agent setup prompt**. After installation, use **Connect** in the Render Bridge panel to copy the prompt again. If the server is offline, select **Start server** first. Paste the prompt into the client on the render host.
-2. For terminal setup, use the [copy-and-paste connection prompt](docs/connections.md#paste-a-connection-prompt). For a client on another device, set up its [private connection and credentials](docs/connections.md#connect-from-another-device) first.
-3. Verify with `server_status` in the intended client session. If the client does not reload its MCP configuration, reopen it and run the check there.
+1. On **Connect** in the Windows installer, start Render Bridge and select **Copy agent setup prompt**. After installation, open **Connect** in the Render Bridge panel and use **Copy agent setup prompt** under **Any agent**. If the server is offline, select **Start server** first. Paste the prompt into the client on the render host.
+2. For a client on another device, set up its [private connection and credentials](docs/connections.md#connect-from-another-device) and choose **Another device** in the installed panel. For a remote client, fill in the prompt's reachable MCP URL and private credential reference. For terminal setup, use the [connection prompt for terminal users](docs/connections.md#paste-a-connection-prompt).
+3. Verify with `server_status` in the intended client session. If the client needs to reload its MCP configuration, reopen it and run the check there.
 
-For manual setup, follow the [client examples](docs/connections.md#configure-the-client) for Claude Code, Codex, VS Code Copilot, or another compatible client.
+For manual setup, follow the [client examples](docs/connections.md#configure-the-client). Use the same endpoint and authentication requirements for other compatible clients.
 
 ## Make your first render
 
@@ -233,7 +233,7 @@ Use https://github.com/BlackRune-LLC/render-mcp-bridge and read its README and A
 Reuse an existing checkout if appropriate. Otherwise clone the official repository.
 Check for Python 3.11 or newer with venv support and find my running local ComfyUI build.
 Use setup_render_bridge.py install and setup_render_bridge.py start with py -3 on Windows or python3 on macOS and Linux. Reuse the intended Render Bridge data directory and ComfyUI settings if already configured. Preserve my existing files and client settings.
-Configure a user-scoped render_bridge entry with Streamable HTTP using the saved MCP address and private token file. Keep the token out of chat, logs, and command lines.
+Configure a user-scoped server with Streamable HTTP using the saved MCP address and private token file. Keep the name of an existing entry for this endpoint. For a new entry, pick a name allowed by my client, such as render-bridge. Keep the token out of chat, logs, and command lines.
 Call server_status to verify the MCP connection. If this session cannot reload its settings, tell me to open a fresh session and verify there. Tell me how to start and stop this installation.
 Ask before installing system software, model weights, or nodes, and before submitting a render. Leave administrator prompts and account sign-ins to me.
 ```
