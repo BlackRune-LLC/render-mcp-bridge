@@ -72,23 +72,30 @@ const MARK_SHADE: Color32 = Color32::from_rgb(180, 151, 237);
 const CAUTION: Color32 = Color32::from_rgb(118, 72, 25);
 const ERROR: Color32 = Color32::from_rgb(133, 46, 40);
 
+macro_rules! guide_url {
+    ($path:literal) => {
+        concat!(
+            "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/",
+            env!("RENDER_BRIDGE_DOCS_REF"),
+            "/",
+            $path
+        )
+    };
+}
+
 const COMFY_GUIDE: &str = "https://docs.comfy.org/installation/manual_install";
 const COMFY_DOWNLOAD: &str = "https://comfy.org/download";
 const CLAUDE_SETUP: &str = "https://code.claude.com/docs/en/quickstart";
 const CODEX_SETUP: &str = "https://openai.com/codex/get-started/";
-const MODEL_GUIDE: &str =
-    "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/pipelines.md";
-const CLIENT_GUIDE: &str =
-    "https://github.com/BlackRune-LLC/render-mcp-bridge#connect-an-mcp-client";
-const PRIVACY_GUIDE: &str =
-    "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/PRIVACY.md";
-const REMOTE_GUIDE: &str = "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/connections.md#connect-from-another-device";
+const MODEL_GUIDE: &str = guide_url!("docs/pipelines.md");
+const CLIENT_GUIDE: &str = guide_url!("README.md#connect-an-mcp-client");
+const AGENT_GUIDE: &str = guide_url!("AGENTS.md");
+const PRIVACY_GUIDE: &str = guide_url!("PRIVACY.md");
+const REMOTE_GUIDE: &str = guide_url!("docs/connections.md#connect-from-another-device");
 #[cfg(windows)]
-const SETTINGS_GUIDE: &str =
-    "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/configuration.md";
+const SETTINGS_GUIDE: &str = guide_url!("docs/configuration.md");
 #[cfg(windows)]
-const RELEASE_NOTES: &str =
-    "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/CHANGELOG.md";
+const RELEASE_NOTES: &str = guide_url!("CHANGELOG.md");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -1101,10 +1108,10 @@ impl ConnectClient {
     fn guide(self) -> &'static str {
         match self {
             Self::Codex => {
-                "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/connections.md#codex"
+                guide_url!("docs/connections.md#codex")
             }
             Self::Claude => {
-                "https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/docs/connections.md#claude-code"
+                guide_url!("docs/connections.md#claude-code")
             }
             Self::Other => CLIENT_GUIDE,
         }
@@ -2346,8 +2353,8 @@ impl Installer {
             if paired { GREEN } else { MUTED },
             |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.hyperlink_to("Get Comfy Desktop", COMFY_DOWNLOAD);
-                    ui.hyperlink_to("Manual setup", COMFY_GUIDE);
+                    ui.hyperlink_to("Get Comfy Desktop from Comfy Org", COMFY_DOWNLOAD);
+                    ui.hyperlink_to("ComfyUI manual setup guide", COMFY_GUIDE);
                 });
             },
         );
@@ -2568,8 +2575,8 @@ impl Installer {
             if self.can_continue() && secondary(ui, "Check again", idle).clicked() {
                 self.start_check(ui.ctx());
             }
-            ui.hyperlink_to("Get Comfy Desktop", COMFY_DOWNLOAD);
-            ui.hyperlink_to("Manual ComfyUI setup", COMFY_GUIDE);
+            ui.hyperlink_to("Get Comfy Desktop from Comfy Org", COMFY_DOWNLOAD);
+            ui.hyperlink_to("ComfyUI manual setup guide", COMFY_GUIDE);
             ui.hyperlink_to(
                 "Find your Comfy Desktop port and folders",
                 "https://docs.comfy.org/installation/desktop/usage/instance-management",
@@ -4627,7 +4634,7 @@ fn agent_setup_prompt(installed: &Installed) -> String {
          Use the active client's user settings and keep existing entries. Ask me first if the client requires permission to edit its configuration. If an entry already uses this name, check it before changing it. Use the private token file for bearer authentication, preferably with the client's secret storage or a private environment variable. Keep the token out of chat, logs, command-line arguments, and project files.\n\n\
          If the server is offline or the token file is missing, ask me to click Start server in the Jobs panel or Start & Verify in Setup. After configuring it, initialize the connection, list its tools, and call server_status before submitting any jobs. If MCP settings load only at startup, tell me to start a fresh session and verify there.\n\n\
          Connection guide: {CLIENT_GUIDE}\n\
-         Agent guide: https://github.com/BlackRune-LLC/render-mcp-bridge/blob/main/AGENTS.md",
+         Agent guide: {AGENT_GUIDE}",
         installed.mcp_url,
         installed.token_path.display(),
     )

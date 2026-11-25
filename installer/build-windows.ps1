@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [string]$TargetDirectory = (Join-Path $PSScriptRoot 'target'),
-    [switch]$Offline
+    [switch]$Offline,
+    [ValidatePattern('^[0-9a-f]{40}$')][string]$DocsCommit
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,7 +47,11 @@ if ($Offline) {
 }
 
 $previousFlags = $env:CARGO_ENCODED_RUSTFLAGS
+$previousDocsRef = $env:RENDER_BRIDGE_DOCS_REF
 try {
+    if ($DocsCommit) {
+        $env:RENDER_BRIDGE_DOCS_REF = $DocsCommit
+    }
     $env:CARGO_ENCODED_RUSTFLAGS = $rustFlags -join [char]31
     & cargo.exe @buildArguments
     if ($LASTEXITCODE -ne 0) {
@@ -55,6 +60,7 @@ try {
 }
 finally {
     $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags
+    $env:RENDER_BRIDGE_DOCS_REF = $previousDocsRef
 }
 
 $installer = Get-Item -LiteralPath (Join-Path $TargetDirectory "$target/release/render-bridge-setup.exe")

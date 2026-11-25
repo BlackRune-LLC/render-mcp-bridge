@@ -8,6 +8,16 @@ Render Bridge runs locally and sends no telemetry or crash reports to BlackRune.
 
 [Download for Windows x64 (unsigned)](https://github.com/BlackRune-LLC/render-mcp-bridge/releases/latest/download/RenderBridgeSetup.exe) · [Install from source](#install-from-source) · [Ask your agent to set it up](#ask-your-agent-to-set-it-up) · [Windows control panel](#windows-control-panel) · [Connect an MCP client](#connect-an-mcp-client) · [Set up your first pipeline](docs/pipelines.md#recommended-first-pipeline)
 
+## Why Render Bridge
+
+ComfyUI gives you the visual workflow editor and runs models. Comfy Desktop helps you install and manage ComfyUI instances. Render Bridge lets your agents send rendering jobs to a machine running ComfyUI, either locally or over a trusted private connection.
+
+- **Hand a job to an agent.** Give it a prompt, image, or workflow. It can pick an installed preset, submit a background job, check progress, and retrieve the result.
+- **Move files between the agent and the render host.** Signed upload and download links move inputs and outputs. Project context and asset history stay on the host.
+- **Keep control of the GPU.** Gaming Mode pauses new Render Bridge jobs and can request a model unload when ComfyUI is idle.
+
+Comfy Org also offers agent tools through Comfy MCP. Render Bridge focuses on a self-hosted HTTP endpoint with bearer-token authentication, signed file transfers, project records, and Gaming Mode. [Official Comfy MCP](https://github.com/Comfy-Org/comfy-mcp)
+
 ## Install and run
 
 Start here if Python, ComfyUI, and your agent client are all new to this machine. Render Bridge needs a full Python 3.11 or newer installation with virtual environment support, plus a local ComfyUI build on the same computer. Its standard setup runs without Docker. Allow internet access for the installers, Python packages, and any model weights you choose.

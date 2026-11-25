@@ -47,6 +47,8 @@ Share the release installer and checksum with the tester. Ask them to confirm th
 
 ### Package the release
 
+Build from the source commit intended for release. Pass `-DocsCommit (git rev-parse HEAD)` to `./installer/build-windows.ps1` so the installer opens guides from that commit. Make the source commit available in the public repository before sharing the installer.
+
 Copy the release installer to `RenderBridgeSetup.exe` and calculate its checksum. The clean PC checks use those same executable bytes.
 
 ```powershell

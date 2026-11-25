@@ -2,6 +2,18 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=RENDER_BRIDGE_DOCS_REF");
+    let docs_ref = env::var("RENDER_BRIDGE_DOCS_REF").unwrap_or_else(|_| "main".into());
+    assert!(
+        docs_ref == "main"
+            || (docs_ref.len() == 40 && docs_ref.bytes().all(|b| b.is_ascii_hexdigit())),
+        "The Render Bridge documentation reference must be main or a full Git commit SHA."
+    );
+    println!(
+        "cargo:rustc-env=RENDER_BRIDGE_DOCS_REF={}",
+        docs_ref.to_ascii_lowercase()
+    );
+
     println!("cargo:rerun-if-changed=assets/render-bridge.ico");
     println!("cargo:rerun-if-changed=assets/render-bridge.res");
     println!("cargo:rerun-if-changed=build.rs");
