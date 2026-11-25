@@ -1,12 +1,14 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::setup::{atomic_write, fetch_json, lock_install, loopback_agent, validate_comfy_url};
+
+use crate::workflow_editor::{MAX_WORKFLOW_BYTES, WorkflowEditor};
 
 const REVISION_FILE: &str = "pipeline-revisions.json";
 const REVISION_SCHEMA: u32 = 1;
@@ -233,23 +235,12 @@ pub fn load(data_dir: &Path) -> Result<Vec<Revision>, String> {
     if !data_dir.is_absolute() || !data_dir.is_dir() {
         return Err("Open a Render Bridge installation to save pipeline revisions.".into());
     }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
-    }
     let path = data_dir.join(REVISION_FILE);
-    let file = match options.open(&path) {
+    let file = match open_regular_file(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err(READ_ERROR.into()),
     };
-    if !regular_file(&file, &path) {
-        return Err(READ_ERROR.into());
-    }
     let mut bytes = Vec::new();
     file.take(MAX_REVISION_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -268,23 +259,6 @@ pub fn load(data_dir: &Path) -> Result<Vec<Revision>, String> {
         return Err(INVALID_HISTORY.into());
     }
     Ok(history.revisions)
-}
-
-fn regular_file(file: &File, path: &Path) -> bool {
-    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-        return false;
-    }
-    file.metadata().is_ok_and(|metadata| {
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-                return false;
-            }
-        }
-        metadata.is_file()
-    })
 }
 
 pub fn append(data_dir: &Path, variant: Variant) -> Result<u32, String> {
@@ -307,6 +281,210 @@ pub fn append(data_dir: &Path, variant: Variant) -> Result<u32, String> {
     atomic_write(&data_dir.join(REVISION_FILE), &bytes)
         .map_err(|_| "Could not save the pipeline revision.")?;
     Ok(number)
+}
+
+pub struct SavedPipeline {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+const PIPELINE_DIRECTORY: &str = "pipelines";
+const NEED_INSTALLATION: &str = "Open a Render Bridge installation to manage saved pipelines.";
+const BAD_DIRECTORY: &str =
+    "The saved pipelines folder is unreadable or is not a regular directory.";
+const BAD_NAME: &str = "Start the name with a letter or number. Use up to 64 letters, numbers, spaces, dashes, or underscores.";
+const READ_PIPELINE_ERROR: &str = "Could not open the saved pipeline.";
+
+pub fn catalog(data_dir: &Path) -> Result<Vec<SavedPipeline>, String> {
+    let folder = pipeline_directory(data_dir)?;
+    if !storage_exists(&folder)? {
+        return Ok(Vec::new());
+    }
+
+    let mut pipelines = Vec::new();
+    for entry in fs::read_dir(&folder).map_err(|_| BAD_DIRECTORY)? {
+        let entry = entry.map_err(|_| BAD_DIRECTORY)?;
+        let path = entry.path();
+        if path.extension().and_then(|part| part.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|part| part.to_str()) else {
+            continue;
+        };
+        if !valid_pipeline_name(name) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(BAD_DIRECTORY.into()),
+        };
+        if metadata.is_file() && !is_redirected(&metadata) {
+            pipelines.push(SavedPipeline {
+                name: name.into(),
+                path,
+            });
+        }
+    }
+    pipelines.sort_by_key(|pipeline| pipeline.name.to_ascii_lowercase());
+    Ok(pipelines)
+}
+
+pub fn save_new(
+    data_dir: &Path,
+    name: &str,
+    graph: &WorkflowEditor,
+) -> Result<SavedPipeline, String> {
+    let path = pipeline_path(data_dir, name)?;
+    let folder = pipeline_directory(data_dir)?;
+    let _lock = lock_install(data_dir)?;
+    if !storage_exists(&folder)? {
+        fs::create_dir(&folder).map_err(|_| "Could not create the saved pipelines folder.")?;
+    }
+    if catalog(data_dir)?
+        .iter()
+        .any(|pipeline| pipeline.name.eq_ignore_ascii_case(name))
+    {
+        return Err("A saved pipeline already uses this name. Choose a different name.".into());
+    }
+    graph.export(&path)?;
+    Ok(SavedPipeline {
+        name: name.into(),
+        path,
+    })
+}
+
+pub fn open_saved(data_dir: &Path, name: &str) -> Result<(WorkflowEditor, [u8; 32]), String> {
+    let path = pipeline_path(data_dir, name)?;
+    let bytes = read_saved(&path)?;
+    let mut graph = WorkflowEditor::default();
+    graph.import_json(&bytes)?;
+    Ok((graph, revision_of(&bytes)))
+}
+
+pub fn save_existing(
+    data_dir: &Path,
+    name: &str,
+    graph: &WorkflowEditor,
+    expected_revision: [u8; 32],
+) -> Result<[u8; 32], String> {
+    let path = pipeline_path(data_dir, name)?;
+    let bytes = graph.api_json()?.into_bytes();
+    let _lock = lock_install(data_dir)?;
+    if revision_of(&read_saved(&path)?) != expected_revision {
+        return Err(
+            "This pipeline changed on disk. Reopen it or save your work under a new name.".into(),
+        );
+    }
+    atomic_write(&path, &bytes).map_err(|_| "Could not save the pipeline changes.")?;
+    Ok(revision_of(&bytes))
+}
+
+fn pipeline_directory(data_dir: &Path) -> Result<PathBuf, String> {
+    if !data_dir.is_absolute() || !data_dir.is_dir() {
+        return Err(NEED_INSTALLATION.into());
+    }
+    Ok(data_dir.join(PIPELINE_DIRECTORY))
+}
+
+fn storage_exists(folder: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(folder) {
+        Ok(metadata) if metadata.is_dir() && !is_redirected(&metadata) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        _ => Err(BAD_DIRECTORY.into()),
+    }
+}
+
+fn valid_pipeline_name(name: &str) -> bool {
+    let valid = name.len() <= 64
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && !name.ends_with(' ')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_'));
+    valid
+        && !matches!(
+            name.to_ascii_uppercase().as_bytes(),
+            b"CON"
+                | b"PRN"
+                | b"AUX"
+                | b"NUL"
+                | [b'C', b'O', b'M', b'0'..=b'9']
+                | [b'L', b'P', b'T', b'0'..=b'9']
+        )
+}
+
+fn pipeline_path(data_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    if !valid_pipeline_name(name) {
+        return Err(BAD_NAME.into());
+    }
+    Ok(pipeline_directory(data_dir)?.join(format!("{name}.json")))
+}
+
+fn is_redirected(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn open_regular_file(path: &Path) -> io::Result<File> {
+    let check = |metadata: fs::Metadata| -> io::Result<()> {
+        if metadata.is_file() && !is_redirected(&metadata) {
+            Ok(())
+        } else {
+            Err(io::ErrorKind::InvalidData.into())
+        }
+    };
+    check(fs::symlink_metadata(path)?)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    check(file.metadata()?)?;
+    Ok(file)
+}
+
+fn read_saved(path: &Path) -> Result<Vec<u8>, String> {
+    let folder = path.parent().ok_or(BAD_DIRECTORY)?;
+    if !storage_exists(folder)? {
+        return Err(READ_PIPELINE_ERROR.into());
+    }
+    let file = open_regular_file(path).map_err(|_| READ_PIPELINE_ERROR)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_WORKFLOW_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| READ_PIPELINE_ERROR)?;
+    if bytes.len() as u64 > MAX_WORKFLOW_BYTES {
+        return Err("The saved pipeline exceeds 2 MiB.".into());
+    }
+    Ok(bytes)
+}
+
+fn revision_of(bytes: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut revision = [0; 32];
+    revision.copy_from_slice(digest.as_ref());
+    revision
 }
 
 #[cfg(test)]
@@ -436,6 +614,73 @@ mod tests {
                 None
             );
         }
+    }
+
+    fn sample_workflow(prefix: &str) -> WorkflowEditor {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "1": {"class_type": "EmptyImage", "inputs": {"width": 512, "height": 512}},
+            "2": {"class_type": "SaveImage", "inputs": {
+                "images": ["1", 0],
+                "filename_prefix": prefix
+            }}
+        }))
+        .unwrap();
+        let mut editor = WorkflowEditor::default();
+        editor.import_json(&bytes).unwrap();
+        editor
+    }
+
+    #[test]
+    fn saves_and_reopens_a_named_pipeline_without_overwriting_it() {
+        let fixture = tempfile::tempdir().unwrap();
+        let data = fixture.path();
+        assert!(catalog(data).unwrap().is_empty());
+
+        let original = sample_workflow("First");
+        let saved = save_new(data, "Studio preview", &original).unwrap();
+        assert_eq!(saved.path, data.join("pipelines/Studio preview.json"));
+        assert_eq!(catalog(data).unwrap()[0].name, "Studio preview");
+        let (reopened, _) = open_saved(data, "Studio preview").unwrap();
+        assert_eq!(reopened.nodes()["2"].inputs["filename_prefix"], "First");
+
+        assert!(save_new(data, "Studio preview", &sample_workflow("Replacement")).is_err());
+        assert!(save_new(data, "studio preview", &sample_workflow("Replacement")).is_err());
+        let (reopened, _) = open_saved(data, "Studio preview").unwrap();
+        assert_eq!(reopened.nodes()["2"].inputs["filename_prefix"], "First");
+    }
+
+    #[test]
+    fn updates_a_saved_pipeline_without_overwriting_a_newer_edit() {
+        let fixture = tempfile::tempdir().unwrap();
+        let data = fixture.path();
+        save_new(data, "Preview", &sample_workflow("Original")).unwrap();
+        let (_, stale) = open_saved(data, "Preview").unwrap();
+        let latest = save_existing(data, "Preview", &sample_workflow("Newer"), stale).unwrap();
+
+        assert_ne!(latest, stale);
+        assert!(save_existing(data, "Preview", &sample_workflow("Stale"), stale).is_err());
+        let (reopened, revision) = open_saved(data, "Preview").unwrap();
+        assert_eq!(reopened.nodes()["2"].inputs["filename_prefix"], "Newer");
+        assert_eq!(revision, latest);
+    }
+
+    #[test]
+    fn rejects_unsafe_pipeline_names_and_leaves_the_collection_empty() {
+        let fixture = tempfile::tempdir().unwrap();
+        let data = fixture.path();
+        let graph = sample_workflow("Output");
+        for name in [
+            "",
+            "../outside",
+            "nested/file",
+            "alpha.json",
+            "ends in ",
+            "NUL",
+            "COM1",
+        ] {
+            assert!(save_new(data, name, &graph).is_err(), "{name:?}");
+        }
+        assert!(catalog(data).unwrap().is_empty());
     }
 
     #[test]

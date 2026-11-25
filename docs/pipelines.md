@@ -71,10 +71,10 @@ Open **Nodes** to search the selected build by name, ID, or category. Filter by 
 
 ### Edit a ComfyUI workflow
 
-1. Export the graph from ComfyUI in **API Format**. Open **Pipelines → Workflow editor → Import API JSON** in Render Bridge.
-2. Select **Check dependencies**. Pick a node and an input to see the current value or connection. Choose a model from the files the selected build reports, apply a value, or connect a compatible output in the graph.
-3. Review missing nodes, unsupported inputs, and model changes. Find curated packs under **Models**, or follow the workflow author's instructions for other files. Check dependencies again after adding resources.
-4. Use **Undo** to back out an edit, or **Export copy** to save a new API JSON file. Keep your original file. Ask your connected agent to pass the edited graph to `run_workflow` as a new job.
+1. Export the graph from ComfyUI in **API Format**. In Render Bridge, open **Pipelines → Your pipelines → Add pipeline**, import the JSON, and give the pipeline a name. Choose **Duplicate current** to start another pipeline from the open draft.
+2. Open a saved pipeline from the library. Render Bridge checks the graph against the selected ComfyUI build. Select a node and input to change its value, choose one of its reported models, or connect a compatible output. Use **Check dependencies** to refresh after adding models or nodes.
+3. To start from a model, open **Models → Installed**, select a file, and choose **Use in pipeline**. Open the pipeline you want, choose one of the compatible loader slots, and select **Apply model**. The selected build supplies the choices for that slot.
+4. Select **Save changes** to keep the edits in your local pipeline library. **Undo** reverses the last edit. **Export copy** writes a separate API JSON file. **Copy agent prompt** gives a connected agent the current graph for a new `run_workflow` job.
 
 **Test run** explicitly queues a new job on the selected local ComfyUI instance. The app checks the graph again at submission. Gaming Mode must be off. The test accepts built-in local ComfyUI nodes and requires you to confirm before it runs. Watch queue activity in **Jobs**. Copy the prompt ID to look up this test in ComfyUI. Custom and hosted workflows should be tested in ComfyUI first. Editing or exporting a draft leaves queued and running jobs alone.
 

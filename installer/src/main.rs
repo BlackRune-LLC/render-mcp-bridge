@@ -3575,7 +3575,15 @@ impl Installer {
                                     self.model_manager.show_workspace(
                                         ui, url, controls.model_root.clone(), data_dir,
                                     );
-                                    if self.model_manager.take_pipeline_request() {
+                                    if let Some(request) = self.model_manager.take_pipeline_request() {
+                                        match request {
+                                            model_ui::PipelineRequest::BuiltInWan => self.pipelines.show_builtin(),
+                                            model_ui::PipelineRequest::InstalledModel { category, name } => {
+                                                if let Some(backend) = url {
+                                                    self.pipelines.use_model(backend.to_owned(), category, name);
+                                                }
+                                            }
+                                        }
                                         self.select_workspace(ctx, WorkspaceTab::Pipelines);
                                     }
                                 }

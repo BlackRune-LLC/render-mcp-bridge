@@ -67,7 +67,7 @@ pub struct ModelManager {
     category: Option<String>,
     verification: Option<(&'static str, Verification)>,
     confirm_repair: bool,
-    pipeline_requested: bool,
+    pipeline_request: Option<PipelineRequest>,
 }
 
 impl ModelManager {
@@ -85,8 +85,8 @@ impl ModelManager {
         self.destination_changed.then_some(self.selected.as_deref())
     }
 
-    pub fn take_pipeline_request(&mut self) -> bool {
-        std::mem::take(&mut self.pipeline_requested)
+    pub fn take_pipeline_request(&mut self) -> Option<PipelineRequest> {
+        self.pipeline_request.take()
     }
 
     #[cfg(windows)]
@@ -312,7 +312,7 @@ impl ModelManager {
             self.category = None;
             self.workspace_model = None;
             self.paused = None;
-            self.pipeline_requested = false;
+            self.pipeline_request = None;
             self.refresh(ui.ctx());
         }
         if workspace {
@@ -864,9 +864,26 @@ impl ModelManager {
                 ui.separator();
                 field_label(ui, "Registered filename");
                 crate::code_label(ui, &name);
-                if secondary(ui, "Copy filename", true).clicked() {
-                    ui.ctx().copy_text(name);
-                }
+                let available = self.library.as_ref().is_some_and(|library| {
+                    library
+                        .files
+                        .get(&category)
+                        .is_some_and(|files| files.contains(&name))
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if primary(ui, "Use in pipeline", available)
+                        .on_hover_text("Choose a compatible model input in Pipelines.")
+                        .clicked()
+                    {
+                        self.pipeline_request = Some(PipelineRequest::InstalledModel {
+                            category,
+                            name: name.clone(),
+                        });
+                    }
+                    if secondary(ui, "Copy filename", true).clicked() {
+                        ui.ctx().copy_text(name);
+                    }
+                });
             }),
             None => {}
         }
@@ -1069,9 +1086,9 @@ impl ModelManager {
                     ui.label(theme::strong(label, 13.0).color(theme::color(ui.ctx(), color)));
                     pack_license(ui, pipeline.license);
                     if pipeline.name == "Wan Animate 2"
-                        && primary(ui, "Use in pipeline", true).clicked()
+                        && primary(ui, "Open built-in pipeline", true).clicked()
                     {
-                        self.pipeline_requested = true;
+                        self.pipeline_request = Some(PipelineRequest::BuiltInWan);
                     }
                 } else {
                     ui.horizontal_top(|ui| {
@@ -1262,6 +1279,12 @@ fn hugging_face_help(ui: &mut Ui) {
 }
 
 const FILE_ROW_HEIGHT: f32 = 54.0;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PipelineRequest {
+    BuiltInWan,
+    InstalledModel { category: String, name: String },
+}
 
 #[derive(Clone, PartialEq, Eq)]
 enum ModelSelection {
@@ -1755,6 +1778,60 @@ mod tests {
             assert_eq!(manager.paused.is_some(), resumable);
             assert!(!manager.downloading());
         }
+    }
+
+    #[test]
+    fn installed_model_inspector_sends_the_registered_model_to_pipelines() {
+        use egui::accesskit::{Action, ActionRequest, Role};
+
+        let mut library = Library::default();
+        library.files.insert(
+            "diffusion_models".into(),
+            vec!["motion/custom.safetensors".into()],
+        );
+        let mut manager = ModelManager {
+            library: Some(library),
+            workspace_model: Some(ModelSelection::File {
+                category: "diffusion_models".into(),
+                name: "motion/custom.safetensors".into(),
+            }),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        theme::configure_for(&ctx, egui::ThemePreference::Dark, None);
+        ctx.enable_accesskit();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| manager.workspace_inspector(ui));
+        });
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let (target, _) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == Role::Button
+                    && node.label() == Some("Use in pipeline")
+                    && node.supports_action(Action::Click)
+                    && !node.is_disabled()
+            })
+            .expect("installed model should have a pipeline action");
+        let input = egui::RawInput {
+            events: vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                action: Action::Click,
+                target: *target,
+                data: None,
+            })],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| manager.workspace_inspector(ui));
+        });
+        assert_eq!(
+            manager.take_pipeline_request(),
+            Some(PipelineRequest::InstalledModel {
+                category: "diffusion_models".into(),
+                name: "motion/custom.safetensors".into(),
+            }),
+        );
     }
 
     #[test]

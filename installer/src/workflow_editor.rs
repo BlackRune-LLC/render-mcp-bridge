@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::setup::{fetch_json, loopback_agent, validate_comfy_url};
 
-const MAX_WORKFLOW_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_WORKFLOW_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_NODES: usize = 256;
 const MAX_INPUTS: usize = 128;
 const MAX_OPTIONS: usize = 4096;
@@ -63,11 +63,16 @@ pub struct InputSchema {
     pub kind: InputKind,
     minimum: Option<f64>,
     maximum: Option<f64>,
+    combo_link: bool,
 }
 
 impl InputSchema {
     pub fn accepts_output(&self, kind: &str) -> bool {
-        link_matches(kind, &self.kind)
+        link_matches(kind, &self.kind, self.combo_link)
+    }
+
+    pub fn supports_links(&self) -> bool {
+        self.accepts_output("*")
     }
 }
 
@@ -118,12 +123,7 @@ impl WorkflowEditor {
     }
 
     pub fn export(&self, path: &Path) -> Result<(), String> {
-        check_structure(&self.nodes)?;
-        let bytes =
-            serde_json::to_vec(&self.nodes).map_err(|_| "Could not encode the workflow.")?;
-        if bytes.len() as u64 > MAX_WORKFLOW_BYTES {
-            return Err("The workflow exceeds 2 MiB.".into());
-        }
+        let json = self.api_json()?;
         let base = path
             .parent()
             .filter(|directory| directory.is_dir())
@@ -131,7 +131,7 @@ impl WorkflowEditor {
         let mut draft = tempfile::NamedTempFile::new_in(base)
             .map_err(|_| "Could not prepare the workflow export.")?;
         draft
-            .write_all(&bytes)
+            .write_all(json.as_bytes())
             .and_then(|()| draft.as_file().sync_all())
             .map_err(|_| "Could not write the workflow export.")?;
         draft.persist_noclobber(path).map_err(|_| {
@@ -142,6 +142,51 @@ impl WorkflowEditor {
 
     pub fn nodes(&self) -> &BTreeMap<String, WorkflowNode> {
         &self.nodes
+    }
+
+    pub fn api_json(&self) -> Result<String, String> {
+        check_structure(&self.nodes)?;
+        let json =
+            serde_json::to_string(&self.nodes).map_err(|_| "Could not encode the workflow.")?;
+        if json.len() as u64 > MAX_WORKFLOW_BYTES {
+            return Err("The workflow exceeds 2 MiB.".into());
+        }
+        Ok(json)
+    }
+
+    pub fn model_slots(
+        &self,
+        category: &str,
+        name: &str,
+        schema: &WorkflowSchema,
+    ) -> Vec<(String, String)> {
+        let mut slots = Vec::new();
+        for (id, node) in &self.nodes {
+            let Some(shape) = schema.nodes.get(&node.class_type) else {
+                continue;
+            };
+            for (field, input) in &shape.inputs {
+                if model_choice(&node.class_type, field, input, category, name).is_some() {
+                    slots.push((id.clone(), field.clone()));
+                }
+            }
+        }
+        slots
+    }
+
+    pub fn assign_model(
+        &mut self,
+        node: &str,
+        input: &str,
+        category: &str,
+        name: &str,
+        schema: &WorkflowSchema,
+    ) -> Result<DependencyDiff, String> {
+        let spec = self.input_spec(node, input, schema)?;
+        let choice = model_choice(&self.nodes[node].class_type, input, spec, category, name)
+            .cloned()
+            .ok_or("This loader does not list the selected model.")?;
+        self.set_literal(node, input, choice, schema)
     }
 
     pub fn dependency_changes(&self) -> DependencyDiff {
@@ -434,7 +479,64 @@ fn model_input<'a>(field: &str, value: &'a Value) -> Option<&'a str> {
                     | "weights"
             )
         });
-    known_selector.then_some(model)
+    (known_selector || model_slot_category("", field).is_some()).then_some(model)
+}
+
+fn model_choice<'a>(
+    class: &str,
+    field: &str,
+    input: &'a InputSchema,
+    category: &str,
+    name: &str,
+) -> Option<&'a Value> {
+    let InputKind::Choice(choices) = &input.kind else {
+        return None;
+    };
+    let category = match category {
+        "clip" => "text_encoders",
+        "unet" => "diffusion_models",
+        "vae_approx" => "vae",
+        category => category,
+    };
+    let expected = model_slot_category(class, field);
+    if expected.is_some_and(|expected| expected != category) {
+        return None;
+    }
+    let matches = |value: &&Value| {
+        value.as_str().is_some_and(|option| {
+            (expected.is_some() || model_input(field, value).is_some())
+                && option.split(['/', '\\']).eq(name.split(['/', '\\']))
+        })
+    };
+    choices
+        .iter()
+        .find(|value| value.as_str() == Some(name) && matches(value))
+        .or_else(|| choices.iter().find(matches))
+}
+
+fn model_slot_category(class: &str, field: &str) -> Option<&'static str> {
+    match field {
+        "ckpt_name" | "checkpoint_name" => Some("checkpoints"),
+        "unet_name" | "diffusion_model_name" => Some("diffusion_models"),
+        "clip_name" if class == "CLIPVisionLoader" => Some("clip_vision"),
+        "clip_name" | "clip_name1" | "clip_name2" | "clip_name3" | "clip_name4" => {
+            Some("text_encoders")
+        }
+        "clip_vision_name" => Some("clip_vision"),
+        "vae_name" => Some("vae"),
+        "lora_name" => Some("loras"),
+        "control_net_name" | "controlnet_name" => Some("controlnet"),
+        "style_model_name" => Some("style_models"),
+        "gligen_name" => Some("gligen"),
+        "model_path" if class == "DiffusersLoader" => Some("diffusers"),
+        "model_name" => match class {
+            "UpscaleModelLoader" => Some("upscale_models"),
+            "LoadMoGeModel" => Some("geometry_estimation"),
+            "FrameInterpolationModelLoader" => Some("frame_interpolation"),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn is_model_file(value: &str) -> bool {
@@ -443,7 +545,7 @@ fn is_model_file(value: &str) -> bool {
         && value.rsplit_once('.').is_some_and(|(_, extension)| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "safetensors" | "ckpt" | "pt" | "pth" | "bin" | "gguf" | "onnx"
+                "safetensors" | "sft" | "ckpt" | "pt" | "pth" | "bin" | "gguf" | "onnx" | "pkl"
             )
         })
 }
@@ -475,13 +577,14 @@ fn literal_matches(value: &Value, input: &InputSchema) -> bool {
         })
 }
 
-fn link_matches(output: &str, input: &InputKind) -> bool {
+fn link_matches(output: &str, input: &InputKind, combo_link: bool) -> bool {
     let expected = match input {
         InputKind::Integer => "INT",
         InputKind::Float => "FLOAT",
         InputKind::Boolean => "BOOLEAN",
         InputKind::String => "STRING",
         InputKind::Link(kind) => kind,
+        InputKind::Choice(_) if combo_link => "COMBO",
         InputKind::Choice(_) | InputKind::Unknown => return false,
     };
     !output.is_empty()
@@ -577,6 +680,7 @@ fn parse_input(spec: &Value, required: bool) -> InputSchema {
         kind,
         minimum: options["min"].as_f64(),
         maximum: options["max"].as_f64(),
+        combo_link: first.as_str() == Some("COMBO"),
     }
 }
 
@@ -837,6 +941,116 @@ mod tests {
             assert!(editor.import_json(text).is_err());
         }
         assert_eq!(editor.nodes().len(), 2);
+    }
+
+    #[test]
+    fn accepts_exported_comfy_v3_combo_links() {
+        let mut editor = WorkflowEditor::default();
+        editor
+            .import_json(
+                br#"{
+            "10":{"class_type":"ComboSwitch","inputs":{}},
+            "20":{"class_type":"MethodSink","inputs":{"method":["10",0]}}
+        }"#,
+            )
+            .unwrap();
+        let mut schema = WorkflowSchema {
+            nodes: [
+                ("ComboSwitch".to_owned(), parse_schema(&json!({
+                    "input":{"required":{}}, "output":["COMBO"], "python_module":"comfy_extras.nodes_logic"
+                })).unwrap()),
+                ("MethodSink".to_owned(), parse_schema(&json!({
+                    "input":{"required":{"method":["COMBO",{"options":["a","b"]}]}},
+                    "output":[], "output_node":true, "python_module":"nodes"
+                })).unwrap()),
+            ].into(),
+            ..Default::default()
+        };
+        assert_eq!(editor.validate(&schema), Vec::<String>::new());
+        assert!(editor.connect("20", "method", "10", 0, &schema).is_ok());
+
+        schema.nodes.insert(
+            "MethodSink".into(),
+            parse_schema(&json!({
+                "input":{"required":{"method":[["a","b"]]}},
+                "output":[], "output_node":true, "python_module":"nodes"
+            }))
+            .unwrap(),
+        );
+        assert!(!editor.validate(&schema).is_empty());
+    }
+
+    #[test]
+    fn assigns_an_installed_model_only_to_matching_loader_slots() {
+        let mut editor = WorkflowEditor::default();
+        editor
+            .import_json(
+                br#"{
+            "1":{"class_type":"CLIPLoader","inputs":{"clip_name":"old.safetensors"}},
+            "2":{"class_type":"CLIPVisionLoader","inputs":{"clip_name":"old.safetensors"}},
+            "3":{"class_type":"CheckpointLoaderSimple","inputs":{"ckpt_name":"old.safetensors"}}
+        }"#,
+            )
+            .unwrap();
+        let choices = json!(["old.safetensors", "pack\\replacement.safetensors"]);
+        let schema = WorkflowSchema {
+            nodes: [
+                ("CLIPLoader", "clip_name"),
+                ("CLIPVisionLoader", "clip_name"),
+                ("CheckpointLoaderSimple", "ckpt_name"),
+            ]
+            .into_iter()
+            .map(|(class, input)| {
+                let metadata = json!({
+                    "input":{"required":{(input): ["COMBO", {"options": choices}]}},
+                    "output":["CLIP"],
+                    "output_name":["Encoder"],
+                    "output_node":false,
+                    "python_module":"nodes"
+                });
+                (class.to_owned(), parse_schema(&metadata).unwrap())
+            })
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            editor.model_slots("text_encoders", "pack/replacement.safetensors", &schema),
+            [("1".into(), "clip_name".into())]
+        );
+        assert!(
+            editor
+                .model_slots("clip", "replacement.safetensors", &schema)
+                .is_empty()
+        );
+        assert!(
+            editor
+                .assign_model(
+                    "2",
+                    "clip_name",
+                    "clip",
+                    "pack/replacement.safetensors",
+                    &schema
+                )
+                .is_err()
+        );
+        editor
+            .assign_model(
+                "1",
+                "clip_name",
+                "clip",
+                "pack/replacement.safetensors",
+                &schema,
+            )
+            .unwrap();
+
+        let json: Value = serde_json::from_str(&editor.api_json().unwrap()).unwrap();
+        assert_eq!(
+            json["1"]["inputs"]["clip_name"],
+            "pack\\replacement.safetensors"
+        );
+        assert_eq!(json["2"]["inputs"]["clip_name"], "old.safetensors");
+        assert!(editor.undo());
+        assert_eq!(editor.nodes()["1"].inputs["clip_name"], "old.safetensors");
     }
 
     #[test]

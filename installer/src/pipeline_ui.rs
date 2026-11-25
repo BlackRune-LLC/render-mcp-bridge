@@ -86,6 +86,15 @@ pub struct PipelinePanel {
 }
 
 impl PipelinePanel {
+    pub fn show_builtin(&mut self) {
+        self.edit_workflow = false;
+    }
+
+    pub fn use_model(&mut self, backend: String, category: String, name: String) {
+        self.edit_workflow = true;
+        self.workflow.offer_model(backend, category, name);
+    }
+
     pub fn show(
         &mut self,
         ui: &mut Ui,
@@ -96,10 +105,14 @@ impl PipelinePanel {
         self.refresh(data_dir, backend);
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.edit_workflow, false, "Built-in pipelines");
-            ui.selectable_value(&mut self.edit_workflow, true, "Workflow editor");
+            ui.selectable_value(&mut self.edit_workflow, true, "Your pipelines");
+            if !self.edit_workflow && primary(ui, "+ Add pipeline", data_dir.is_some()).clicked() {
+                self.edit_workflow = true;
+                self.workflow.begin_add();
+            }
         });
         if self.edit_workflow {
-            self.workflow.show(ui, backend, installed);
+            self.workflow.show(ui, backend, data_dir, installed);
             return;
         }
         ui.add_space(4.0);
