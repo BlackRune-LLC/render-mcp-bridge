@@ -65,14 +65,14 @@ Restart the selected ComfyUI build after saving the paths. Use **Refresh** on th
 
 ## Review pipelines and nodes
 
-Open **Pipelines**, or choose **Use in pipeline** on the Wan Animate 2 pack. Select the motion model to compare **Distilled** and **Full quality**. Full quality uses another diffusion weight, the Lightx2v LoRA, and a different step count. The selected ComfyUI build must report the required models and nodes before you can save a revision. Share the copied run option with the agent you want to use for its next `animate_from_clip` call. A saved revision stays local and existing jobs keep their settings.
+Open **Pipelines**, or choose **Use in pipeline** on the Wan Animate 2 pack. Open any graph step to see its menu. The **Motion model** menu switches between **Distilled** and **Full quality**. Full quality uses another diffusion weight, the Lightx2v LoRA, and a different step count. The **Character**, **Driving clip**, **Animate**, and **Save video** menus control image source, the frame rate for image sequences, render size, and contact-sheet preview. **VAE decode** shows the VAE used by the built-in preset. Validate the required models and nodes before saving a revision, then use **Copy agent options** to give your agent the selected settings for a new `animate_from_clip` call.
 
 Open **Nodes** to search the selected build by name, ID, or category. Filter by built-in, custom, or unreported origin. If the backend reports a source or version, the selected node shows it. Follow the next section to manage custom nodes.
 
 ### Edit a ComfyUI workflow
 
 1. Export the graph from ComfyUI in **API Format**. In Render Bridge, open **Pipelines → Your pipelines → Add pipeline**, import the JSON, and give the pipeline a name. Choose **Duplicate current** to start another pipeline from the open draft.
-2. Open a saved pipeline from the library. Render Bridge checks the graph against the selected ComfyUI build. Select a node and input to change its value, choose one of its reported models, or connect a compatible output. Use **Check dependencies** to refresh after adding models or nodes.
+2. Open a saved pipeline from the library. Render Bridge checks the graph against the selected ComfyUI build. Open a step and choose an input to change its value, choose one of its reported models, or connect a compatible output. Use **Check dependencies** to refresh after adding models or nodes.
 3. To start from a model, open **Models → Installed**, select a file, and choose **Use in pipeline**. Open the pipeline you want, choose one of the compatible loader slots, and select **Apply model**. The selected build supplies the choices for that slot.
 4. Select **Save changes** to keep the edits in your local pipeline library. **Undo** reverses the last edit. **Export copy** writes a separate API JSON file. **Copy agent prompt** gives a connected agent the current graph for a new `run_workflow` job.
 

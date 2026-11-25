@@ -1,13 +1,13 @@
 # Render Bridge 0.2.0 for Windows x64
 
-Use `RenderBridgeSetup.exe` from this directory. These are the installer bytes planned for the public release. The installer is unsigned and built from source commit `f52ebdc39dbdd6461de5f742faa178af0fd2c291`.
+Use `RenderBridgeSetup.exe` from this directory. These are the installer bytes planned for the public release. The installer is unsigned and built from source commit `3b5c100296e13ee9707b2645c5b0cedbdeb31b89`.
 
 Download [RenderBridgeSetup.exe](./RenderBridgeSetup.exe?raw=1) and [SHA256SUMS.txt](./SHA256SUMS.txt?raw=1) to the same folder. Open PowerShell in that folder and run the following before opening Setup.
 
 ```powershell
 $expected = ((Get-Content -LiteralPath .\SHA256SUMS.txt -TotalCount 1) -split '\s+')[0]
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath .\RenderBridgeSetup.exe).Hash
-if ($expected -ne 'b3e3581c60ccad6e7c44df16c8ffa1612dc739f175ba9c9778e1204b2f428363' -or $actual -ne $expected) {
+if ($expected -ne 'a1fe456092ec052744e0f8b471cf73aaf808118168f0a9b90075e59a0e2c2f27' -or $actual -ne $expected) {
     throw 'RenderBridgeSetup.exe checksum mismatch.'
 }
 ```
@@ -21,6 +21,8 @@ if ($expected -ne 'b3e3581c60ccad6e7c44df16c8ffa1612dc739f175ba9c9778e1204b2f428
 
 - Export a ComfyUI workflow in **API Format**. Open **Pipelines → Add pipeline**, import the JSON, and name it. Check that the pipeline opens from **Your pipelines** after reopening the panel.
 - If another compatible model is installed, select it in **Models → Installed → Use in pipeline**, choose the saved pipeline and loader slot, then select **Apply model** and **Save changes**. Reopen the pipeline and confirm the loader and **Copy agent prompt** carry the selected filename.
+
+- In **Built-in pipelines**, open several step menus and try the **Motion model** dropdown. In **Nodes**, select a custom node and check its source, version, and review state. Check both the Dark and Light theme at the normal workspace size.
 
 ## Upgrade from v0.1.0
 
