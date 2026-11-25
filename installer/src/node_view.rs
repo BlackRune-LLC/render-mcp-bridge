@@ -314,13 +314,13 @@ impl NodePanel {
             });
         let visible_rows =
             ((ui.clip_rect().height() - 250.0) / NODE_ROW_HEIGHT).clamp(4.0, 9.0) as usize;
-        let custom_open = selected.is_some_and(|index| self.nodes[index].origin == Origin::Custom);
+        let shared_rows = (visible_rows / group_count).max(2);
         for (origin, indices) in groups {
             if !indices.is_empty() {
-                let row_limit = if custom_open {
-                    2
+                let row_limit = if origin == Origin::Custom {
+                    visible_rows
                 } else {
-                    (visible_rows / group_count).max(2)
+                    shared_rows
                 };
                 node_group(ui, &self.nodes, origin, &indices, row_limit, &mut selected);
             }
@@ -918,6 +918,91 @@ fn review_source(source: &str) -> Option<url::Url> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn custom_inventory_uses_the_viewport_row_budget() {
+        const BACKEND: &str = "http://127.0.0.1:8188";
+        const ROW_PREFIX: &str = "Custom row ";
+
+        for (size, filter, selected, theme_preference, expected_rows) in [
+            (
+                crate::MONITOR_MIN_SIZE,
+                Some(Origin::Custom),
+                "Row00",
+                egui::ThemePreference::Dark,
+                3,
+            ),
+            (
+                egui::vec2(1000.0, 680.0),
+                None,
+                "BuiltIn",
+                egui::ThemePreference::Dark,
+                9,
+            ),
+            (
+                egui::vec2(1000.0, 680.0),
+                None,
+                "Row00",
+                egui::ThemePreference::Light,
+                9,
+            ),
+        ] {
+            let mut inventory = serde_json::Map::from_iter([
+                ("BuiltIn".to_owned(), json!({"python_module": "nodes"})),
+                ("Unreported".to_owned(), json!({"category": "other"})),
+            ]);
+            for row in 0..12 {
+                inventory.insert(
+                    format!("Row{row:02}"),
+                    json!({
+                        "display_name": format!("{ROW_PREFIX}{row:02}"),
+                        "python_module": "custom_nodes.fixture",
+                    }),
+                );
+            }
+            let nodes = parse_inventory(Value::Object(inventory)).unwrap();
+            let mut panel = NodePanel {
+                backend: Some(BACKEND.into()),
+                origin: filter,
+                selected: nodes.iter().position(|node| node.id == selected),
+                nodes,
+                ..Default::default()
+            };
+            let ctx = egui::Context::default();
+            theme::configure_for(&ctx, theme_preference, None);
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            };
+            let mut draw = |ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        panel.show_with_target(ui, Some(BACKEND), None);
+                    });
+                });
+            };
+            let _ = ctx.run(input(), &mut draw);
+            let output = ctx.run(input(), &mut draw);
+            let visible_rows = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.job.text.starts_with(ROW_PREFIX)
+                            && text.galley.job.sections[0].format.font_id.size == 14.0
+                            && clipped.clip_rect.contains_rect(text.visual_bounding_rect()) =>
+                    {
+                        Some(text.galley.job.text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                visible_rows.len() >= expected_rows,
+                "{size:?}, {filter:?}, {selected}: {visible_rows:?}"
+            );
+        }
+    }
 
     #[test]
     fn classifies_only_reported_core_and_custom_namespaces() {
