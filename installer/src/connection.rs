@@ -1,9 +1,12 @@
 use crate::setup::{self, Installed};
+use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, TcpListener};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const PIPELINE_DATA_DIR: &str = "RENDER_BRIDGE_PIPELINE_DATA_DIR";
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Client {
@@ -43,21 +46,7 @@ impl RunningBridge {
             .path()
             .file_name()
             .ok_or("Could not prepare a Bridge session ID.")?;
-        let child = setup::quiet_command(setup::venv_python(&installed.app_dir))
-            .arg(installed.app_dir.join("comfy_mcp_server.py"))
-            .current_dir(&installed.app_dir)
-            .stdin(Stdio::piped())
-            .env("COMFY_MCP_DATA_DIR", &installed.data_dir)
-            .env("PAUSE_FLAG", &installed.pause_flag)
-            .env("COMFY_ROOT", &settings.comfy_root)
-            .env("COMFY_URL", &settings.comfy_url)
-            .env("COMFY_INPUT_DIR", setup::folder(settings, "input"))
-            .env("COMFY_OUTPUT_DIR", setup::folder(settings, "output"))
-            .env("MCP_HOST", "127.0.0.1")
-            .env("MCP_PORT", port.to_string())
-            .env("MCP_TOKEN_FILE", &installed.token_path)
-            .env("RENDER_BRIDGE_MANAGED_ID", id)
-            .env("RENDER_BRIDGE_PANEL_MANAGED", if cfg!(windows) { "1" } else { "0" })
+        let child = managed_server_command(installed, settings, id, port)
             .spawn()
             .map_err(|_| "Could not start Render Bridge. Run the copied start command in a terminal for details.")?;
         Ok(Self {
@@ -83,6 +72,39 @@ impl RunningBridge {
     pub fn backend_url(&self) -> &str {
         &self.settings.comfy_url
     }
+}
+
+fn managed_server_command(
+    installed: &Installed,
+    settings: &setup::Settings,
+    id: &OsStr,
+    port: u16,
+) -> Command {
+    let mut command = setup::quiet_command(setup::venv_python(&installed.app_dir));
+    command
+        .arg(installed.app_dir.join("comfy_mcp_server.py"))
+        .current_dir(&installed.app_dir)
+        .stdin(Stdio::piped())
+        .env("COMFY_MCP_DATA_DIR", &installed.data_dir)
+        .env("PAUSE_FLAG", &installed.pause_flag)
+        .env("COMFY_ROOT", &settings.comfy_root)
+        .env("COMFY_URL", &settings.comfy_url)
+        .env("COMFY_INPUT_DIR", setup::folder(settings, "input"))
+        .env("COMFY_OUTPUT_DIR", setup::folder(settings, "output"))
+        .env("MCP_HOST", "127.0.0.1")
+        .env("MCP_PORT", port.to_string())
+        .env("MCP_TOKEN_FILE", &installed.token_path)
+        .env("RENDER_BRIDGE_MANAGED_ID", id)
+        .env(
+            "RENDER_BRIDGE_PANEL_MANAGED",
+            if cfg!(windows) { "1" } else { "0" },
+        )
+        .env_remove(PIPELINE_DATA_DIR);
+    #[cfg(windows)]
+    if crate::shortcuts::existing_monitor_executable(&installed.data_dir).is_ok() {
+        command.env(PIPELINE_DATA_DIR, &installed.data_dir);
+    }
+    command
 }
 
 impl Drop for RunningBridge {
@@ -296,4 +318,41 @@ pub fn profile_path(client: Client) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::home_dir().map(|home| home.join(subdir)))?;
     Some(root.join(file))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_servers_enable_pipeline_import_only_for_the_owned_monitor() {
+        let state = tempfile::tempdir().unwrap();
+        let installed = Installed {
+            app_dir: state.path().join("app"),
+            data_dir: state.path().into(),
+            token_path: state.path().join("token.txt"),
+            pause_flag: state.path().join("gaming_mode.flag"),
+            attach_only: false,
+            mcp_url: "http://127.0.0.1:8189/mcp".into(),
+            start_command: String::new(),
+        };
+        let pipeline_target = || {
+            managed_server_command(
+                &installed,
+                &setup::Settings::default(),
+                OsStr::new("fixture"),
+                8189,
+            )
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new(PIPELINE_DATA_DIR))
+            .map(|(_, value)| value.map(OsStr::to_os_string))
+        };
+
+        assert_eq!(pipeline_target(), Some(None));
+        crate::shortcuts::install_current_monitor(state.path()).unwrap();
+        assert_eq!(
+            pipeline_target(),
+            Some(Some(state.path().as_os_str().to_os_string()))
+        );
+    }
 }

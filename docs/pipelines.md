@@ -84,6 +84,8 @@ In Render Bridge, open **Pipelines → Your pipelines → Add pipeline**. Choose
 
 If the connected MCP server exposes `add_pipeline`, pass the new pipeline's `name` and ComfyUI API-format graph as `workflow`. The tool saves it to **Your pipelines** and returns its ID, missing models and nodes, and dependencies it could not verify. Use a unique name. A saved draft can have missing dependencies. To render it, submit the graph with `run_workflow` when you are ready.
 
+On a managed Windows installation, start the server from the installed panel to make this tool available. Reconnect your agent to refresh its tool list after updating.
+
 Use these steps when the connected server does not expose `add_pipeline`.
 
 1. Ask the user for the intended output and any workflow they want to build on. Prepare a ComfyUI API-format graph as a JSON object keyed by node ID. Each node has a `class_type` and an `inputs` object. A link such as `["12", 0]` uses output 0 from node 12. Include the output node that saves the intended result.
