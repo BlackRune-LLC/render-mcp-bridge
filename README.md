@@ -205,9 +205,13 @@ Open the downloaded PNG to verify your first render. Then try video or 3D with a
 
 For longer jobs, submit through `start_job` and use `get_job` to retrieve the signed file links. If the agent is on another device, open the file using a link reachable from that device. [Remote connections and file transfer](docs/connections.md#connect-from-another-device)
 
+To stop the active render, select the red square next to its progress bar in **Jobs**. Render Bridge checks that the same render is still running before it sends the stop request.
+
 ## Render Bridge Gaming Mode
 
 Select **Gaming Mode · Off** in the Jobs panel or on **Connect** to pause new GPU work. The controller button turns bright green and reads **Gaming Mode · On** while the pause is active. Select it again to resume. If you selected **Create a Gaming Mode shortcut**, open **Render Bridge Gaming Mode** from the Windows or macOS desktop or from your Linux application menu. If you have an older shortcut that toggles Gaming Mode immediately, rename or remove it before creating the new shortcut.
+
+With Gaming Mode on, Render Bridge asks ComfyUI to unload its models once both the running and pending queues are empty. If the queue is busy or ComfyUI is unreachable, the running Render Bridge server checks again in the background. The ComfyUI process and its baseline memory use remain.
 
 For terminal control, go to **Connect → Shutdown and terminal commands → Turn Gaming Mode off** and run the copied command. Use **Copy status command** to check it in a terminal or replace the final `off` with `on` to enable it. In the v0.1.0 download, copy the start command and replace the final `start` with `gaming-mode off`.
 
@@ -221,7 +225,7 @@ python3 setup_render_bridge.py gaming-mode off
 
 For manual setup, use `comfy_mcp_server.py gaming-mode on|off|status` with the virtual environment's Python and the same `COMFY_URL` and `COMFY_MCP_DATA_DIR` settings as the running server.
 
-Turning gaming mode on pauses new GPU work through the MCP server. If ComfyUI's queue is idle, the command asks it to unload models and free memory. If it is busy, let the existing work finish and run `gaming-mode on` again to request the unload. The pause persists across restarts. Check `server_status` from your MCP client to confirm it, then switch gaming mode off when you're ready to generate again. Keep ComfyUI running separately.
+The pause persists across restarts. Check `server_status` from your MCP client to confirm it, then turn Gaming Mode off when you are ready to generate again. If Render Bridge is stopped while the queue clears, start it or run `gaming-mode on` again to request the unload.
 
 ## Ask your agent to set it up
 

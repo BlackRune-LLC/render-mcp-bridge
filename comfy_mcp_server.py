@@ -506,9 +506,13 @@ def mark_activity() -> None:
     _state["models_loaded"] = True
 
 
+async def _request_model_unload() -> None:
+    response = await _http.post("/free", json={"unload_models": True, "free_memory": True}, timeout=10)
+    response.raise_for_status()
+
+
 async def unload(reason: str) -> dict[str, Any]:
-    r = await _http.post("/free", json={"unload_models": True, "free_memory": True}, timeout=10)
-    r.raise_for_status()
+    await _request_model_unload()
     _state.update(models_loaded=False, last_unload=time.time(), last_unload_reason=reason)
     log(f"Unloaded models ({reason})")
     await asyncio.sleep(3)  # ComfyUI applies the flag on its worker loop
@@ -524,20 +528,80 @@ async def gpu_info() -> dict[str, Any]:
         return {}
 
 
-async def idle_check() -> None:
-    if PAUSE_FLAG.exists():
-        return
-    if not await comfy_up():
-        _state["models_loaded"] = False
-        return
+async def _queue_busy() -> bool | None:
     response = await _http.get("/queue", timeout=5)
     response.raise_for_status()
     queue = response.json()
     if not isinstance(queue, dict) or not all(
         isinstance(queue.get(key), list) for key in ("queue_running", "queue_pending")
     ):
+        return None
+    return bool(queue["queue_running"] or queue["queue_pending"])
+
+
+def _gaming_activation() -> bytes | None:
+    try:
+        flag = PAUSE_FLAG.stat()
+    except FileNotFoundError:
+        return None
+    return f"{flag.st_dev}:{flag.st_ino}:{flag.st_ctime_ns}:{flag.st_mtime_ns}".encode("ascii")
+
+
+async def _gaming_unload(activation: bytes) -> str:
+    # The CLI and watcher share one receipt. Lock its first byte while checking
+    # the queue and sending /free, then store the accepted activation after it.
+    receipt_path = PAUSE_FLAG.with_name(f"{PAUSE_FLAG.name}.unload")
+    with os.fdopen(os.open(receipt_path, os.O_RDWR | os.O_CREAT, 0o600), "r+b") as receipt:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(receipt.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(receipt.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "checking"
+
+        if _gaming_activation() != activation:
+            return "changed"
+        receipt.seek(1)
+        if receipt.read(len(activation) + 1) == activation:
+            accepted_at = os.fstat(receipt.fileno()).st_mtime
+        else:
+            try:
+                busy = await _queue_busy()
+                if _gaming_activation() != activation:
+                    return "changed"
+                if busy is None:
+                    return "unknown"
+                if busy:
+                    return "busy"
+                await _request_model_unload()
+            except (httpx.HTTPError, ValueError):
+                return "unknown"
+            receipt.seek(1)
+            receipt.write(activation)
+            receipt.truncate()
+            accepted_at = time.time()
+            log("ComfyUI accepted the model unload request (gaming mode)")
+        if _gaming_activation() == activation and accepted_at > (_state["last_unload"] or 0):
+            _state.update(models_loaded=False, last_unload=accepted_at, last_unload_reason="gaming mode")
+        return "accepted"
+
+
+async def idle_check() -> None:
+    if (activation := _gaming_activation()) is not None:
+        await _gaming_unload(activation)
         return
-    if queue["queue_running"] or queue["queue_pending"]:
+    if not await comfy_up():
+        _state["models_loaded"] = False
+        return
+    busy = await _queue_busy()
+    if busy is None:
+        return
+    if busy:
         mark_activity()
         return
     response = await _http.get("/history", params={"max_items": 1}, timeout=5)
@@ -551,7 +615,7 @@ async def idle_check() -> None:
         mark_activity()
         return
     idle = time.time() - _state["last_activity"]
-    if IDLE_UNLOAD_S > 0 and _state["models_loaded"] and idle >= IDLE_UNLOAD_S:
+    if IDLE_UNLOAD_S > 0 and _state["models_loaded"] and idle >= IDLE_UNLOAD_S and not PAUSE_FLAG.exists():
         await unload(f"idle {idle / 60:.0f} min")
 
 
@@ -4336,23 +4400,18 @@ def set_gaming_mode(enabled: bool) -> None:
 async def enable_gaming_mode() -> None:
     set_gaming_mode(True)
     try:
-        response = await _http.get("/queue", timeout=5)
-        response.raise_for_status()
-        queue = response.json()
-        running = queue.get("queue_running") if isinstance(queue, dict) else None
-        pending = queue.get("queue_pending") if isinstance(queue, dict) else None
-        if not isinstance(running, list) or not isinstance(pending, list):
-            print("Gaming mode is on. Queue status is unknown. No model unload was requested.")
-        elif running or pending:
-            print("Gaming mode is on. The ComfyUI queue is busy. No model unload was requested.")
-        elif PAUSE_FLAG.exists():
-            response = await _http.post("/free", json={"unload_models": True, "free_memory": True}, timeout=10)
-            response.raise_for_status()
+        activation = _gaming_activation()
+        outcome = await _gaming_unload(activation) if activation is not None else "changed"
+        if outcome == "accepted":
             print("Gaming mode is on. ComfyUI accepted the model unload request.")
+        elif outcome == "changed":
+            print("Gaming mode changed before the unload request.")
+        elif outcome == "busy":
+            print("Gaming mode is on. While Render Bridge is running, it will request an unload when the ComfyUI queue is empty.")
         else:
-            print("Gaming mode was turned off before the unload request.")
-    except (httpx.HTTPError, ValueError):
-        print("Gaming mode is on. No model unload was confirmed by ComfyUI.")
+            print("Gaming mode is on. While Render Bridge is running, it will check the queue again before unloading models.")
+    except OSError:
+        print("Gaming mode is on. Could not confirm the model unload. Check access to the Gaming Mode flag folder.")
     finally:
         await _http.aclose()
 

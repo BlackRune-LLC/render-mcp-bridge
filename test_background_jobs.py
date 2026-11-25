@@ -72,6 +72,126 @@ class ModelLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.state["models_loaded"])
         self.assertTrue(self.state["last_unload_reason"].startswith("idle "))
 
+    async def test_gaming_mode_unloads_once_after_the_queue_becomes_empty(self):
+        backend = AsyncMock()
+        backend.get.side_effect = [
+            response(queue_running=[["test job"]], queue_pending=[]),
+            response(queue_running=[], queue_pending=[["next job"]]),
+            response(queue_running=[], queue_pending=[]),
+        ]
+        backend.post.return_value = response()
+        with patch.object(server, "_http", backend):
+            await server.enable_gaming_mode()
+            await server.idle_check()
+            backend.post.assert_not_awaited()
+            await server.idle_check()
+            await server.idle_check()
+        backend.post.assert_awaited_once_with(
+            "/free", json={"unload_models": True, "free_memory": True}, timeout=10,
+        )
+        self.assertFalse(self.state["models_loaded"])
+        self.assertEqual(self.state["last_unload_reason"], "gaming mode")
+        self.assertTrue(server.PAUSE_FLAG.exists())
+
+    async def test_gaming_mode_rechecks_after_unavailable_or_invalid_queue(self):
+        server.set_gaming_mode(True)
+        backend = AsyncMock()
+        backend.get.side_effect = [
+            httpx.ConnectError("offline"),
+            response(queue_running=[]),
+            response(queue_running=[], queue_pending=[]),
+            response(queue_running=[], queue_pending=[]),
+        ]
+        backend.post.side_effect = [response(503), response()]
+        with patch.object(server, "_http", backend):
+            await server.idle_check()
+            await server.idle_check()
+            backend.post.assert_not_awaited()
+            await server.idle_check()
+            self.assertTrue(self.state["models_loaded"])
+            await server.idle_check()
+            await server.idle_check()
+        self.assertEqual(backend.post.await_count, 2)
+        self.assertFalse(self.state["models_loaded"])
+
+    async def test_gaming_mode_change_during_queue_check_requires_a_new_check(self):
+        for enabled_again in (False, True):
+            with self.subTest(enabled_again=enabled_again):
+                server.set_gaming_mode(True)
+                backend = AsyncMock()
+                empty_queue = response(queue_running=[], queue_pending=[])
+
+                async def change_gaming_mode(*args, **kwargs):
+                    server.set_gaming_mode(False)
+                    if enabled_again:
+                        server.set_gaming_mode(True)
+                    return empty_queue
+
+                backend.get.side_effect = change_gaming_mode
+                backend.post.return_value = response()
+                with patch.object(server, "_http", backend):
+                    await server.idle_check()
+                    backend.get.assert_awaited_once()
+                    backend.post.assert_not_awaited()
+                    if enabled_again:
+                        backend.get.side_effect = None
+                        backend.get.return_value = empty_queue
+                        await server.idle_check()
+                        backend.post.assert_awaited_once()
+
+    async def test_gaming_mode_cli_and_watcher_share_the_same_activation(self):
+        backend = AsyncMock()
+        backend.get.return_value = response(queue_running=[], queue_pending=[])
+        backend.post.return_value = response()
+        with patch.object(server, "_http", backend):
+            await server.enable_gaming_mode()
+            with patch.object(server, "_state", {**self.state, "models_loaded": True, "last_unload": None}):
+                await server.idle_check()
+                self.assertFalse(server._state["models_loaded"])
+            await server.enable_gaming_mode()
+            backend.post.assert_awaited_once()
+            server.set_gaming_mode(False)
+            await server.enable_gaming_mode()
+        self.assertEqual(backend.post.await_count, 2)
+
+    async def test_normal_idle_unload_defers_when_gaming_mode_starts_during_probe(self):
+        backend = AsyncMock()
+
+        async def check_backend(path, **kwargs):
+            if path == "/queue":
+                return response(queue_running=[], queue_pending=[])
+            server.set_gaming_mode(True)
+            return response(last={})
+
+        backend.get.side_effect = check_backend
+        backend.post.return_value = response()
+        with patch.object(server, "_http", backend):
+            await server.idle_check()
+        backend.post.assert_not_awaited()
+
+    async def test_gaming_mode_does_not_repeat_an_unload_while_cli_checks_queue(self):
+        checking = asyncio.Event()
+        reply = asyncio.Event()
+        backend = AsyncMock()
+        backend.post.return_value = response()
+
+        async def check_queue(*args, **kwargs):
+            checking.set()
+            await reply.wait()
+            return response(queue_running=[], queue_pending=[])
+
+        backend.get.side_effect = check_queue
+        with patch.object(server, "_http", backend):
+            cli = asyncio.create_task(server.enable_gaming_mode())
+            try:
+                await checking.wait()
+                await asyncio.wait_for(server.idle_check(), timeout=1)
+            finally:
+                reply.set()
+                await cli
+            await server.idle_check()
+        backend.post.assert_awaited_once()
+
     async def test_health_proof_is_bound_to_a_valid_per_request_challenge(self):
         key = "test_installation_token_fixture_0123456789"
         challenge = "ab" * 16

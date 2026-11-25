@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use crate::INK;
-use crate::jobs::{self, QueueStatus};
+use crate::jobs::{self, CancelOutcome, QueueStatus};
 use crate::theme;
-use crate::{CAUTION, CREAM, GREEN, LINE, MUTED, SURFACE, VIOLET, caption, monitor_button, status};
+use crate::{
+    CAUTION, CREAM, ERROR, GREEN, LINE, MUTED, SURFACE, VIOLET, caption, monitor_button, status,
+};
 
 #[cfg(windows)]
 use crate::RAIL_ACTIVE;
@@ -17,9 +19,28 @@ use crate::job_progress::{Observer, Progress};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const FRESH_FOR: Duration = Duration::from_secs(3);
+const STOP_BUTTON_SIZE: f32 = 24.0;
+const CANCEL_RETRY_DELAY: Duration = Duration::from_secs(5);
 const CHECK_ERROR: &str = "The queue check could not start. Try Refresh.";
 
 type Snapshot = Arc<Result<QueueStatus, String>>;
+
+enum QueueRequest {
+    Refresh,
+    Cancel(String),
+}
+
+struct Cancellation {
+    id: String,
+    state: CancelState,
+}
+
+enum CancelState {
+    Sending,
+    Requested { retry_at: Instant },
+    NoLongerRunning,
+    Failed(String),
+}
 
 #[derive(Default)]
 struct QueueState {
@@ -28,9 +49,20 @@ struct QueueState {
     checking: bool,
     manual: bool,
     stop_waiting: bool,
+    cancellation: Option<Cancellation>,
 }
 
 impl QueueState {
+    fn can_cancel(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_none_or(|cancel| match cancel.state {
+                CancelState::Sending => false,
+                CancelState::Requested { retry_at } => Instant::now() >= retry_at,
+                CancelState::NoLongerRunning | CancelState::Failed(_) => true,
+            })
+    }
+
     fn finish(&mut self, result: Result<QueueStatus, String>, explicit: bool) -> bool {
         self.checking = false;
         self.checked_at = Some(Instant::now());
@@ -41,16 +73,26 @@ impl QueueState {
         if changed {
             self.snapshot = Some(Arc::new(result));
         }
+        let cancel_finished = if let Some(cancel) = self.cancellation.as_mut()
+            && matches!(cancel.state, CancelState::Requested { .. })
+            && matches!(self.snapshot.as_deref(), Some(Ok(queue))
+                if queue.is_running(&cancel.id) == Some(false))
+        {
+            cancel.state = CancelState::NoLongerRunning;
+            true
+        } else {
+            false
+        };
         // Wake an open stop dialog if it observed an in-flight check.
         let stop_changed = !self.manual && std::mem::take(&mut self.stop_waiting);
-        changed || explicit || stop_changed
+        changed || explicit || stop_changed || cancel_finished
     }
 }
 
 pub struct QueueView {
     url: String,
     state: Arc<Mutex<QueueState>>,
-    refresh: Option<Sender<()>>,
+    refresh: Option<Sender<QueueRequest>>,
     #[cfg(windows)]
     progress: Option<Observer>,
 }
@@ -112,7 +154,26 @@ impl QueueView {
                         ctx.request_repaint();
                     }
                     explicit = match requested.recv_timeout(REFRESH_INTERVAL) {
-                        Ok(()) => true,
+                        Ok(QueueRequest::Refresh) => true,
+                        Ok(QueueRequest::Cancel(id)) => {
+                            let result = jobs::cancel_running(&url, &id);
+                            if let Ok(mut state) = state.lock()
+                                && let Some(cancel) = state.cancellation.as_mut()
+                                && cancel.id == id
+                            {
+                                cancel.state = match result {
+                                    Ok(CancelOutcome::Requested) => CancelState::Requested {
+                                        retry_at: Instant::now() + CANCEL_RETRY_DELAY,
+                                    },
+                                    Ok(CancelOutcome::NoLongerRunning) => {
+                                        CancelState::NoLongerRunning
+                                    }
+                                    Err(message) => CancelState::Failed(message),
+                                };
+                            }
+                            ctx.request_repaint();
+                            false
+                        }
                         Err(RecvTimeoutError::Timeout) => false,
                         Err(RecvTimeoutError::Disconnected) => break,
                     };
@@ -132,7 +193,7 @@ impl QueueView {
             let Ok(mut state) = self.state.lock() else {
                 return;
             };
-            if refresh.send(()).is_ok() {
+            if refresh.send(QueueRequest::Refresh).is_ok() {
                 state.manual = true;
                 return;
             }
@@ -141,6 +202,30 @@ impl QueueView {
             state.manual = true;
         }
         self.start_worker(ctx, true);
+    }
+
+    fn request_cancel(&self, id: &str, ctx: &egui::Context) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if !state.can_cancel() {
+            return;
+        }
+        let sent = self
+            .refresh
+            .as_ref()
+            .is_some_and(|worker| worker.send(QueueRequest::Cancel(id.to_owned())).is_ok());
+        state.cancellation = Some(Cancellation {
+            id: id.to_owned(),
+            state: if sent {
+                CancelState::Sending
+            } else {
+                CancelState::Failed(
+                    "Could not start the stop request. Refresh and try again.".into(),
+                )
+            },
+        });
+        ctx.request_repaint();
     }
 
     pub fn show(&mut self, ui: &mut Ui) {
@@ -170,12 +255,46 @@ impl QueueView {
             Some(Err(message)) => {
                 status(ui, "Queue status unavailable", message, CAUTION);
                 ui.horizontal_wrapped(|ui| self.show_refresh(ui));
+                self.show_cancel_status(ui);
             }
             None => queue_frame(ui, 12, |ui| caption(ui, "Checking the ComfyUI queue…")),
         }
         if self.state.lock().is_ok_and(|state| state.manual) {
             caption(ui, "Refreshing queue…");
         }
+    }
+
+    fn show_cancel_status(&self, ui: &mut Ui) {
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        let Some(cancel) = &state.cancellation else {
+            return;
+        };
+        let job = short_job_id(&cancel.id).unwrap_or(&cancel.id);
+        let (message, color) = match &cancel.state {
+            CancelState::Sending => (format!("Sending stop request for job {job}…"), MUTED),
+            CancelState::Requested { retry_at } => {
+                let remaining = retry_at.saturating_duration_since(Instant::now());
+                if remaining.is_zero()
+                    && matches!(state.snapshot.as_deref(), Some(Ok(queue))
+                    if queue.is_running(&cancel.id) == Some(true))
+                {
+                    (
+                        format!("Job {job} is still running. You can retry Stop."),
+                        CAUTION,
+                    )
+                } else {
+                    if !remaining.is_zero() {
+                        ui.ctx().request_repaint_after(remaining);
+                    }
+                    (format!("Stop requested for job {job}."), CAUTION)
+                }
+            }
+            CancelState::NoLongerRunning => (format!("Job {job} is no longer running."), GREEN),
+            CancelState::Failed(message) => (format!("Job {job} · {message}"), ERROR),
+        };
+        ui.label(theme::strong(message, 12.0).color(theme::color(ui.ctx(), color)));
     }
 
     fn queue_snapshot(&mut self, ui: &mut Ui, queue: &QueueStatus, dashboard: bool) {
@@ -186,7 +305,7 @@ impl QueueView {
         } else {
             ("Queue idle", GREEN, QueueGlyph::Ready)
         };
-        queue_frame(ui, if dashboard { 10 } else { 12 }, |ui| {
+        queue_frame(ui, if dashboard { 8 } else { 12 }, |ui| {
             ui.horizontal_top(|ui| {
                 if dashboard {
                     queue_glyph(ui, shape, tone, 49.0);
@@ -200,13 +319,7 @@ impl QueueView {
                         });
                     });
                     let active_job = if queue.running > 0 {
-                        self.show_progress(ui, queue).or_else(|| {
-                            queue
-                                .running_ids
-                                .first()
-                                .filter(|_| queue.running == 1)
-                                .map(String::as_str)
-                        })
+                        self.show_progress(ui, queue, dashboard)
                     } else {
                         None
                     };
@@ -225,6 +338,7 @@ impl QueueView {
             });
         });
         if dashboard {
+            self.show_cancel_status(ui);
             for id in &queue.pending_ids {
                 queue_frame(ui, 5, |ui| {
                     ui.horizontal(|ui| {
@@ -259,20 +373,54 @@ impl QueueView {
         }
     }
 
-    fn show_progress<'a>(&self, ui: &mut Ui, _queue: &'a QueueStatus) -> Option<&'a str> {
+    fn show_progress<'a>(
+        &self,
+        ui: &mut Ui,
+        queue: &'a QueueStatus,
+        dashboard: bool,
+    ) -> Option<&'a str> {
         #[cfg(windows)]
-        if let Some((id, progress)) = self.progress.as_ref().and_then(|observer| {
-            _queue.running_ids.iter().find_map(|id| {
+        let sample = self.progress.as_ref().and_then(|observer| {
+            queue.running_ids.iter().find_map(|id| {
                 observer
                     .latest_for(id)
                     .map(|progress| (id.as_str(), progress))
             })
-        }) {
-            show_node_progress(ui, progress);
-            return Some(id);
+        });
+        #[cfg(windows)]
+        let measured_job = sample.map(|(id, _)| id);
+        #[cfg(not(windows))]
+        let measured_job = None;
+        let active = measured_job.or_else(|| identified_running_job(queue));
+        let stoppable = active.filter(|id| dashboard && jobs::valid_prompt_id(id));
+        let stop = |ui: &mut Ui| {
+            if let Some(id) = stoppable {
+                let enabled = self.state.lock().is_ok_and(|state| state.can_cancel());
+                if stop_job_button(ui, id, enabled).clicked() {
+                    self.request_cancel(id, ui.ctx());
+                }
+            }
+        };
+        #[cfg(windows)]
+        if let Some((_, progress)) = sample {
+            show_node_progress(ui, progress, stoppable.is_some(), stop);
+            return active;
         }
-        caption(ui, "Waiting for node progress.");
-        None
+        if stoppable.is_some() {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), STOP_BUTTON_SIZE),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    stop(ui);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        caption(ui, "Waiting for node progress.");
+                    });
+                },
+            );
+        } else {
+            caption(ui, "Waiting for node progress.");
+        }
+        active
     }
 
     pub fn stop_confirmation(
@@ -301,42 +449,98 @@ impl QueueView {
 }
 
 #[cfg(windows)]
-fn show_node_progress(ui: &mut Ui, progress: Progress) {
+fn show_node_progress(
+    ui: &mut Ui,
+    progress: Progress,
+    stoppable: bool,
+    stop: impl FnOnce(&mut Ui),
+) {
     let fraction = (progress.value / progress.max).clamp(0.0, 1.0);
     let percent = if progress.value < progress.max {
         (fraction * 100.0).round().min(99.0)
     } else {
         100.0
     };
-    ui.horizontal_wrapped(|ui| {
-        caption(
-            ui,
-            &format!("Node steps {:.0} of {:.0}", progress.value, progress.max),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                theme::strong(format!("{percent:.0}% of node"), 17.0)
-                    .color(theme::color(ui.ctx(), INK)),
-            );
-        });
-    });
     ui.scope(|ui| {
-        ui.visuals_mut().extreme_bg_color = theme::color(ui.ctx(), RAIL_ACTIVE);
-        ui.add(
-            egui::ProgressBar::new(fraction as f32)
-                .desired_height(10.0)
-                .fill(theme::color(ui.ctx(), GREEN)),
+        let rail_height = 10.0;
+        if stoppable {
+            ui.spacing_mut().item_spacing.y = 1.0;
+        }
+        ui.horizontal_wrapped(|ui| {
+            caption(
+                ui,
+                &format!("Node steps {:.0} of {:.0}", progress.value, progress.max),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    theme::strong(format!("{percent:.0}% of node"), 17.0)
+                        .color(theme::color(ui.ctx(), INK)),
+                );
+            });
+        });
+        let height = if stoppable {
+            STOP_BUTTON_SIZE
+        } else {
+            rail_height
+        };
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), height),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                stop(ui);
+                ui.scope(|ui| {
+                    ui.visuals_mut().extreme_bg_color = theme::color(ui.ctx(), RAIL_ACTIVE);
+                    ui.add(
+                        egui::ProgressBar::new(fraction as f32)
+                            .desired_height(rail_height)
+                            .fill(theme::color(ui.ctx(), GREEN)),
+                    );
+                });
+            },
         );
     });
 }
 
+fn stop_job_button(ui: &mut Ui, id: &str, enabled: bool) -> egui::Response {
+    ui.push_id(("stop-job", id), |ui| {
+        ui.spacing_mut().button_padding.x = 0.0;
+        let fill = theme::destructive_fill(ui.ctx());
+        let response = ui.add_enabled(
+            enabled,
+            egui::Button::new("")
+                .small()
+                .fill(fill)
+                .min_size(egui::Vec2::splat(STOP_BUTTON_SIZE))
+                .corner_radius(6),
+        );
+        let glyph = egui::Rect::from_center_size(response.rect.center(), egui::Vec2::splat(9.0));
+        let label = format!("Stop job {}", short_job_id(id).unwrap_or(id));
+        let painter = ui.painter_at(response.rect);
+        let glyph_color = theme::on_fill(fill);
+        let glyph_color = if enabled {
+            glyph_color
+        } else {
+            glyph_color.gamma_multiply(ui.visuals().disabled_alpha())
+        };
+        painter.rect_filled(glyph, 1, glyph_color);
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &label));
+        response
+            .on_hover_text(label)
+            .on_disabled_hover_text("A stop request is already in progress.")
+    })
+    .inner
+}
+
+fn identified_running_job(queue: &QueueStatus) -> Option<&str> {
+    match queue.running_ids.as_slice() {
+        [id] if queue.running == 1 && jobs::valid_prompt_id(id) => Some(id),
+        _ => None,
+    }
+}
+
 fn short_job_id(id: &str) -> Option<&str> {
-    (!id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
-    .then(|| &id[..id.len().min(10)])
+    jobs::valid_prompt_id(id).then(|| &id[..id.len().min(10)])
 }
 
 fn queue_frame(ui: &mut Ui, margin: i8, content: impl FnOnce(&mut Ui)) {
@@ -434,12 +638,77 @@ mod tests {
                         value: 20.0,
                         max: 20.0,
                     },
+                    false,
+                    |_| {},
                 );
             });
         });
         assert!(output.shapes.iter().any(|shape| {
             matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "100% of node")
         }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn progress_stop_button_has_a_label_and_fits_beside_the_rail_in_both_themes() {
+        for preference in [egui::ThemePreference::Dark, egui::ThemePreference::Light] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            theme::configure_for(&ctx, preference, None);
+            let mut button = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(408.0, 120.0),
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_node_progress(
+                            ui,
+                            Progress {
+                                value: 14.0,
+                                max: 20.0,
+                            },
+                            true,
+                            |ui| {
+                                button = Some(stop_job_button(ui, "render-a", true).rect);
+                            },
+                        );
+                    });
+                },
+            );
+
+            let button = button.unwrap();
+            assert_eq!(button.size(), egui::Vec2::splat(STOP_BUTTON_SIZE));
+            assert!(button.bottom() < 65.0);
+            let rail = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == theme::color(&ctx, RAIL_ACTIVE)
+                            && rect.rect.height() == 10.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(rail.right() < button.left());
+            assert!((rail.center().y - button.center().y).abs() < 1.0);
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some("Stop job render-a"))
+            );
+        }
     }
 
     #[test]
@@ -450,6 +719,63 @@ mod tests {
         assert_eq!(short_job_id("éx"), None);
         assert_eq!(short_job_id(&"a".repeat(129)), None);
         assert_eq!(short_job_id(""), None);
+    }
+
+    #[test]
+    fn one_identifiable_running_job_can_be_stopped_before_the_first_progress_event() {
+        let mut snapshot = queue(1);
+        snapshot.running = 1;
+        assert_eq!(identified_running_job(&snapshot), None);
+        snapshot.running_ids.push("my-render".into());
+        assert_eq!(identified_running_job(&snapshot), Some("my-render"));
+        snapshot.running = 2;
+        assert_eq!(identified_running_job(&snapshot), None);
+    }
+
+    #[test]
+    fn a_running_job_can_be_retried_manually_only_after_the_cooldown() {
+        let (sender, receiver) = mpsc::channel();
+        let mut view = QueueView::new("http://127.0.0.1:8188".into());
+        view.refresh = Some(sender);
+        let ctx = egui::Context::default();
+        view.request_cancel("first", &ctx);
+        view.request_cancel("first", &ctx);
+        view.request_cancel("second", &ctx);
+        assert!(matches!(receiver.try_recv(), Ok(QueueRequest::Cancel(id)) if id == "first"));
+        assert!(receiver.try_recv().is_err());
+
+        let requested = |retry_at| CancelState::Requested { retry_at };
+        view.state
+            .lock()
+            .unwrap()
+            .cancellation
+            .as_mut()
+            .unwrap()
+            .state = requested(Instant::now() + CANCEL_RETRY_DELAY);
+        view.request_cancel("first", &ctx);
+        assert!(receiver.try_recv().is_err());
+
+        let mut active = queue(0);
+        active.running = 1;
+        active.running_ids.push("first".into());
+        {
+            let mut state = view.state.lock().unwrap();
+            state.cancellation.as_mut().unwrap().state = requested(Instant::now());
+            assert!(state.finish(Ok(active), false));
+            assert!(state.can_cancel());
+        }
+        assert!(receiver.try_recv().is_err());
+        view.request_cancel("first", &ctx);
+        assert!(matches!(receiver.try_recv(), Ok(QueueRequest::Cancel(id)) if id == "first"));
+
+        let mut state = view.state.lock().unwrap();
+        state.cancellation.as_mut().unwrap().state = requested(Instant::now() + CANCEL_RETRY_DELAY);
+        assert!(state.finish(Ok(queue(0)), false));
+        assert!(matches!(
+            state.cancellation.as_ref().unwrap().state,
+            CancelState::NoLongerRunning
+        ));
+        assert!(state.can_cancel());
     }
 
     #[test]
